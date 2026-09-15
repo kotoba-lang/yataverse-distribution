@@ -1,0 +1,8 @@
+{:paths ["src"]
+ ;; top-level :deps は workspace 内 :local/root のみ（ADR-2608201300）。
+ ;; third-party maven / external-git は alias 側にのみ足す。
+ ;; io-libp2p (kotoba-lang) が gossip/bitswap 意味論の正。
+ :deps {io.github.kotoba-lang/io-libp2p {:local/root "../io-libp2p"}}
+ :aliases
+ {:test {:extra-paths ["test"]
+         :main-opts ["-m" "yataverse.distribution.test-runner"]}}}

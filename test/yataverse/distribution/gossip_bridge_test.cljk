@@ -1,0 +1,106 @@
+(ns yataverse.distribution.gossip-bridge-test
+  "Bridge tests: plan assignments land in the io-libp2p gossip/bitswap
+  shapes. The dedup (seen-cache) and want/have behavior pinned here is the
+  core's own contract — these tests prove the BRIDGE converts correctly,
+  not that the core works."
+  (:require [clojure.test :refer [deftest is testing run-tests]]
+            [kotoba.net.gossip :as gossip]
+            [kotoba.net.bitswap :as bitswap]
+            [yataverse.distribution.planner :as planner]
+            [yataverse.distribution.gossip-bridge :as bridge]))
+
+(def plan (planner/plan-replication "bafyTest"
+                                    [{:name "naphtali" :labels {:zone "jp"}}
+                                     {:name "simeon" :labels {:zone "jp"}}
+                                     {:name "a" :labels {:zone "us"}}]
+                                    3))
+
+(deftest topic-for-zone-test
+  (testing "topic is namespaced per zone"
+    (is (= "yataverse/distribution/jp" (bridge/topic-for-zone "jp")))
+    (is (= "yataverse/distribution/us" (bridge/topic-for-zone "us")))))
+
+(deftest peers-from-plan-test
+  (testing "each assigned node is a peer subscribed to its zone topic"
+    (let [state (bridge/peers-from-plan plan)]
+      (is (= #{"naphtali" "simeon" "a"} (set (keys (:peers state)))))
+      (is (contains? (get-in state [:peers "naphtali"])
+                     (bridge/topic-for-zone "jp")))
+      (is (contains? (get-in state [:peers "a"])
+                     (bridge/topic-for-zone "us"))))))
+
+(deftest announce-replica-test
+  (testing "first announce fans out to zone-topic subscribers, sender excluded"
+    (let [state (bridge/peers-from-plan plan)
+          cache (gossip/empty-seen-cache 128)
+          {:keys [forward seen-cache]}
+          (bridge/announce-replica state cache
+                                   {:node "naphtali" :zone "jp" :cid "bafyTest"})]
+      (is (= 1 (count forward)))
+      (is (= "simeon" (:to (first forward))))
+      (is (= "bafyTest" (:payload (first forward))))
+      (is (some? seen-cache) "seen-cache is threaded through")
+      (testing "second identical announce is deduplicated (empty forward)"
+        (let [{forward2 :forward}
+              (bridge/announce-replica state seen-cache
+                                       {:node "simeon" :zone "jp"
+                                        :cid "bafyTest"})]
+          (is (= 0 (count forward2)))))
+      (testing "a DIFFERENT cid still routes (dedup is per content-hash)"
+        (let [{forward3 :forward}
+              (bridge/announce-replica state seen-cache
+                                       {:node "simeon" :zone "jp"
+                                        :cid "bafyOther"})]
+          (is (= 1 (count forward3))))))))
+
+(deftest relay-announcement-test
+  (testing "relay on a topic where the relaying node is the only subscriber
+            forwards to nobody (excluded self, no other peers)"
+    (let [state (bridge/peers-from-plan plan)
+          cache (gossip/empty-seen-cache 128)
+          {:keys [forward]}
+          (bridge/relay-announcement state cache
+                                     {:from "naphtali" :cid "bafyX"}
+                                     "a" "us")]
+      (is (= 0 (count forward))))
+    (testing "relay of an unseen payload reaches the zone peers"
+      (let [state (bridge/peers-from-plan plan)
+            cache (gossip/empty-seen-cache 128)
+            {:keys [forward]}
+            (bridge/relay-announcement state cache
+                                       {:from "a" :cid "bafyX"}
+                                       "naphtali" "jp")]
+        (is (= #{"simeon"} (set (map :to forward))))))))
+
+(deftest wants-from-plan-test
+  (testing "assigned node without the cid wants it"
+    (let [w (bridge/wants-from-plan "bafyTest" plan "naphtali" #{})]
+      (is (contains? w "bafyTest"))))
+  (testing "node that already has it does not want (nil — no want)"
+    (is (nil? (bridge/wants-from-plan "bafyTest" plan "naphtali" #{"bafyTest"}))))
+  (testing "unassigned node wants nothing (nil — honest absence, not empty set)"
+    (is (nil? (bridge/wants-from-plan "bafyTest" plan "other" #{})))))
+
+(deftest serve-announced-test
+  (testing "want ∩ have is what gets served (returned as a set)"
+    (let [w (bitswap/add-want (bitswap/empty-want-list) "bafyTest")]
+      (is (= #{"bafyTest"} (set (bridge/serve-announced w #{"bafyTest" "bafyOther"}))))
+      (is (= #{} (set (bridge/serve-announced w #{"bafyOther"})))))))
+
+(deftest e2e-gossip-roundtrip-test
+  "One full loop: plan → peers → announce → fanout forward reaches the
+  assigned zone peers; echo relay is dropped by the seen-cache. This is the
+  shape the transport adapter must deliver (content crosses as :payload)."
+  (let [state (bridge/peers-from-plan plan)
+        cache (gossip/empty-seen-cache 128)
+        ;; naphtali announces the replica
+        {:keys [seen-cache forward]}
+        (bridge/announce-replica state cache
+                                 {:node "naphtali" :zone "jp" :cid "bafyTest"})
+        ;; simeon receives the forward and relays it onward — echo is dropped
+        relayed (bridge/relay-announcement state seen-cache
+                                           {:from "naphtali" :cid "bafyTest"}
+                                           "simeon" "jp")]
+    (is (= 1 (count forward)))
+    (is (= "simeon" (:to (first forward))))
+    (is (= 0 (count (:forward relayed))) "echo dropped by seen-cache")))

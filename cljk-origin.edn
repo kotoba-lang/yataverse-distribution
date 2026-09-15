@@ -1,0 +1,10 @@
+{:format :kotoba.cljk-origin/v1
+ :renamed-on "2026-09-15"
+ :decision "owner instruction 2026-09-15 (yataverse 配信面 repo は全ソース .cljk)"
+ :rule "value = the extension the file would have had under the pre-cljk convention. This repo was authored .cljk-first (no rename happened); origins recorded for the same reader contract as the 2026-09-11 workspace-wide rename (adr-2609111500)."
+ :origins
+ {"src/yataverse/distribution/planner.cljk" ".cljc"
+  "src/yataverse/distribution/gossip_bridge.cljk" ".cljc"
+  "test/yataverse/distribution/planner_test.cljk" ".cljs"
+  "test/yataverse/distribution/gossip_bridge_test.cljk" ".cljs"
+  "test/yataverse/distribution/test_runner.cljk" ".cljs"}}

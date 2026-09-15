@@ -1,0 +1,8 @@
+target/
+.cpcache/
+.clj-kondo/
+.lsp/
+*.class
+node_modules/
+out/
+.shadow-cljs/

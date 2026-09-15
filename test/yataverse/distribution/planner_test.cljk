@@ -1,0 +1,100 @@
+(ns yataverse.distribution.planner-test
+  "Replication planner tests. 8 問の 1: 入力が無いとき / 実行できないとき何を
+  返すかを、pass と同じ値にならない形で assert する。"
+  (:require [clojure.test :refer [deftest is testing run-tests]]
+            [yataverse.distribution.planner :as planner]))
+
+(def jp-nodes
+  [{:name "naphtali" :labels {:tier "edge" :zone "jp"}}
+   {:name "simeon"   :labels {:tier "edge" :zone "jp"}}
+   {:name "judah"    :labels {:tier "edge" :zone "jp"}}])
+
+(def inventory jp-nodes)
+
+(deftest zones-test
+  (testing "distinct zones, sorted"
+    (is (= ["jp" "us"] (planner/zones (concat inventory
+                                              [{:name "a" :labels {:zone "us"}}])))))
+  (testing "unstated zone is preserved as ::no-zone, not dropped"
+    (is (= [::planner/no-zone "jp"] (planner/zones
+                                     (concat inventory
+                                             [{:name "x"}])))))
+  (testing "empty inventory yields no zones (empty answer, not an error)"
+    (is (= [] (planner/zones [])))))
+
+(deftest nodes-in-zone-test
+  (testing "filters by zone"
+    (is (= 3 (count (planner/nodes-in-zone inventory "jp")))))
+  (testing "no node matches an absent zone"
+    (is (= 0 (count (planner/nodes-in-zone inventory "eu"))))))
+
+(deftest plan-replication-test
+  (testing "factor within inventory: assignments spread across nodes"
+    (let [p (planner/plan-replication "bafyTest" inventory 2)]
+      (is (= 2 (count (:assignments p))))
+      (is (= 2 (:factor p)))
+      (is (= 0 (:shortfall p)))
+      ;; distinct nodes — no double assignment
+      (is (= 2 (count (distinct (map :node (:assignments p))))))))
+  (testing "zone coverage names the zone"
+    (is (= #{"jp"} (:coverage (planner/plan-replication "bafyTest" inventory 1)))))
+  (testing "multi-zone spread: factor across distinct zones when pool allows"
+    (let [inv (concat inventory [{:name "a" :labels {:zone "us"}}])
+          p (planner/plan-replication "bafyTest" inv 3)]
+      (is (= #{"jp" "us"} (:coverage p)))
+      (is (= 3 (count (:assignments p)))))))
+
+(deftest plan-replication-fail-closed-test
+  (testing "zero factor throws (a zero-replica plan is not a plan)"
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"positive integer"
+                          (planner/plan-replication "bafyTest" inventory 0))))
+  (testing "negative factor throws"
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"positive integer"
+                          (planner/plan-replication "bafyTest" inventory -1))))
+  (testing "empty inventory throws"
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"empty inventory"
+                          (planner/plan-replication "bafyTest" [] 1))))
+  (testing "inventory smaller than factor throws"
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"smaller than replication factor"
+                          (planner/plan-replication "bafyTest" inventory 5)))))
+
+(deftest rank-providers-test
+  (testing "ranks by distance ascending"
+    (let [requester {:lat 35.68 :lng 139.77}   ; tokyo-ish
+          providers [{:name "far"  :lat 40.71 :lng -74.0}   ; nyc
+                     {:name "near" :lat 34.69 :lng 135.5}]  ; osaka
+          ranked (planner/rank-providers requester providers)]
+      (is (= "near" (:name (first ranked))))
+      (is (< (:distance-km (first ranked)) (:distance-km (second ranked))))
+      ;; exact distance sanity: tokyo<->osaka ~ 400km, tokyo<->nyc ~ 10800km
+      (is (< (:distance-km (first ranked)) 500))
+      (is (> (:distance-km (second ranked)) 10000))))
+  (testing "empty providers -> empty ranking (not an error)"
+    (is (= [] (planner/rank-providers {:lat 0 :lng 0} []))))
+  (testing "requester without coordinates throws"
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #":lat/:lng"
+                          (planner/rank-providers {} [{:name "x" :lat 1 :lng 1}]))))
+  (testing "provider without coordinates throws (not silently ranked last)"
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"cannot be ranked"
+                          (planner/rank-providers {:lat 0 :lng 0}
+                                                  [{:name "lost"}])))))
+
+(deftest nearest-provider-test
+  (testing "returns the closest"
+    (let [p (planner/nearest-provider {:lat 35.68 :lng 139.77}
+                                       [{:name "far" :lat 40.71 :lng -74.0}
+                                        {:name "near" :lat 34.69 :lng 135.5}])]
+      (is (= "near" (:name p)))))
+  (testing "nil when no providers (nil, not a fabricated pick)"
+    (is (nil? (planner/nearest-provider {:lat 0 :lng 0} [])))))
+
+(deftest delivery-path-test
+  (testing "path names all stages in order"
+    (let [p (planner/plan-replication "bafyTest" inventory 2)
+          path (planner/delivery-path "bafyTest" p)]
+      (is (= [:origin :mirror :p2p :p2p :discovery] (map :stage path)))
+      (is (= :kotobase-bytes-plane (:actor (first path))))
+      (is (= :yataverse-mirror-zone (:actor (second path))))
+      (is (= :ipni (:actor (last path))))
+      ;; every p2p hop names its node
+      (is (= (map :node (:assignments p)) (map :actor (filter #(= :p2p (:stage %)) path)))))))

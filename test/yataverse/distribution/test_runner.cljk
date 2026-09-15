@@ -1,0 +1,38 @@
+(ns yataverse.distribution.test-runner
+  "kbb/nbb-compatible test runner. Explicit namespace list — a missing
+  namespace is a visible failure, not a silent skip (8 問の 7)."
+  (:require [clojure.test :as t]
+            yataverse.distribution.planner-test
+            yataverse.distribution.gossip-bridge-test))
+
+(def totals (atom {:tests 0 :asserts 0 :fail 0 :error 0}))
+(defonce ^:private counts (atom {:n 0}))
+(defonce ^:private orig-report t/report)
+
+(defn- counting-report [m]
+  (case (:type m)
+    :pass (do (swap! counts update :n inc) (orig-report m))
+    :fail (do (swap! counts update :n inc) (orig-report m))
+    :error (do (swap! counts update :n inc) (orig-report m))
+    :summary (do (swap! totals (fn [s]
+                                 {:tests (+ (:tests s) (or (:test m) 0))
+                                  :asserts (+ (:asserts s) (:n @counts))
+                                  :fail (+ (:fail s) (or (:fail m) 0))
+                                  :error (+ (:error s) (or (:error m) 0))}))
+                 (println "\nRan" (:test m) "tests containing" (:n @counts)
+                          "assertions.")
+                 (reset! counts {:n 0})
+                 (println (:fail m) "failures," (:error m) "errors."))
+    :begin-test-ns (do (println "Testing" (some-> m :ns ns-name))
+                       (orig-report m))
+    (orig-report m)))
+
+(defn -main [& _args]
+  (reset! totals {:tests 0 :asserts 0 :fail 0 :error 0})
+  (set! t/report counting-report)
+  (t/run-tests 'yataverse.distribution.planner-test
+               'yataverse.distribution.gossip-bridge-test)
+  (let [{:keys [fail error]} @totals]
+    (if (pos? (+ fail error))
+      #?(:clj (System/exit 1) :cljs (js/process.exit 1))
+      #?(:clj (System/exit 0) :cljs (js/process.exit 0)))))

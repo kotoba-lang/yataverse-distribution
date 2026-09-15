@@ -1,0 +1,95 @@
+(ns yataverse.distribution.gossip-bridge
+  "Bridge between this repo's replication plan and kotoba.net.gossip /
+  kotoba.net.bitswap semantics (io-libp2p). Nothing here opens a socket:
+  the bridge converts a plan's assignments into the peer/topic and
+  want/have shapes those namespaces already define, so that the actual
+  transport adapter (murakumo overlay QUIC, ADR-2607023100) can consume
+  them without re-deriving the semantics.
+
+  Pure functions only. Depends on io-libp2p (workspace :local/root)."
+  (:require [clojure.string :as str]
+            [kotoba.net.gossip :as gossip]
+            [kotoba.net.bitswap :as bitswap]))
+
+;; ---------------------------------------------------------------------------
+;; topic naming
+;; ---------------------------------------------------------------------------
+
+(def topic-prefix "yataverse/distribution")
+
+(defn topic-for-zone
+  "One gossip topic per zone — plan updates fan out to zone-local topics."
+  [zone]
+  (str topic-prefix "/" (str/replace (str zone) #"\s+" "-")))
+
+;; ---------------------------------------------------------------------------
+;; plan -> gossip state
+;; ---------------------------------------------------------------------------
+
+(defn peers-from-plan
+  "Turn a replication plan's assignments into gossip peer subscriptions:
+  each assigned node subscribes to its zone's topic. Returns the gossip
+  peer-state built via the existing io-libp2p semantics."
+  [plan]
+  (reduce (fn [state {:keys [zone node]}]
+            (-> state
+                (gossip/add-peer node)
+                (gossip/subscribe node (topic-for-zone zone))))
+          (gossip/empty-peer-state)
+          (:assignments plan)))
+
+;; ---------------------------------------------------------------------------
+;; announce / relay (dedup via the core's seen-cache)
+;; ---------------------------------------------------------------------------
+
+(defn announce-replica
+  "A node announces it now holds `cid` on its zone's topic.
+
+  Uses the core's own contract: `route-message` takes
+  {:topic :payload :from :self} and returns {:seen-cache :forward};
+  re-announcing the same payload is deduplicated by the content-hash
+  seen-cache, never by callers.
+
+  Returns {:peer-state :seen-cache' :forward} on first sight,
+  {:seen-cache' :forward []} (dropped) when already seen."
+  [peer-state seen-cache {:keys [node zone cid] :as _announce}]
+  (gossip/route-message peer-state seen-cache
+                        {:topic (topic-for-zone zone)
+                         :payload cid
+                         :from node
+                         :self node}))
+
+(defn relay-announcement
+  "Relay an announcement on behalf of `node`: same message, but :from is the
+  original sender and :self is the relaying node — the exclude set then keeps
+  the announcement from bouncing back to its origin."
+  [peer-state seen-cache {:keys [from cid]} node zone]
+  (gossip/route-message peer-state seen-cache
+                        {:topic (topic-for-zone zone)
+                         :payload cid
+                         :from from
+                         :self node}))
+
+;; ---------------------------------------------------------------------------
+;; plan -> bitswap want/have
+;; ---------------------------------------------------------------------------
+
+(defn wants-from-plan
+  "A node that should hold `cid` but does not yet have it WANTS it:
+  convert a plan + the node's have-set into a bitswap want-list.
+
+  Returns nil when the node is not assigned this CID, or already has it —
+  nil is the honest answer (no want), not an empty-list success."
+  [cid plan node-name have-cids]
+  (let [assigned? (some #(= (:node %) node-name) (:assignments plan))
+        have? (contains? (set have-cids) cid)]
+    (cond
+      (not assigned?) nil
+      have? nil
+      :else (bitswap/add-want (bitswap/empty-want-list) cid))))
+
+(defn serve-announced
+  "Given a want-list and a node's have-set, return the want∩have block CIDs
+  this node can serve right now (the core's respond-to-want)."
+  [want-list have-cids]
+  (bitswap/respond-to-want want-list (set have-cids)))

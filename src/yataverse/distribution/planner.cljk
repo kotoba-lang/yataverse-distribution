@@ -1,0 +1,184 @@
+(ns yataverse.distribution.planner
+  "Geo-aware replication planning for the yataverse.com bytes plane.
+
+  yataverse.com is the decentralized mirror zone of the kotobase bytes plane
+  (ADR-2609131630). This namespace decides WHERE a CID's replicas should live:
+  it takes the murakumo fleet's node inventory (each node already carries
+  `:labels {:tier ... :zone ...}` in fleet.edn) plus the desired replication
+  factor, and emits a plan of zone -> node assignments.
+
+  Pure functions only. The wire (io-libp2p gossip fanout, murakumo overlay
+  QUIC) is described, not performed — the execution shell is a host concern
+  (ADR-2607023100 wiring, not yet landed). Fails closed: an inventory with
+  no zones, or a factor no inventory can satisfy, throws — a silent
+  under-replicated plan is the failure this namespace exists to prevent."
+  (:require [clojure.set :as set]))
+
+;; ---------------------------------------------------------------------------
+;; inventory normalization
+;; ---------------------------------------------------------------------------
+
+(defn- node-zone
+  "A node's zone label, or ::no-zone when unstated. Unstated is preserved as
+  its own answer (mirrors murakumo.fleet.topology's :unstated discipline —
+  a node nobody has decided about is neither right nor wrong)."
+  [node]
+  (or (get-in node [:labels :zone]) ::no-zone))
+
+(defn zones
+  "Distinct zones in an inventory, sorted by name string. ::no-zone counts
+  as a zone bucket (sorted as its string form)."
+  [inventory]
+  (sort-by str (distinct (map node-zone inventory))))
+
+(defn nodes-in-zone
+  "Nodes whose zone label equals `zone`."
+  [inventory zone]
+  (filterv #(= zone (node-zone %)) inventory))
+
+;; ---------------------------------------------------------------------------
+;; plan
+;; ---------------------------------------------------------------------------
+
+(defn plan-replication
+  "Plan replicas of one CID across zones.
+
+  inventory: sequence of node maps, each with at least
+             {:name ... :labels {:zone \"jp\" ...}}
+  factor:    desired replica count (positive integer)
+
+  Returns a plan map:
+    {:cid          the cid
+     :factor       the requested factor
+     :assignments  [{:zone :node}] — distinct nodes, spread across zones
+                   round-robin starting from the zone with the most nodes,
+     :coverage     #{zones} actually used,
+     :shortfall    nodes short of :factor (0 when satisfied)}
+
+  Throws (fail closed) when factor is not a positive integer, or the
+  inventory is empty, or no node can host a replica."
+  [cid inventory factor]
+  (when-not (pos-int? factor)
+    (throw (ex-info "replication factor must be a positive integer"
+                    {:cid cid :factor factor})))
+  (when (empty? inventory)
+    (throw (ex-info "empty inventory cannot host any replica"
+                    {:cid cid :factor factor})))
+  (let [by-zone (group-by node-zone inventory)
+        ;; zones ordered by node count desc, zone name as tiebreak —
+        ;; deterministic regardless of input order
+        ordered (sort-by (fn [[z nodes]] [(- (count nodes)) (str z)])
+                         by-zone)
+        pool (mapcat (fn [[_ nodes]] nodes) ordered)
+        pool-count (count pool)]
+    (when (< pool-count factor)
+      (throw (ex-info "inventory smaller than replication factor"
+                      {:cid cid :factor factor :nodes pool-count})))
+    (let [;; zone-round-robin walk: zones ordered by size desc, then by name;
+          ;; step i visits zone (mod i nzones), taking the i-th unseen node in
+          ;; it (cycling within the zone when short) — this spreads the factor
+          ;; across zones first and only then fills within a zone.
+          zone-names (vec (map first ordered))
+          nzones (count zone-names)
+          picked
+          (loop [i 0 picked [] seen #{}]
+            (if (= (count picked) factor)
+              picked
+              (let [zone (nth zone-names (mod i nzones))
+                    nodes (vec (by-zone zone))
+                    rotate (quot i nzones)
+                    cand (nth nodes (mod (+ rotate (mod i nzones))
+                                         (count nodes)))
+                    cand-name (:name cand)]
+                (if (contains? seen cand-name)
+                  (recur (inc i) picked seen)
+                  (recur (inc i) (conj picked cand)
+                         (conj seen cand-name))))))
+          assignments (mapv (fn [n] {:zone (node-zone n) :node (:name n)}) picked)]
+      {:cid cid
+       :factor factor
+       :assignments assignments
+       :coverage (set (map :zone assignments))
+       :shortfall (- factor (count assignments))})))
+
+;; ---------------------------------------------------------------------------
+;; geo scoring
+;; ---------------------------------------------------------------------------
+
+(defn- haversine-km
+  "Great-circle distance in km between two {:lat :lng} points. Pure math.
+  Math/toRadians is JVM-only under this reader — atan2/sqrt/cos/sin take
+  pre-converted radians; convert with (* d (/ Math/PI 180)) portably."
+  [{la1 :lat lo1 :lng} {la2 :lat lo2 :lng}]
+  (let [pi-over-180 (/ 3.141592653589793 180.0)
+        r 6371.0
+        dlat (* (- la2 la1) pi-over-180)
+        dlng (* (- lo2 lo1) pi-over-180)
+        a (+ (* (Math/sin (/ dlat 2)) (Math/sin (/ dlat 2)))
+             (* (Math/cos (* la1 pi-over-180))
+                (Math/cos (* la2 pi-over-180))
+                (* (Math/sin (/ dlng 2)) (Math/sin (/ dlng 2)))))
+        c (* 2 (Math/atan2 (Math/sqrt a) (Math/sqrt (- 1 a))))]
+    (* r c)))
+
+(defn rank-providers
+  "Rank candidate providers for a requester by geo distance, then by
+  declared tier (lesser tiers first as tiebreak). Fail closed on candidates
+  without coordinates — a provider that cannot be located is not ranked,
+  it is refused, so a silent default ordering can never ship.
+
+  requester: {:lat :lng}
+  providers: [{:name :lat :lng :tier ...}]  ; tier: keyword, smaller = closer
+             to the requester's class (e.g. :edge < :gpu is NOT assumed —
+             provide :tier as a rank number you have decided)
+
+  Returns [{:name :distance-km :tier}] sorted best-first, or throws when
+  any provider lacks :lat/:lng or the requester lacks coordinates."
+  [requester providers]
+  (when-not (and (:lat requester) (:lng requester))
+    (throw (ex-info "requester must carry :lat/:lng" {:requester requester})))
+  (doseq [p providers]
+    (when-not (and (:lat p) (:lng p))
+      (throw (ex-info "provider without coordinates cannot be ranked"
+                      {:provider (:name p)}))))
+  (->> providers
+       (map (fn [p] (assoc p :distance-km
+                           (haversine-km requester (select-keys p [:lat :lng])))))
+       (sort-by (juxt :distance-km (fnil identity ##Inf) :name))))
+
+(defn nearest-provider
+  "Best provider or nil when providers is empty (nil, not a fabricated pick)."
+  [requester providers]
+  (when (seq providers)
+    (first (rank-providers requester providers))))
+
+;; ---------------------------------------------------------------------------
+;; e2e description (descriptive, not a wire implementation)
+;; ---------------------------------------------------------------------------
+
+(defn delivery-path
+  "Describe the e2e delivery path for a CID under this plane — the data is
+  the contract; the actual transfer is performed by the bytes-plane gateway
+  (net-kotobase/ipfs Worker), the mirror zone (yataverse.com), and the p2p
+  exchange (io-libp2p gossip/bitswap over murakumo overlay, ADR-2607023100).
+
+  Returns an ordered vector of {:stage :actor :what} — each stage names the
+  component that OWNS it. Used by tests to pin the boundary, and by docs as
+  the executable statement of the e2e."
+  [cid plan]
+  (vec
+   (concat
+    [{:stage :origin :actor :kotobase-bytes-plane
+      :what (str "R2 origin serves " cid " at {cid}.ipfs.kotobase.net")}
+     {:stage :mirror :actor :yataverse-mirror-zone
+      :what (str "mirror zone serves the same CID at {cid}.ipfs.yataverse.com"
+                 " (same Worker, same bucket — ADR-2609131630 D3)")}]
+    (map (fn [{:keys [zone node]}]
+           {:stage :p2p :actor node
+            :what (str "replica held by node " node " in zone " zone
+                       " — discoverable via IPNI, exchangeable via bitswap"
+                       " semantics over murakumo overlay QUIC")})
+         (:assignments plan))
+    [{:stage :discovery :actor :ipni
+      :what "providers announced to IPNI (cid.contact); delegated routing is
+             the explicit boundary of the HTTP gateway"}])))
