@@ -1,7 +1,7 @@
 (ns yataverse.distribution.planner-test
   "Replication planner tests. 8 問の 1: 入力が無いとき / 実行できないとき何を
   返すかを、pass と同じ値にならない形で assert する。"
-  (:require [clojure.test :refer [deftest is testing run-tests]]
+  (:require [kotoba.test :refer [deftest is testing run-tests]]
             [yataverse.distribution.planner :as planner]))
 
 (def jp-nodes

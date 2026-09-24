@@ -3,7 +3,7 @@
   shapes. The dedup (seen-cache) and want/have behavior pinned here is the
   core's own contract — these tests prove the BRIDGE converts correctly,
   not that the core works."
-  (:require [clojure.test :refer [deftest is testing run-tests]]
+  (:require [kotoba.test :refer [deftest is testing run-tests]]
             [kotoba.net.gossip :as gossip]
             [kotoba.net.bitswap :as bitswap]
             [yataverse.distribution.planner :as planner]
