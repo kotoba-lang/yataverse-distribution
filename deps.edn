@@ -2,7 +2,12 @@
  ;; top-level :deps は workspace 内 :local/root のみ（ADR-2608201300）。
  ;; third-party maven / external-git は alias 側にのみ足す。
  ;; io-libp2p (kotoba-lang) が gossip/bitswap 意味論の正。
- :deps {io.github.kotoba-lang/io-libp2p {:local/root "../io-libp2p"}}
+ :deps {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text {:git/sha "3dcb2ab087933dc7b703b340dac9afce62cb30ff"}
+       io.github.kotoba-lang/io-libp2p {:local/root "../io-libp2p"}}
  :aliases
  {:test {:extra-paths ["test"]
          :main-opts ["-m" "yataverse.distribution.test-runner"]}}}
