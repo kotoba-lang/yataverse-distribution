@@ -12,7 +12,7 @@
   (ADR-2607023100 wiring, not yet landed). Fails closed: an inventory with
   no zones, or a factor no inventory can satisfy, throws — a silent
   under-replicated plan is the failure this namespace exists to prevent."
-  (:require [clojure.set :as set]))
+  (:require [kotoba.lang.coll :as set]))
 
 ;; ---------------------------------------------------------------------------
 ;; inventory normalization
