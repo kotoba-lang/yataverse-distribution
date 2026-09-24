@@ -7,7 +7,7 @@
   them without re-deriving the semantics.
 
   Pure functions only. Depends on io-libp2p (workspace :local/root)."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.net.gossip :as gossip]
             [kotoba.net.bitswap :as bitswap]))
 
