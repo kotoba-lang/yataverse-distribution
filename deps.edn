@@ -15,7 +15,9 @@
         ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
         ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
         ;; this repo silently rides whatever a sibling happens to name.
-        io.github.kotoba-lang/text {:git/sha "3dcb2ab087933dc7b703b340dac9afce62cb30ff"}
+       io.github.kotoba-lang/text {:git/sha "3dcb2ab087933dc7b703b340dac9afce62cb30ff"}
+       ;; CAR writer validates every sha2-256 block before durable export.
+       io.github.kotoba-lang/io-ipld-car {:git/sha "0784e68b52891da7fa81c0d13c6743f60ec7d607"}
        io.github.kotoba-lang/io-libp2p {:local/root "../io-libp2p"}}
  :aliases
  {:test {:extra-paths ["test"]

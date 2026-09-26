@@ -252,6 +252,38 @@ python3 deploy/audit_lake.py \
   --count 821533 --ipfs-bin /path/to/ipfs --require-complete
 ```
 
+`deploy/export_lake_car.cljk` writes one bounded range of the dated inventory
+to CARv1 with `io-ipld-car`'s streaming writer. It checks the complete
+inventory SHA-256 and row count, downloads original blocks through one node's
+own HTTPS reader, checks size and CID, normalizes CIDv0 to equivalent CIDv1
+dag-pb, and publishes an fsynced file without replacing an existing output.
+A refusal removes the partial file. The receipt gives the row range, block
+count, CAR byte count and SHA-256 for a later storage handoff.
+
+```bash
+kbb --backend sci --classpath "$(kbb -Spath)" deploy/export_lake_car.cljk \
+  --inventory /path/to/inventory-20260926.jsonl \
+  --inventory-sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
+  --inventory-count 821533 --start-row 0 --max-blocks 3 --max-bytes 2000000 \
+  --base-url https://yataverse-data.220-146-170-114.sslip.io:8443/ipfs/ \
+  --output /path/to/first-3.car
+```
+
+On 2026-09-26 the first three actual rows exported from Xavier :8443 and gad
+:8444 to byte-identical 786,733-byte CARs, SHA-256
+`4e86a913a863b47f9067b52f9a3080d75345beb2e78d67fe07b19fd33e22c9ea`.
+A fresh offline Kubo repo imported the CAR and read back the first original
+CIDv0 block. A wrong inventory digest and a too-small output ceiling each
+exited 2 without publishing an output file. This is a three-block recovery
+canary, not a complete lake export or a Filecoin custody proof. The dated
+inventory's first 200 rows also exported from Xavier to a 49,132,040-byte
+CAR, SHA-256 `bc7aff2c03e7294a0f5bc141f23f5752b16f11a17eb2730e74a83bc2f075c482`.
+The fresh offline Kubo repo imported it and read back both the first and last
+CIDv0 blocks in that range. This larger canary is still a subset. The dated
+inventory totals 88,410,406,176 block bytes; 446 blocks exceed the current
+public reader's 8 MB per-block limit (largest 204,123,728 bytes). Those need
+a separately bounded large-block read path before a complete export.
+
 For the first public read entry, `deploy/xavier-public-lake.conf` exposes this
 same local service at `https://yataverse-data.220-146-170-114.sslip.io:8443/`
 through Xavier's Nginx and the shared router mapping (public 8443 to Xavier
