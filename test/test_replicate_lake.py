@@ -34,12 +34,15 @@ class FakeKubo:
         self.data[cid] = data
         self.pins.add(cid)
 
+    def require_disk_reserve(self, _size, _reserve):
+        pass
+
 
 def args(directory, budget=100, pages=10):
     return SimpleNamespace(
         state_dir=Path(directory), api_url="https://example.test/blocks",
         block_url_base="https://example.test/ipfs/", max_pages=pages,
-        max_new_bytes=budget, max_block_bytes=100,
+        max_new_bytes=budget, max_block_bytes=100, min_free_bytes=0,
     )
 
 
@@ -53,6 +56,13 @@ def page(blocks, cursor=None):
 
 
 class ReplicationTests(unittest.TestCase):
+    def test_physical_reserve_refuses_before_source_read(self):
+        node = replica.Kubo(shutil.which("true"))
+        node.repo_path = Path(tempfile.gettempdir())
+        with patch.object(replica.shutil, "disk_usage", return_value=SimpleNamespace(free=100)):
+            with self.assertRaisesRegex(replica.ReplicationError, "physical disk reserve"):
+                node.require_disk_reserve(30, 50)
+
     def test_large_cidv1_uses_explicit_large_block_mode(self):
         cid = "bafkreihg6pmtrfuwpybthr6nrhrqkxke3tosiecp2rhosu7psuzaagpsyy"
         data = b"x" * (2 * 1024 * 1024 + 1)
