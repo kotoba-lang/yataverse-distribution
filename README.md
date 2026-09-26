@@ -185,6 +185,20 @@ inventory to the path in the unit, then enable the service. This local route
 can be tested with a direct node connection. Public ingress and a live
 snapshot refresh still need separate qualification.
 
+For the first public read entry, `deploy/xavier-public-lake.conf` exposes this
+same local service at `https://yataverse-data.220-146-170-114.sslip.io:8443/`
+through Xavier's Nginx and the shared router mapping (public 8443 to Xavier
+443). Issue a certificate for that exact name using the port-80 webroot
+challenge before enabling the HTTPS server; retain the Isekai virtual host on
+the same listener. The Nginx config limits each source address to 8 requests
+per second and 8 simultaneous connections, permits GET only, and serves only
+`/health`, `/api/v1/lake/blocks`, and `/ipfs/{cid}`. The response headers
+`X-Yataverse-Inventory-Scope: dated-full` and
+`X-Yataverse-Bytes-Scope: local-pinned-only` distinguish inventory coverage
+from locally copied bytes. A public `/health` response still describes the
+inventory, not full block availability. This temporary hostname does not
+replace `yataverse.com` and the shared router is a failure domain.
+
 ## Honest state (what this repo does NOT do yet)
 
 - The murakumo overlay adapter (QUIC delivery of gossip forwards and
