@@ -193,6 +193,22 @@ inventory to the path in the unit, then enable the service. This local route
 can be tested with a direct node connection. Public ingress and a live
 snapshot refresh still need separate qualification.
 
+`deploy/audit_lake.py` compares the dated inventory against Kubo's durable
+direct and recursive pins. It refuses an absent or changed inventory, a failed
+pin listing, and invalid or duplicate rows, then reports exact pinned and
+missing rows and listed bytes. `--require-complete` exits 1 while any
+inventory CID is missing, 2 when the audit cannot answer, and 0 only when
+every inventory CID has a durable pin. It does not reread every block's
+content: the copy receipt and Kubo readback in `replicate_lake.py` cover that
+separate check. For a node:
+
+```
+python3 deploy/audit_lake.py \
+  --inventory /path/to/inventory-20260926.jsonl \
+  --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
+  --count 821533 --ipfs-bin /path/to/ipfs --require-complete
+```
+
 For the first public read entry, `deploy/xavier-public-lake.conf` exposes this
 same local service at `https://yataverse-data.220-146-170-114.sslip.io:8443/`
 through Xavier's Nginx and the shared router mapping (public 8443 to Xavier
