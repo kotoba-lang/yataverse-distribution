@@ -126,9 +126,12 @@ replicator stores the exact CID-checked bytes in a separately fsynced raw
 block store. Other pin failures still stop the batch. It
 records a receipt for each new block and advances the durable page cursor
 only when every block on that page is accounted for. Reruns skip pinned
-blocks after checking their size. The source listing and bytes endpoint
-still depend on Cloudflare; this is a physical copy path, not an independent
-read API or a public gateway.
+blocks after checking their size. The deployed listing comes from the pinned
+local inventory. Xavier initially seeds bytes from the public source; gad runs
+with `--peer-only` and reads bytes from Xavier's named HTTPS endpoint at its
+LAN address. A missing peer block stops gad's batch without advancing its
+page cursor; it never falls back to the public source. This is a two-node copy
+path on one router, not a separate WAN failure domain.
 
 Run as the node owner with `IPFS_PATH` set to its local repo. For example,
 gad uses `/usr/local/bin/ipfs` and `/home/gad/.ipfs`, while Xavier uses
@@ -181,6 +184,14 @@ and the current script as `~/.local/bin/yataverse-lake-replicate` (mode 755),
 then reload and enable the timer. Each node retains its own state directory.
 The timer does not change Kubo's `StorageMax`; measure the lake and physical
 capacity before increasing that limit.
+
+Keep Xavier ahead of gad before switching gad to `--peer-only`. Stop gad's
+timer and active service, install the peer-only service unit, reload systemd,
+then restart the timer after Xavier has advanced. Verify a fresh block on gad,
+the matching CID and byte digest on both nodes, and a successful LAN peer
+response in Xavier's web-server log. A peer 404 is an incomplete copy, not a
+reason to fetch from Cloudflare on gad. Xavier remains the bootstrap source
+until the full dated inventory is stored on both nodes.
 
 After measuring the dated lake at 88,410,406,176 bytes and checking 120 GB
 Kubo limits plus physical free space on both nodes, the deployed user units
