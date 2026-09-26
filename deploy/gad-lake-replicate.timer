@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly bounded Yataverse lake replication on gad
+
+[Timer]
+OnCalendar=*-*-* *:10:00 UTC
+Persistent=true
+Unit=yataverse-lake-replicate.service
+
+[Install]
+WantedBy=timers.target

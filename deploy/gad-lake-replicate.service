@@ -1,0 +1,12 @@
+[Unit]
+Description=Replicate a bounded batch of public Yataverse lake blocks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=IPFS_PATH=/home/gad/.ipfs
+ExecStart=/usr/bin/python3 /home/gad/.local/bin/yataverse-lake-replicate --ipfs-bin /usr/local/bin/ipfs --state-dir /home/gad/.local/state/yataverse-lake --max-pages 20 --max-new-bytes 512000000
+TimeoutStartSec=3600
+MemoryMax=1G
+Nice=10

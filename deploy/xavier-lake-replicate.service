@@ -1,0 +1,13 @@
+[Unit]
+Description=Replicate a bounded batch of public Yataverse lake blocks
+After=network-online.target ipfs.service
+Wants=network-online.target
+Requires=ipfs.service
+
+[Service]
+Type=oneshot
+Environment=IPFS_PATH=/mnt/nvme/ipfs-xavier/repo
+ExecStart=/usr/bin/python3 /home/xavier/.local/bin/yataverse-lake-replicate --ipfs-bin /mnt/nvme/ipfs-xavier/bin/ipfs --state-dir /mnt/nvme/ipfs-xavier/lake-state --max-pages 20 --max-new-bytes 512000000
+TimeoutStartSec=3600
+MemoryMax=1G
+Nice=10

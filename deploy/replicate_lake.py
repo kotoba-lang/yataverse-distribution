@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.parse
@@ -91,6 +92,7 @@ class Kubo:
         self.pins = set()
         self.repo_size = 0
         self.storage_max = 0
+        self.repo_path = None
 
     def run(self, *args, data=None):
         return command([self.binary] + list(args), data=data)
@@ -105,10 +107,18 @@ class Kubo:
         try:
             self.repo_size = int(fields["RepoSize"].strip())
             self.storage_max = int(fields["StorageMax"].strip())
+            self.repo_path = Path(fields["RepoPath"].strip())
         except (KeyError, ValueError) as exc:
             raise ReplicationError("Kubo repo capacity unreadable: {}".format(exc))
+        if not self.repo_path.is_dir():
+            raise ReplicationError("Kubo repo path is not a directory")
         if self.storage_max <= self.repo_size:
             raise ReplicationError("Kubo repo has no configured storage headroom")
+
+    def require_disk_reserve(self, new_bytes, reserve):
+        free = shutil.disk_usage(self.repo_path).free
+        if free - 2 * new_bytes < reserve:
+            raise ReplicationError("physical disk reserve would be crossed")
 
     def block_size(self, cid):
         stat = self.run("block", "stat", cid).decode("utf-8")
@@ -208,6 +218,7 @@ def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
                         "new_bytes": new_bytes, "cursor_advanced": False}
             if kubo.repo_size + 2 * (new_bytes + size) >= kubo.storage_max:
                 raise ReplicationError("Kubo storage limit would be exceeded before " + cid)
+            kubo.require_disk_reserve(size, args.min_free_bytes)
             data = block_fn(args.block_url_base + cid, args.max_block_bytes)
             if len(data) != size:
                 raise ReplicationError("source byte count differs from listing: " + cid)
@@ -246,9 +257,10 @@ def main():
     parser.add_argument("--max-pages", type=int, default=20)
     parser.add_argument("--max-new-bytes", type=int, default=512_000_000)
     parser.add_argument("--max-block-bytes", type=int, default=256_000_000)
+    parser.add_argument("--min-free-bytes", type=int, default=50_000_000_000)
     args = parser.parse_args()
-    if args.max_pages < 1 or args.max_new_bytes < 1 or args.max_block_bytes < 1:
-        parser.error("all budgets must be positive")
+    if args.max_pages < 1 or args.max_new_bytes < 1 or args.max_block_bytes < 1 or args.min_free_bytes < 0:
+        parser.error("batch budgets must be positive and disk reserve nonnegative")
     args.state_dir.mkdir(parents=True, exist_ok=True)
     lock_path = args.state_dir / "replicate.lock"
     try:

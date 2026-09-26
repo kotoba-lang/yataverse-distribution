@@ -135,16 +135,30 @@ most 20 pages and 512 MB of new bytes. `--max-pages`, `--max-new-bytes`, and
 `--max-block-bytes` bound an invocation; an exceeded byte budget returns a
 `byte-budget` status and retains the current page cursor. A failed source,
 CID mismatch, unreadable capacity, or invalid listing exits with `REFUSED`.
+The script also checks actual free space on the Kubo repo filesystem before
+each new block and reserves 50 GB by default (`--min-free-bytes`).
 
 Some listed blocks exceed Kubo's standard 2 MiB Bitswap block size. The
 script uses Kubo's explicit large-block option for these. Their local copy
 does not establish standard Bitswap delivery; an independent large-block
 transport or a compatible HTTP gateway must be qualified separately.
 
-Before increasing Kubo `StorageMax` or scheduling full replication, measure
-the whole listing and leave enough capacity for both nodes. A bounded live
+Before increasing Kubo `StorageMax` toward full replication, measure the
+whole listing and leave enough capacity for both nodes. A bounded live
 run on each node copied 3 new blocks / 786,474 bytes and verified 53 listed
 blocks, stopping before the first page cursor on the 1 MB byte budget.
+Subsequent bounded runs covered the first four full pages and part of the
+fifth: 987 listed blocks are pinned on each node, with equal checkpoints
+(`pages_total=4`, `new_blocks_total=937`, `new_bytes_total=236213699`;
+the other 50 blocks were already pinned from the earlier probe).
+
+The matching `deploy/{gad,xavier}-lake-replicate.{service,timer}` user units
+run a 512 MB batch hourly, staggered at 10 and 40 minutes UTC. Install the
+node's service and timer as `~/.config/systemd/user/yataverse-lake-replicate.*`
+and the current script as `~/.local/bin/yataverse-lake-replicate` (mode 755),
+then reload and enable the timer. Each node retains its own state directory.
+The timer does not change Kubo's `StorageMax`; measure the lake and physical
+capacity before increasing that limit.
 
 ## Honest state (what this repo does NOT do yet)
 
