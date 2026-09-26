@@ -286,6 +286,21 @@ class ReplicationTests(unittest.TestCase):
         sleeper.assert_not_called()
         self.assertEqual(public_calls, len([entry for entry in urls if entry[0] == "public"]))
 
+    def test_peer_on_nonstandard_https_port_requires_matching_resolve(self):
+        args = SimpleNamespace(
+            block_url_base="https://public.example/ipfs/",
+            peer_block_url_base="https://yataverse-data.example:8443/ipfs/",
+            peer_resolve="yataverse-data.example:8443:192.168.1.16",
+            peer_only=True)
+        with patch.object(replica, "curl", return_value=b"abc") as fetch:
+            result = replica.peer_first_block_fetcher(args, self.fail)(
+                args.block_url_base + CID_A, 3)
+        self.assertEqual(b"abc", result)
+        self.assertEqual(args.peer_resolve, fetch.call_args.kwargs["resolve"])
+        args.peer_resolve = "yataverse-data.example:443:192.168.1.16"
+        with self.assertRaisesRegex(replica.ReplicationError, "explicit HTTPS host and address"):
+            replica.peer_first_block_fetcher(args, self.fail)
+
     def test_prefetch_overlaps_fetches_and_preserves_receipt_order(self):
         barrier = threading.Barrier(2, timeout=3)
         fetched = []

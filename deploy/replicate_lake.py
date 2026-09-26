@@ -503,8 +503,9 @@ def peer_first_block_fetcher(args, public_fetch):
         return public_fetch
     peer = urllib.parse.urlsplit(peer_base)
     resolve = getattr(args, "peer_resolve", None)
+    peer_port = peer.port or 443
     if (peer.scheme != "https" or not peer.hostname or not peer_base.endswith("/ipfs/") or
-            not resolve or not resolve.startswith(peer.hostname + ":443:")):
+            not resolve or not resolve.startswith(peer.hostname + ":{}:".format(peer_port))):
         raise ReplicationError("peer source must be an explicit HTTPS host and address")
 
     def fetch(url, limit):
