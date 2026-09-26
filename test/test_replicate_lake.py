@@ -5,6 +5,7 @@ import json
 import shutil
 import tempfile
 import threading
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from unittest.mock import patch
 
 
 source = Path(__file__).resolve().parents[1] / "deploy" / "replicate_lake.py"
+sys.path.insert(0, str(source.parent))
 spec = importlib.util.spec_from_file_location("replicate_lake", source)
 replica = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(replica)

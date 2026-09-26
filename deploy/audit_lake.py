@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from raw_block_store import RawBlockStore, RawBlockStoreError
 
 
 CID = re.compile(r"^(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,200})$")
@@ -48,13 +49,14 @@ def durable_pins(ipfs_bin):
     return pins
 
 
-def audit_inventory(path, expected_sha256, expected_count, pins):
+def audit_inventory(path, expected_sha256, expected_count, pins, raw_store=None):
     if expected_count < 1 or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
         raise AuditError("declared snapshot identity is invalid")
     digest = hashlib.sha256()
     seen = set()
-    count = total_bytes = pinned_count = pinned_bytes = 0
+    count = total_bytes = pinned_count = pinned_bytes = raw_count = raw_bytes = 0
     missing = []
+    raw_cids = raw_store.cids() if raw_store is not None else set()
     try:
         with Path(path).open("rb") as source:
             for line in source:
@@ -74,19 +76,26 @@ def audit_inventory(path, expected_sha256, expected_count, pins):
                 if cid in pins:
                     pinned_count += 1
                     pinned_bytes += size
+                elif cid in raw_cids:
+                    raw = raw_store.read(cid, max_bytes=size)
+                    if raw is None or len(raw) != size:
+                        raise AuditError("raw block size differs from inventory: " + cid)
+                    raw_count += 1
+                    raw_bytes += size
                 elif len(missing) < 3:
                     missing.append(cid)
     except OSError as exc:
         raise AuditError("inventory unreadable: " + str(exc)) from exc
     if count != expected_count or digest.hexdigest() != expected_sha256:
         raise AuditError("inventory count or SHA-256 differs from declared snapshot")
-    missing_count = count - pinned_count
+    missing_count = count - pinned_count - raw_count
     return {"status": "complete" if missing_count == 0 else "partial",
             "inventory_rows": count, "inventory_bytes": total_bytes,
             "pinned_rows": pinned_count, "pinned_bytes": pinned_bytes,
-            "missing_rows": missing_count, "missing_bytes": total_bytes - pinned_bytes,
+            "raw_rows": raw_count, "raw_bytes": raw_bytes,
+            "missing_rows": missing_count, "missing_bytes": total_bytes - pinned_bytes - raw_bytes,
             "missing_sample": missing, "inventory_sha256": digest.hexdigest(),
-            "scope": "durable-pin-coverage-not-content-readback"}
+            "scope": "durable-pins-plus-cid-verified-raw-blocks"}
 
 
 def main():
@@ -95,12 +104,14 @@ def main():
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--count", required=True, type=int)
     parser.add_argument("--ipfs-bin", required=True)
+    parser.add_argument("--raw-block-store", type=Path)
     parser.add_argument("--require-complete", action="store_true")
     args = parser.parse_args()
     try:
         report = audit_inventory(args.inventory, args.sha256, args.count,
-                                 durable_pins(args.ipfs_bin))
-    except AuditError as exc:
+                                 durable_pins(args.ipfs_bin),
+                                 RawBlockStore(args.raw_block_store) if args.raw_block_store else None)
+    except (AuditError, RawBlockStoreError) as exc:
         print("REFUSED: " + str(exc), file=sys.stderr)
         return 2
     print(json.dumps(report, sort_keys=True))

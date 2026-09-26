@@ -9,6 +9,7 @@ import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from raw_block_store import RawBlockStore, RawBlockStoreError
 
 
 CID = re.compile(r"^[a-zA-Z0-9]{46,100}$")
@@ -65,11 +66,12 @@ class Inventory:
 
 
 class LocalBlocks:
-    def __init__(self, ipfs_bin, ipfs_path, inventory, max_block_bytes):
+    def __init__(self, ipfs_bin, ipfs_path, inventory, max_block_bytes, raw_store=None):
         self.ipfs_bin = ipfs_bin
         self.ipfs_path = ipfs_path
         self.inventory = inventory
         self.max_block_bytes = max_block_bytes
+        self.raw_store = raw_store
 
     def read(self, cid):
         size = self.inventory.sizes.get(cid)
@@ -77,6 +79,15 @@ class LocalBlocks:
             raise InventoryError("CID absent from inventory")
         if size > self.max_block_bytes:
             raise InventoryError("block exceeds API byte limit")
+        if self.raw_store is not None:
+            try:
+                data = self.raw_store.read(cid, max_bytes=self.max_block_bytes)
+            except RawBlockStoreError as exc:
+                raise InventoryError("raw block store refused " + cid) from exc
+            if data is not None:
+                if len(data) != size:
+                    raise InventoryError("raw block size differs from inventory")
+                return data
         import os
         env = dict(os.environ, IPFS_PATH=self.ipfs_path)
         pin = subprocess.run([self.ipfs_bin, "pin", "ls", "--type=all", cid],
@@ -138,12 +149,15 @@ def main():
     parser.add_argument("--count", required=True, type=int)
     parser.add_argument("--ipfs-bin", required=True)
     parser.add_argument("--ipfs-path", required=True)
+    parser.add_argument("--raw-block-store", type=Path)
     parser.add_argument("--max-block-bytes", type=int, default=8_000_000)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
     args = parser.parse_args()
     inventory = Inventory(args.inventory, args.sha256, args.count)
-    blocks = LocalBlocks(args.ipfs_bin, args.ipfs_path, inventory, args.max_block_bytes)
+    raw_store = RawBlockStore(args.raw_block_store) if args.raw_block_store else None
+    blocks = LocalBlocks(args.ipfs_bin, args.ipfs_path, inventory,
+                         args.max_block_bytes, raw_store=raw_store)
     ThreadingHTTPServer((args.host, args.port), handler_for(inventory, blocks)).serve_forever()
 
 

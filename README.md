@@ -120,7 +120,10 @@ drill are still separate qualification steps.
 
 `deploy/replicate_lake.py` copies the public lake block listing to a local
 Kubo node in bounded batches. It checks each listed byte count, makes Kubo
-rederive the original CID, reads the block back, then direct-pins it. It
+rederive the original CID, reads the block back, then direct-pins it. If Kubo
+rejects pinning because the dag-pb bytes cannot be decoded as protobuf, the
+replicator stores the exact CID-checked bytes in a separately fsynced raw
+block store. Other pin failures still stop the batch. It
 records a receipt for each new block and advances the durable page cursor
 only when every block on that page is accounted for. Reruns skip pinned
 blocks after checking their size. The source listing and bytes endpoint
@@ -134,14 +137,19 @@ The deployed units set `--kubo-api-url http://127.0.0.1:5001` so each block
 uses the daemon's loopback RPC instead of starting a CLI process repeatedly.
 Startup still reads the CLI pin list and repo status, and refuses when the RPC
 daemon reports a different repo path. Every new block still requires the
-expected CID, exact byte readback, and a confirmed direct or recursive pin
-before its receipt or page cursor is advanced. The RPC URL accepts loopback
+expected CID and exact byte readback, followed by a confirmed Kubo pin or a
+durable raw block whose sha2-256 CID is rederived independently, before its
+receipt or page cursor is advanced. The RPC URL accepts loopback
 only; do not publish Kubo's admin API. Omitting the option retains the CLI
 path for bounded manual probes. On gad, 20 already-pinned `block stat`
 measurements had 25.4 ms CLI and 1.3 ms RPC median; this measures call
 overhead, not full-batch throughput. A new 38-byte gad canary and 41-byte
 Xavier canary each passed CID, readback, size, and direct-pin checks through
-the RPC path.
+the RPC path. Install `deploy/raw_block_store.py` beside both installed
+Python scripts and give the replication and read services the same
+`--raw-block-store` path on their own node. Only the observed `pin: protobuf:`
+decode refusal uses this store. A corrupted or incomplete stored block
+refuses on read and audit rather than counting as replicated.
 Give each node its own persistent `--state-dir`. The default batch copies at
 most 20 pages and 512 MB of new bytes. `--max-pages`, `--max-new-bytes`, and
 `--max-block-bytes` bound an invocation; an exceeded byte budget returns a
@@ -187,13 +195,14 @@ prove full replication.
 ## Local read API from the dated lake snapshot
 
 `deploy/serve_lake.py` serves the complete, dated inventory and locally pinned
-raw blocks without fetching from Cloudflare. It refuses startup unless the
+or CID-verified raw blocks without fetching from Cloudflare. It refuses startup unless the
 inventory's SHA-256 and row count match the declared snapshot. Its
 `/api/v1/lake/blocks` response uses the same `blocks`, `cursor`, and
 `truncated?` fields as the replication source, with a local integer cursor.
-`/ipfs/{cid}` accepts only a CID in that inventory, confirms a direct or
-recursive Kubo pin, then reads the block with `ipfs --offline`. Unpinned,
-missing, or oversized blocks return an error. `/health` describes the
+`/ipfs/{cid}` accepts only a CID in that inventory. It either validates the
+raw store's CID, size, and digest or confirms a direct/recursive Kubo pin and
+reads the block with `ipfs --offline`. Missing or oversized blocks return an
+error. `/health` describes the
 inventory only; it does not certify that all block bytes have been copied.
 
 The first deployment uses the dated `inventory-20260926.jsonl` snapshot
@@ -209,12 +218,14 @@ can be tested with a direct node connection. Public ingress and a live
 snapshot refresh still need separate qualification.
 
 `deploy/audit_lake.py` compares the dated inventory against Kubo's durable
-direct and recursive pins. It refuses an absent or changed inventory, a failed
-pin listing, and invalid or duplicate rows, then reports exact pinned and
-missing rows and listed bytes. `--require-complete` exits 1 while any
-inventory CID is missing, 2 when the audit cannot answer, and 0 only when
-every inventory CID has a durable pin. It does not reread every block's
-content: the copy receipt and Kubo readback in `replicate_lake.py` cover that
+direct/recursive pins and, when `--raw-block-store` is supplied, checks the
+CID and bytes of each raw sidecar block. It refuses an absent or changed
+inventory, a failed pin listing, corrupted sidecar bytes, and invalid or
+duplicate rows, then reports pinned, raw, and missing coverage separately.
+`--require-complete` exits 1 while any inventory CID is missing, 2 when the
+audit cannot answer, and 0 only when every inventory CID has a durable pin
+or verified raw copy. It does not reread every pinned block's content: the
+copy receipt and Kubo readback in `replicate_lake.py` cover that
 separate check. For a node:
 
 ```
