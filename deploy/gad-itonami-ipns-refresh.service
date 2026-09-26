@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh Itonami's dated static IPNS name from gad
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=IPFS_PATH=/home/gad/.ipfs
+Environment=IPFS_TELEMETRY=off
+ExecStart=/home/gad/.local/bin/yataverse-ipns-refresh /usr/local/bin/ipfs /home/gad/.local/state/itonami/current-cid k51qzi5uqu5dgbd0a8zlo49u11rkmhksg465sgmzstwvz0bz4aswwix3j7yvns itonami-static
+TimeoutStartSec=240
+MemoryMax=256M
+CPUQuota=50%

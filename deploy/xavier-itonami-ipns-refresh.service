@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh Itonami's dated static IPNS name from Xavier
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=IPFS_PATH=/mnt/nvme/ipfs-xavier/repo
+Environment=IPFS_TELEMETRY=off
+ExecStart=/home/xavier/.local/bin/yataverse-ipns-refresh /mnt/nvme/ipfs-xavier/bin/ipfs /mnt/nvme/ipfs-xavier/itonami/current-cid k51qzi5uqu5dgbd0a8zlo49u11rkmhksg465sgmzstwvz0bz4aswwix3j7yvns itonami-static
+TimeoutStartSec=240
+MemoryMax=256M
+CPUQuota=50%
