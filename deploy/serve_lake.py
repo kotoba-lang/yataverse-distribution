@@ -51,9 +51,16 @@ class Inventory:
                 total += size
         if digest.hexdigest() != expected_sha256 or len(self.offsets) != expected_count:
             raise InventoryError("inventory digest or row count differs from declared snapshot")
+        self.sha256 = expected_sha256
         self.total_bytes = total
+        self.file_identity = self.path.stat()
 
     def page(self, offset):
+        current = self.path.stat()
+        if (current.st_ino, current.st_size, current.st_mtime_ns) != (
+                self.file_identity.st_ino, self.file_identity.st_size,
+                self.file_identity.st_mtime_ns):
+            raise InventoryError("inventory file changed since startup")
         if offset < 0 or offset >= len(self.offsets):
             raise InventoryError("cursor outside inventory")
         end = min(offset + PAGE_SIZE, len(self.offsets))
@@ -63,7 +70,7 @@ class Inventory:
             for _ in range(offset, end):
                 row = json.loads(source.readline())
                 rows.append({"cid": row["cid"], "size": row["bytes"]})
-        return {"ok": True, "blocks": rows,
+        return {"ok": True, "inventory-sha256": self.sha256, "blocks": rows,
                 "cursor": str(end) if end < len(self.offsets) else None,
                 "truncated?": end < len(self.offsets)}
 
@@ -116,7 +123,8 @@ def handler_for(inventory, blocks):
             large_block_acquired = False
             try:
                 if parsed.path == "/health":
-                    payload = json.dumps({"ok": True, "rows": len(inventory.offsets),
+                    payload = json.dumps({"ok": True, "inventory-sha256": inventory.sha256,
+                                          "rows": len(inventory.offsets),
                                           "bytes": inventory.total_bytes}).encode()
                     content_type = "application/json"
                 elif parsed.path == "/api/v1/lake/blocks":

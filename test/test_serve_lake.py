@@ -41,6 +41,15 @@ class ServingTests(unittest.TestCase):
             with self.assertRaisesRegex(serve.InventoryError, "duplicate CID"):
                 serve.Inventory(inventory.path, hashlib.sha256(inventory.path.read_bytes()).hexdigest(), 2)
 
+    def test_listing_refuses_inventory_file_replacement_after_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inventory = self.inventory(directory)
+            replacement = Path(directory) / "replacement.jsonl"
+            replacement.write_bytes(inventory.path.read_bytes())
+            replacement.replace(inventory.path)
+            with self.assertRaisesRegex(serve.InventoryError, "changed since startup"):
+                inventory.page(0)
+
     def test_listing_has_bounded_cursor_and_original_size(self):
         with tempfile.TemporaryDirectory() as directory:
             inventory = self.inventory(directory)
@@ -48,6 +57,7 @@ class ServingTests(unittest.TestCase):
                 first = inventory.page(0)
                 last = inventory.page(int(first["cursor"]))
             self.assertEqual([{"cid": CID_A, "size": 3}], first["blocks"])
+            self.assertEqual(inventory.sha256, first["inventory-sha256"])
             self.assertEqual("1", first["cursor"])
             self.assertTrue(first["truncated?"])
             self.assertEqual([{"cid": CID_B, "size": 3}], last["blocks"])
@@ -88,6 +98,7 @@ class ServingTests(unittest.TestCase):
                 page = json.loads(response.read())
                 self.assertEqual(200, response.status)
                 self.assertEqual(2, len(page["blocks"]))
+                self.assertEqual(inventory.sha256, page["inventory-sha256"])
                 connection.request("GET", "/api/v1/lake/blocks?cursor=-1")
                 response = connection.getresponse()
                 response.read()

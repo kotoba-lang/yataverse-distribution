@@ -133,6 +133,99 @@ class ReplicationTests(unittest.TestCase):
             self.assertEqual(old, state_path.read_bytes())
             self.assertFalse((root / "checkpoint.pre-local-inventory.json").exists())
 
+    def test_new_inventory_rewinds_and_copies_interleaved_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = root / "old.jsonl"
+            new = root / "new.jsonl"
+            old.write_text(json.dumps({"cid": CID_B, "bytes": 3}) + "\n")
+            new.write_text("".join(json.dumps({"cid": cid, "bytes": 3}) + "\n"
+                                   for cid in (CID_A, CID_B)))
+            old_sha = hashlib.sha256(old.read_bytes()).hexdigest()
+            new_sha = hashlib.sha256(new.read_bytes()).hexdigest()
+            state_path = root / "checkpoint.json"
+            state = replica.state_load(state_path)
+            state.update(cursor=None, listing_source="local-inventory:" + old_sha,
+                         new_blocks_total=1, new_bytes_total=3)
+            replica.state_save(state_path, state)
+            original = state_path.read_bytes()
+            config = args(directory)
+            config.api_url = "http://127.0.0.1:8090/api/v1/lake/blocks"
+            config.inventory_path = new
+            config.inventory_sha256 = new_sha
+            config.previous_inventory_path = old
+            config.previous_inventory_sha256 = old_sha
+            node = FakeKubo()
+            node.pins.add(CID_B)
+            node.data[CID_B] = b"bbb"
+            listing = page([(CID_A, b"aaa"), (CID_B, b"bbb")])
+            listing["inventory-sha256"] = new_sha
+            with patch.object(replica, "fetch_listing", return_value=listing):
+                result = replica.run_batch(config, node,
+                                           lambda _url, _cursor: listing,
+                                           lambda _url, _limit: b"aaa")
+            self.assertEqual("cycle-complete", result["status"])
+            self.assertEqual(1, result["new_blocks"])
+            self.assertEqual({CID_A, CID_B}, node.pins)
+            self.assertEqual(original, (root / ("checkpoint.pre-inventory-" + old_sha + ".json")).read_bytes())
+            migrated = replica.state_load(state_path)
+            self.assertEqual("local-inventory:" + new_sha, migrated["listing_source"])
+            self.assertEqual(2, migrated["new_blocks_total"])
+
+    def test_new_inventory_refuses_omission_and_stale_reader_without_checkpoint_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = root / "old.jsonl"
+            new = root / "new.jsonl"
+            old.write_text(json.dumps({"cid": CID_B, "bytes": 3}) + "\n")
+            new.write_text(json.dumps({"cid": CID_A, "bytes": 3}) + "\n")
+            old_sha = hashlib.sha256(old.read_bytes()).hexdigest()
+            new_sha = hashlib.sha256(new.read_bytes()).hexdigest()
+            state_path = root / "checkpoint.json"
+            state = replica.state_load(state_path)
+            state.update(cursor="0", listing_source="local-inventory:" + old_sha)
+            replica.state_save(state_path, state)
+            original = state_path.read_bytes()
+            config = args(directory)
+            config.api_url = "http://127.0.0.1:8090/api/v1/lake/blocks"
+            config.inventory_path = new
+            config.inventory_sha256 = new_sha
+            config.previous_inventory_path = old
+            config.previous_inventory_sha256 = old_sha
+            with patch.object(replica, "fetch_listing") as listing:
+                with self.assertRaisesRegex(replica.ReplicationError,
+                                            "new inventory omits or changes previous CID"):
+                    replica.prepare_listing_state(config, state_path, state)
+            listing.assert_not_called()
+            self.assertEqual(original, state_path.read_bytes())
+            new.write_text("".join(json.dumps({"cid": cid, "bytes": 3}) + "\n"
+                                   for cid in (CID_A, CID_B)))
+            config.inventory_sha256 = hashlib.sha256(new.read_bytes()).hexdigest()
+            with patch.object(replica, "fetch_listing", return_value={"inventory-sha256": old_sha}):
+                with self.assertRaisesRegex(replica.ReplicationError,
+                                            "local listing is not serving the new inventory"):
+                    replica.prepare_listing_state(config, state_path, state)
+            self.assertEqual(original, state_path.read_bytes())
+            self.assertFalse((root / ("checkpoint.pre-inventory-" + old_sha + ".json")).exists())
+
+    def test_local_page_identity_refuses_before_block_fetch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inventory = root / "inventory.jsonl"
+            inventory.write_text(json.dumps({"cid": CID_A, "bytes": 3}) + "\n")
+            digest = hashlib.sha256(inventory.read_bytes()).hexdigest()
+            config = args(directory)
+            config.api_url = "http://127.0.0.1:8090/api/v1/lake/blocks"
+            config.inventory_path = inventory
+            config.inventory_sha256 = digest
+            node = FakeKubo()
+            with self.assertRaisesRegex(replica.ReplicationError,
+                                        "local listing inventory identity differs"):
+                replica.run_batch(config, node,
+                                  lambda _url, _cursor: page([(CID_A, b"abc")]),
+                                  lambda _url, _limit: self.fail("block fetch reached"))
+            self.assertEqual(set(), node.pins)
+
     def test_peer_first_source_and_peer_only_refusal(self):
         peer = "https://yataverse-data.example/ipfs/"
         args_peer = SimpleNamespace(
