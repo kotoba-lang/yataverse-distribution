@@ -286,7 +286,40 @@ reader accepts an explicit 256 MB ceiling for the dated inventory and allows
 only one request above 8 MB at a time, returning 503 to a second large read.
 Both node units set `MemoryMax=2G`. The reader still buffers one block, so
 live qualification must include a largest-class block from each node and
-memory observation before treating the whole inventory as exportable.
+memory observation before treating the whole inventory as exportable. The
+203,519,718-byte row 16866 was read through both public HTTPS routes with
+SHA-256 `1ae98a9fe61f9d70ac7f94f1a2e4129c3ca858b68273f8a5ddcf079644f6b499`.
+Gad's observed reader memory peak was 607,698,944 bytes under its 2 GiB cap.
+Xavier also returned the complete block; its user service did not expose a
+memory peak in this check.
+
+For oversized source blocks, use `deploy/export_large_lake_block.py`. A CAR
+frame containing the unmodified 203 MB raw block was written successfully,
+but a fresh Kubo repo refused to import that single oversized section even
+with `--allow-big-block`. The large-block exporter instead builds 256 KiB
+UnixFS leaves, exports that DAG as a CAR, imports it into a fresh offline Kubo
+repo, cats the root, checks the original byte count and sha2-256 CID digest,
+and rehydrates the original CID with `ipfs block put --allow-big-block` before
+publishing the CAR and JSON receipt. The recovery root is a new CID; the
+receipt preserves its mapping to the original lake CID.
+`export_lake_car.cljk` refuses these blocks by name and sends them to this
+recovery path; it does not publish a CAR that has not passed the importer.
+
+```bash
+python3 deploy/export_large_lake_block.py \
+  --inventory /path/to/inventory-20260926.jsonl \
+  --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
+  --count 821533 --row 16866 \
+  --base-url https://yataverse-data.220-146-170-114.sslip.io:8443/ipfs/ \
+  --ipfs-bin /path/to/ipfs --output /path/to/row-16866-recovery.car
+```
+
+For row 16866, this produced a 203,589,477-byte CAR with SHA-256
+`2feec457907ce841a90b49dc0aca4c5b3cced60109970fa7ed50299ad5d3f978`
+and recovery root `bafybeic4uk6d2ose5wyadez6df4vtfnj7ypghxgrrwo5f2eddashia4gma`.
+The automated fresh-repo import, offline cat, and original-CID rehydration
+passed. This validates one large block; the remaining 445 large blocks and
+the complete lake still need export, storage placement and retrieval checks.
 
 For the first public read entry, `deploy/xavier-public-lake.conf` exposes this
 same local service at `https://yataverse-data.220-146-170-114.sslip.io:8443/`
