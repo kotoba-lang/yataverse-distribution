@@ -176,7 +176,8 @@ inventory only; it does not certify that all block bytes have been copied.
 The first deployment uses the dated `inventory-20260926.jsonl` snapshot
 (821,533 rows; SHA-256
 `f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188`)
-and binds `127.0.0.1:8090`. Install `serve_lake.py` as
+and binds loopback only (`gad:18090`, `xavier:8090`; gad's 8090 and 8091
+are occupied by local model servers). Install `serve_lake.py` as
 `~/.local/bin/yataverse-lake-read` and the matching
 `deploy/{gad,xavier}-lake-read.service` as
 `~/.config/systemd/user/yataverse-lake-read.service`. Copy the verified
