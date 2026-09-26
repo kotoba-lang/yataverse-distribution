@@ -133,6 +133,36 @@ LAN address. A missing peer block stops gad's batch without advancing its
 page cursor; it never falls back to the public source. This is a two-node copy
 path on one router, not a separate WAN failure domain.
 
+### Temporary R2 bootstrap bridge
+
+The operator host can read the same immutable blocks directly from R2 using
+its existing Wrangler OAuth session. `deploy/r2_origin_bridge.py` checks the
+entire pinned inventory digest on startup, accepts only listed CIDs, bounds
+in-flight memory, and verifies every returned size and CID before serving a
+block. It binds **127.0.0.1 only**. An SSH reverse tunnel can make it appear as
+Xavier's `127.0.0.1:18095`; the OAuth token stays on the operator host.
+
+```sh
+python3 deploy/r2_origin_bridge.py \
+  --inventory /path/to/inventory-20260926.jsonl \
+  --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
+  --account-id 4da88288dc30d9ee257f319d3c33ecf0 \
+  --bucket kotobase-graph-database-production
+ssh -N -o ExitOnForwardFailure=yes \
+  -R 127.0.0.1:18095:127.0.0.1:18095 root@xavier
+```
+
+Run the tunnel as a separate process. Xavier's service first tries its local
+peer, then the bridge, then the existing public gateway. The batch JSON
+records `origin_sources` so public fallback cannot be reported as bridge
+success. When the bridge is unavailable, attempts are suppressed for one
+minute before another probe; the public path remains usable. This operator
+relay accelerates a dated bootstrap and does not qualify independent ongoing
+ingress or ownership of the canonical hostname. In a bounded live probe, 100
+listed blocks (6,167,497 bytes) reached Xavier through the SSH tunnel in
+4.53 seconds with every CID verified. Full-lake completion remains a separate
+checkpoint and audit requirement.
+
 Run as the node owner with `IPFS_PATH` set to its local repo. For example,
 gad uses `/usr/local/bin/ipfs` and `/home/gad/.ipfs`, while Xavier uses
 `/mnt/nvme/ipfs-xavier/bin/ipfs` and `/mnt/nvme/ipfs-xavier/repo`.

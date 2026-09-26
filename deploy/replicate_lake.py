@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import uuid
@@ -531,6 +532,58 @@ def peer_first_block_fetcher(args, public_fetch):
     return fetch
 
 
+def origin_fallback_block_fetcher(args, primary_fetch):
+    """Use the public origin only when a configured local bootstrap source fails.
+
+    The source counts are emitted with each batch result, so the bridge failing
+    cannot be mistaken for a successful bridge-backed copy.
+    """
+    fallback_base = getattr(args, "fallback_block_url_base", None)
+    if not fallback_base:
+        return primary_fetch
+    primary_base = args.block_url_base
+    if (not primary_base.endswith("/ipfs/") or
+            not fallback_base.startswith("https://") or
+            not fallback_base.endswith("/ipfs/") or
+            primary_base == fallback_base):
+        raise ReplicationError("invalid origin fallback configuration")
+    counts = {"primary": 0, "fallback": 0}
+    count_lock = threading.Lock()
+    primary_suppressed_until = 0.0
+
+    def fetch(url, limit):
+        nonlocal primary_suppressed_until
+        if not url.startswith(primary_base):
+            raise ReplicationError("block source URL differs from configured base")
+        cid = url[len(primary_base):]
+        if not valid_cid(cid):
+            raise ReplicationError("block source URL has invalid CID")
+        with count_lock:
+            suppressed = time.monotonic() < primary_suppressed_until
+        try:
+            if suppressed:
+                raise ReplicationError("primary bridge temporarily unavailable")
+            data = primary_fetch(url, limit)
+            source = "primary"
+        except ReplicationError as primary_error:
+            if not suppressed:
+                with count_lock:
+                    primary_suppressed_until = time.monotonic() + 60
+            try:
+                data = primary_fetch(fallback_base + cid, limit)
+                source = "fallback"
+            except ReplicationError as fallback_error:
+                raise ReplicationError(
+                    "both block origins failed: primary={}, fallback={}".format(
+                        primary_error, fallback_error)) from fallback_error
+        with count_lock:
+            counts[source] += 1
+        return data
+
+    fetch.source_counts = counts
+    return fetch
+
+
 def append_receipt(path, cid, size, data):
     receipt = {
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -576,7 +629,13 @@ def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
     state_path = args.state_dir / "checkpoint.json"
     receipt_path = args.state_dir / "receipts.jsonl"
     state = prepare_listing_state(args, state_path, state_load(state_path))
-    fetch_block = peer_first_block_fetcher(args, block_fn)
+    origin_fetch = origin_fallback_block_fetcher(args, block_fn)
+    fetch_block = peer_first_block_fetcher(args, origin_fetch)
+
+    def result_with_sources(result):
+        if hasattr(origin_fetch, "source_counts"):
+            result["origin_sources"] = dict(origin_fetch.source_counts)
+        return result
     kubo.preflight()
     new_bytes = 0
     new_blocks = 0
@@ -626,9 +685,9 @@ def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
             state_save(state_path, state)
 
         if budget_stop:
-            return {"status": "byte-budget", "pages": pages,
+            return result_with_sources({"status": "byte-budget", "pages": pages,
                     "checked_blocks": checked_blocks, "new_blocks": new_blocks,
-                    "new_bytes": new_bytes, "cursor_advanced": False}
+                    "new_bytes": new_bytes, "cursor_advanced": False})
 
         pages += 1
         state["pages_total"] += 1
@@ -639,12 +698,12 @@ def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
             state["cursor"] = None
             state["cycles"] += 1
             state_save(state_path, state)
-            return {"status": "cycle-complete", "pages": pages,
+            return result_with_sources({"status": "cycle-complete", "pages": pages,
                     "checked_blocks": checked_blocks, "new_blocks": new_blocks,
-                    "new_bytes": new_bytes, "cursor_advanced": True}
-    return {"status": "page-limit", "pages": pages,
+                    "new_bytes": new_bytes, "cursor_advanced": True})
+    return result_with_sources({"status": "page-limit", "pages": pages,
             "checked_blocks": checked_blocks, "new_blocks": new_blocks,
-            "new_bytes": new_bytes, "cursor_advanced": True}
+            "new_bytes": new_bytes, "cursor_advanced": True})
 
 
 def main():
@@ -660,6 +719,7 @@ def main():
     parser.add_argument("--previous-inventory-path", type=Path)
     parser.add_argument("--previous-inventory-sha256")
     parser.add_argument("--block-url-base", default=DEFAULT_BLOCKS)
+    parser.add_argument("--fallback-block-url-base")
     parser.add_argument("--peer-block-url-base")
     parser.add_argument("--peer-resolve")
     parser.add_argument("--peer-only", action="store_true")
