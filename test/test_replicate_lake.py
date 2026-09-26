@@ -308,6 +308,39 @@ class ReplicationTests(unittest.TestCase):
             self.assertEqual([CID_A, CID_B], [r["cid"] for r in receipts])
             self.assertEqual({CID_A, CID_B}, set(fetched))
 
+    def test_completed_batch_persists_source_counts_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = args(directory)
+            config.fallback_block_url_base = "https://fallback.test/ipfs/"
+            config.inventory_sha256 = "a" * 64
+            with patch.dict(replica.os.environ, {"INVOCATION_ID": "test-invocation"}):
+                result = replica.run_and_record_batch(
+                    config, FakeKubo(),
+                    lambda _url, _cursor: page([(CID_A, b"abc")]),
+                    lambda _url, _limit: b"abc")
+            files = list((Path(directory) / "batch-receipts").glob("*.json"))
+            self.assertEqual(1, len(files))
+            receipt = json.loads(files[0].read_text())
+            self.assertEqual(result, receipt["result"])
+            self.assertEqual({"primary": 1, "fallback": 0},
+                             receipt["result"]["origin_sources"])
+            self.assertEqual("test-invocation", receipt["systemd_invocation_id"])
+            self.assertEqual("a" * 64, receipt["inventory_sha256"])
+            self.assertEqual(1, receipt["checkpoint"]["new_blocks_total"])
+            self.assertEqual(1, receipt["checkpoint"]["cycles"])
+            self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(),
+                             receipt["script_sha256"])
+
+    def test_failed_batch_has_no_completion_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(replica.ReplicationError,
+                                        "source byte count differs"):
+                replica.run_and_record_batch(
+                    args(directory), FakeKubo(),
+                    lambda _url, _cursor: page([(CID_A, b"abc")]),
+                    lambda _url, _limit: b"x")
+            self.assertFalse((Path(directory) / "batch-receipts").exists())
+
     def test_prefetch_respects_byte_budget_before_network(self):
         fetched = []
         with tempfile.TemporaryDirectory() as directory:
