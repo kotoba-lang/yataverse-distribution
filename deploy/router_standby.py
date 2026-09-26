@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Move the shared public HTTPS lease to gad after xavier gateway loss.
+"""Check the shared public HTTPS lease and perform explicitly enabled cutovers.
 
-The two nodes still share one router. This protects against a node/gateway
-failure, not router, ISP, DNS, certificate, or site-update failure.
+The router returned 718 after removing 8443 during a 2026-09-26 drill and
+rejected both takeover and rollback for several minutes. A timer must not
+delete a working mapping without an explicit maintenance opt-in.
 """
 
 import argparse
@@ -95,6 +96,11 @@ def decide(primary_healthy, standby_healthy, failures, mapping,
     return "take-over" if mapping != GAD_IP else "renew-standby"
 
 
+def require_cutover_opt_in(action, allowed):
+    if action in ("restore-primary", "take-over") and not allowed:
+        raise Refused("router cutover disabled after 8443 conflict; use --allow-router-cutover only during supervised maintenance")
+
+
 def save_failures(path, count):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
@@ -140,6 +146,7 @@ def set_mapping(target, current):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--allow-router-cutover", action="store_true")
     parser.add_argument("--state-dir", type=Path,
                         default=Path.home() / ".local/state/yataverse-router-standby")
     args = parser.parse_args()
@@ -156,6 +163,7 @@ def main():
             listener = tcp_accepts(XAVIER_IP) if not primary and failures >= 3 else False
             action = decide(primary, standby, failures, mapping, listener)
             if args.apply:
+                require_cutover_opt_in(action, args.allow_router_cutover)
                 save_failures(args.state_dir / "state.json", failures)
                 if action in ("restore-primary", "take-over", "renew-standby"):
                     target = XAVIER_IP if action == "restore-primary" else GAD_IP

@@ -47,6 +47,14 @@ class RouterStandbyTests(unittest.TestCase):
         self.assertEqual("keep-primary",
                          standby.decide(True, None, 0, standby.XAVIER_IP))
 
+    def test_timer_cannot_delete_a_mapping_during_unsupervised_cutover(self):
+        for action in ("take-over", "restore-primary"):
+            with self.assertRaisesRegex(standby.Refused, "cutover disabled"):
+                standby.require_cutover_opt_in(action, False)
+            standby.require_cutover_opt_in(action, True)
+        standby.require_cutover_opt_in("keep-primary", False)
+        standby.require_cutover_opt_in("renew-standby", False)
+
     def test_failed_switch_attempts_rollback(self):
         mapping = [standby.XAVIER_IP]
         calls = []
