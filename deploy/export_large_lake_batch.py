@@ -2,6 +2,7 @@
 """Resume oversized lake CAR export and place each verified CAR on both nodes."""
 
 import argparse
+import fcntl
 import json
 import re
 import shutil
@@ -187,7 +188,17 @@ def main():
     if args.max_new < 1 or args.start_row < 0:
         parser.error("--max-new must be positive and --start-row nonnegative")
     try:
-        run_batch(args)
+        if args.plan:
+            run_batch(args)
+        else:
+            output_dir = Path(args.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            with (output_dir / ".batch.lock").open("a+") as lock:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise ExportError("another large-block batch owns this output directory") from exc
+                run_batch(args)
     except (ExportError, InventoryError, OSError, ValueError, KeyError) as exc:
         print("REFUSED: " + str(exc), file=sys.stderr)
         return 2

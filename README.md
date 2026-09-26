@@ -328,7 +328,9 @@ CAR is first checked by a fresh offline Kubo restore and original CID
 rehydration, then copied to gad and xavier with digest checks. On restart it
 rechecks both nodes' receipt and CAR digest, skips matching rows, and resumes
 at the next missing row. An incomplete local pair refuses instead of being
-counted as copied. Keep at least 50 GB free on the Mac and both node volumes.
+counted as copied. An exclusive output-directory lock refuses a concurrent
+batch; a stopped process releases it so the same command can resume. Keep at
+least 50 GB free on the Mac and both node volumes.
 
 ```bash
 python3 deploy/export_large_lake_batch.py \
