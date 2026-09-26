@@ -165,8 +165,9 @@ fifth: 987 listed blocks are pinned on each node, with equal checkpoints
 the other 50 blocks were already pinned from the earlier probe).
 
 The matching `deploy/{gad,xavier}-lake-replicate.{service,timer}` user units
-run a 512 MB batch every 30 minutes, staggered between gad (10/40 UTC) and
-Xavier (25/55 UTC). Install the
+run a bounded batch at staggered calendar times (gad 10/40 UTC, Xavier
+25/55 UTC) and two minutes after each completed batch. The process lock
+prevents concurrent batches on a node. Install the
 node's service and timer as `~/.config/systemd/user/yataverse-lake-replicate.*`
 and the current script as `~/.local/bin/yataverse-lake-replicate` (mode 755),
 then reload and enable the timer. Each node retains its own state directory.
@@ -178,8 +179,10 @@ Kubo limits plus physical free space on both nodes, the deployed user units
 allow up to 100 pages / 2 GB of new bytes per invocation and a three-hour
 start timeout. The script's default remains 20 pages / 512 MB for manual
 bounded probes. A service that fails or crosses the disk reserve refuses;
-the next invocation resumes at its persisted cursor. These unit settings
-reduce idle time between successful batches and do not prove full replication.
+the next invocation resumes at its persisted cursor. The two-minute restart
+reduces idle time between successful batches; the 2 GB byte cap, Kubo storage
+limit, and 50 GB physical disk reserve remain in force. These settings do not
+prove full replication.
 
 ## Local read API from the dated lake snapshot
 

@@ -1,8 +1,9 @@
 [Unit]
-Description=Half-hourly bounded Yataverse lake replication on Xavier
+Description=Bounded, resumable Yataverse lake replication on Xavier
 
 [Timer]
 OnCalendar=*-*-* *:25,55:00 UTC
+OnUnitInactiveSec=2m
 Persistent=true
 Unit=yataverse-lake-replicate.service
 
