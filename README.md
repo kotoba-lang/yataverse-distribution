@@ -199,6 +199,14 @@ from locally copied bytes. A public `/health` response still describes the
 inventory, not full block availability. This temporary hostname does not
 replace `yataverse.com` and the shared router is a failure domain.
 
+`deploy/gad-public-lake-{http,}.conf` provides a standby virtual host for
+the same public hostname, proxying gad's loopback reader on port 18090. gad
+obtains its own TLS certificate with the router's port 80 temporarily moved
+to gad for HTTP-01, then the mapping returns to Xavier. When the public
+8443 mapping is moved to gad, the same name can serve gad's locally pinned
+subset. A long takeover must also move port 80 and enable gad's Certbot
+renewal timer. Do not run both nodes' port mapping refreshers at once.
+
 ## Honest state (what this repo does NOT do yet)
 
 - The murakumo overlay adapter (QUIC delivery of gossip forwards and
