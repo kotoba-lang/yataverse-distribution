@@ -25,6 +25,8 @@ SITES = {
         "2fd28ac84111bd181090f4ea712f8988c80dbad9162edf52c108865a3b636e97",
     "isekai-static.220-146-170-114.sslip.io":
         "5e3fc8703c96bbdb308974cb96559185bbd23748aa3a060ad973d5ca6385fe83",
+    "itonami-static.220-146-170-114.sslip.io":
+        "1c1232c376f79e7e53af01ec7d85cfbfb2f4b9ee0691d4b2c1e600fcfbaa4539",
 }
 
 
