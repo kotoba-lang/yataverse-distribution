@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import subprocess
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -14,6 +15,8 @@ from raw_block_store import RawBlockStore, RawBlockStoreError
 
 CID = re.compile(r"^[a-zA-Z0-9]{46,100}$")
 PAGE_SIZE = 200
+LARGE_BLOCK_THRESHOLD = 8_000_000
+MAX_BLOCK_BYTES = 256_000_000
 
 
 class InventoryError(Exception):
@@ -67,6 +70,8 @@ class Inventory:
 
 class LocalBlocks:
     def __init__(self, ipfs_bin, ipfs_path, inventory, max_block_bytes, raw_store=None):
+        if not 1 <= max_block_bytes <= MAX_BLOCK_BYTES:
+            raise InventoryError("block byte limit must be within 1..256000000")
         self.ipfs_bin = ipfs_bin
         self.ipfs_path = ipfs_path
         self.inventory = inventory
@@ -103,9 +108,12 @@ class LocalBlocks:
 
 
 def handler_for(inventory, blocks):
+    large_block_slot = threading.BoundedSemaphore(1)
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urlsplit(self.path)
+            large_block_acquired = False
             try:
                 if parsed.path == "/health":
                     payload = json.dumps({"ok": True, "rows": len(inventory.offsets),
@@ -124,20 +132,28 @@ def handler_for(inventory, blocks):
                     cid = parsed.path[len("/ipfs/"):]
                     if not CID.fullmatch(cid):
                         raise InventoryError("invalid CID")
+                    if inventory.sizes.get(cid, 0) > LARGE_BLOCK_THRESHOLD:
+                        if not large_block_slot.acquire(blocking=False):
+                            self.send_error(503, "large block reader busy")
+                            return
+                        large_block_acquired = True
+                        self.connection.settimeout(120)
                     payload = blocks.read(cid)
                     content_type = "application/octet-stream"
                 else:
                     self.send_error(404)
                     return
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", "public, max-age=60")
+                self.end_headers()
+                self.wfile.write(payload)
             except (InventoryError, subprocess.TimeoutExpired) as exc:
                 self.send_error(404, str(exc))
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Cache-Control", "public, max-age=60")
-            self.end_headers()
-            self.wfile.write(payload)
+            finally:
+                if large_block_acquired:
+                    large_block_slot.release()
 
     return Handler
 
@@ -150,7 +166,7 @@ def main():
     parser.add_argument("--ipfs-bin", required=True)
     parser.add_argument("--ipfs-path", required=True)
     parser.add_argument("--raw-block-store", type=Path)
-    parser.add_argument("--max-block-bytes", type=int, default=8_000_000)
+    parser.add_argument("--max-block-bytes", type=int, default=LARGE_BLOCK_THRESHOLD)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
     args = parser.parse_args()

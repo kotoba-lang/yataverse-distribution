@@ -5,10 +5,10 @@ Requires=ipfs.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /home/xavier/.local/bin/yataverse-lake-read --inventory /mnt/nvme/ipfs-xavier/lake-state/inventory-20260926.jsonl --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 --count 821533 --ipfs-bin /mnt/nvme/ipfs-xavier/bin/ipfs --ipfs-path /mnt/nvme/ipfs-xavier/repo --raw-block-store /mnt/nvme/ipfs-xavier/lake-state/raw-blocks --host 127.0.0.1 --port 8090
+ExecStart=/usr/bin/python3 /home/xavier/.local/bin/yataverse-lake-read --inventory /mnt/nvme/ipfs-xavier/lake-state/inventory-20260926.jsonl --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 --count 821533 --ipfs-bin /mnt/nvme/ipfs-xavier/bin/ipfs --ipfs-path /mnt/nvme/ipfs-xavier/repo --raw-block-store /mnt/nvme/ipfs-xavier/lake-state/raw-blocks --max-block-bytes 256000000 --host 127.0.0.1 --port 8090
 Restart=on-failure
 RestartSec=10
-MemoryMax=1G
+MemoryMax=2G
 NoNewPrivileges=true
 
 [Install]
