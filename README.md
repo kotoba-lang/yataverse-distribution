@@ -231,6 +231,20 @@ to gad for HTTP-01, then the mapping returns to Xavier. When the public
 subset. A long takeover must also move port 80 and enable gad's Certbot
 renewal timer. Do not run both nodes' port mapping refreshers at once.
 
+`deploy/build_independent_index.py` makes a new dated HTML document from the
+exact 2026-09-26 apex snapshot. It refuses a changed source SHA-256, rewrites
+all 50 HTTPS block links to this gateway's own `/ipfs/{cid}` route, and
+replaces source claims about unavailable APIs and live generation. The output
+is a separate CID, so the original CID retains its original bytes. The
+2026-09-26 build was 17,826 bytes, SHA-256
+`2fd28ac84111bd181090f4ea712f8988c80dbad9162edf52c108865a3b636e97`,
+raw CID `bafkreibp2kfmqqirxumbbehu5jys7cmizag3vwiwf3pvfqiiqzndwy3os4`.
+gad and Xavier both direct-pinned and read back those exact bytes. After
+publishing this CID under the existing `yataverse-apex` IPNS key on both
+nodes, their public Nginx root path can proxy the local IPNS gateway.
+The document is a dated, read-only snapshot; changing the canonical
+`yataverse.com` origin and updating snapshots remain separate work.
+
 ## Honest state (what this repo does NOT do yet)
 
 - The murakumo overlay adapter (QUIC delivery of gossip forwards and
