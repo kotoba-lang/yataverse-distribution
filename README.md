@@ -194,6 +194,10 @@ reason to fetch from Cloudflare on gad. Xavier remains the bootstrap source
 until the full dated inventory is stored on both nodes.
 Gad limits peer fetches to two simultaneous requests and retries transient
 peer HTTP errors three times; a persistent refusal still stops the batch.
+If gad reaches a CID before Xavier pins it, the peer-only unit waits for up
+to 120 seconds for that block. It never falls back to the public source or
+advances the page cursor during that wait. If the peer remains unavailable,
+the batch exits with the peer error and the timer resumes later.
 
 After measuring the dated lake at 88,410,406,176 bytes and checking 120 GB
 Kubo limits plus physical free space on both nodes, the deployed user units

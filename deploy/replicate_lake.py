@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.parse
 import uuid
 from pathlib import Path
@@ -462,15 +463,21 @@ def peer_first_block_fetcher(args, public_fetch):
         cid = url[len(args.block_url_base):]
         if not valid_cid(cid):
             raise ReplicationError("block source URL has invalid CID")
-        try:
-            # A peer can briefly refuse reads while its own Kubo daemon pins
-            # the same page. Retry transient HTTP failures without enabling a
-            # public-source fallback in peer-only mode. curl does not retry 404.
-            return curl(peer_base + cid, limit, resolve=resolve, max_seconds=12, retries=3)
-        except ReplicationError as exc:
-            if getattr(args, "peer_only", False):
-                raise ReplicationError("peer-only block source unavailable: {}: {}".format(cid, exc)) from exc
-            return public_fetch(url, limit)
+        # A peer-only follower may reach a CID before the leader has pinned
+        # it. Bound the wait; never advance the cursor or use the public
+        # source while waiting. curl itself retries transient HTTP failures.
+        deadline = time.monotonic() + getattr(args, "peer_wait_seconds", 0)
+        while True:
+            try:
+                return curl(peer_base + cid, limit, resolve=resolve, max_seconds=12, retries=3)
+            except ReplicationError as exc:
+                if not getattr(args, "peer_only", False):
+                    return public_fetch(url, limit)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ReplicationError(
+                        "peer-only block source unavailable: {}: {}".format(cid, exc)) from exc
+                time.sleep(min(10, remaining))
 
     return fetch
 
@@ -603,6 +610,7 @@ def main():
     parser.add_argument("--peer-block-url-base")
     parser.add_argument("--peer-resolve")
     parser.add_argument("--peer-only", action="store_true")
+    parser.add_argument("--peer-wait-seconds", type=int, default=0)
     parser.add_argument("--max-pages", type=int, default=20)
     parser.add_argument("--max-new-bytes", type=int, default=512_000_000)
     parser.add_argument("--max-block-bytes", type=int, default=256_000_000)
@@ -611,7 +619,8 @@ def main():
     parser.add_argument("--min-free-bytes", type=int, default=50_000_000_000)
     args = parser.parse_args()
     if (args.max_pages < 1 or args.max_new_bytes < 1 or args.max_block_bytes < 1 or
-            args.fetch_workers < 1 or args.max_prefetch_bytes < 1 or args.min_free_bytes < 0):
+            args.fetch_workers < 1 or args.max_prefetch_bytes < 1 or args.min_free_bytes < 0 or
+            args.peer_wait_seconds < 0):
         parser.error("batch budgets must be positive and disk reserve nonnegative")
     if args.peer_only and not local_listing(args.api_url):
         parser.error("peer-only mode requires a local inventory listing")
