@@ -23,6 +23,19 @@ export FAKE_LOG="$tmp/log" FAKE_PIN=yes FAKE_NAME="$name"
 "$repo/deploy/refresh-ipns.sh" "$tmp/ipfs" "$tmp/current-cid" "$name" > "$tmp/out"
 grep -Fx "Published to $name: /ipfs/$cid" "$tmp/out" >/dev/null
 grep -F "pin ls --type=recursive $cid" "$tmp/log" >/dev/null
+grep -F "name publish --key=yataverse-apex" "$tmp/log" >/dev/null
+
+: > "$tmp/log"
+"$repo/deploy/refresh-ipns.sh" "$tmp/ipfs" "$tmp/current-cid" "$name" itonami-static > "$tmp/out"
+grep -F "name publish --key=itonami-static" "$tmp/log" >/dev/null
+
+: > "$tmp/log"
+if "$repo/deploy/refresh-ipns.sh" "$tmp/ipfs" "$tmp/current-cid" "$name" 'bad/key' > "$tmp/out" 2>&1; then
+  echo "invalid key name was accepted" >&2
+  exit 1
+fi
+grep -F "REFUSED: invalid IPNS key name" "$tmp/out" >/dev/null
+[ ! -s "$tmp/log" ]
 
 : > "$tmp/log"
 printf 'not-a-cid\n' > "$tmp/current-cid"

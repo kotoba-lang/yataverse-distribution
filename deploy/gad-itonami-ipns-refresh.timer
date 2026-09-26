@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh Itonami's static IPNS name twice daily from gad
+
+[Timer]
+OnCalendar=*-*-* 00,12:13:00 UTC
+RandomizedDelaySec=5m
+AccuracySec=1m
+Persistent=true
+Unit=itonami-ipns-refresh.service
+
+[Install]
+WantedBy=timers.target
