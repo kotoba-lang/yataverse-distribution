@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh the Yataverse IPNS name twice daily from Xavier
+
+[Timer]
+OnCalendar=*-*-* 06,18:07:00 UTC
+RandomizedDelaySec=5m
+AccuracySec=1m
+Persistent=true
+Unit=yataverse-ipns-refresh.service
+
+[Install]
+WantedBy=timers.target
