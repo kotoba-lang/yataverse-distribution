@@ -321,6 +321,30 @@ The automated fresh-repo import, offline cat, and original-CID rehydration
 passed. This validates one large block; the remaining 445 large blocks and
 the complete lake still need export, storage placement and retrieval checks.
 
+`deploy/export_large_lake_batch.py` advances the dated oversized-block plan.
+It verifies all 821,533 inventory rows before selecting the 446 blocks over
+8 MB (13,454,005,391 original bytes), then handles one row at a time. Each
+CAR is first checked by a fresh offline Kubo restore and original CID
+rehydration, then copied to gad and xavier with digest checks. On restart it
+rechecks both nodes' receipt and CAR digest, skips matching rows, and resumes
+at the next missing row. An incomplete local pair refuses instead of being
+counted as copied. Keep at least 50 GB free on the Mac and both node volumes.
+
+```bash
+python3 deploy/export_large_lake_batch.py \
+  --inventory /path/to/inventory-20260926.jsonl \
+  --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
+  --count 821533 --expected-large-count 446 \
+  --output-dir /path/to/lake-large-car-export --ipfs-bin /path/to/ipfs --plan
+# Remove --plan and set --max-new 10 for a bounded production batch.
+```
+
+The first live bounded passes skipped the already mirrored row 16866, then
+exported and mirrored rows 16885 and 16994. Their CAR digests are checked on
+both nodes after placement. This proves restart/skip and two new rows, not
+all 446 rows. A later audit must reconcile the complete inventory with both
+nodes and perform provider retrieval before calling this Filecoin custody.
+
 For the first public read entry, `deploy/xavier-public-lake.conf` exposes this
 same local service at `https://yataverse-data.220-146-170-114.sslip.io:8443/`
 through Xavier's Nginx and the shared router mapping (public 8443 to Xavier

@@ -64,8 +64,8 @@ def checked_source_url(base, cid):
     return base + cid
 
 
-def inventory_row(args):
-    inventory = Inventory(args.inventory, args.sha256, args.count)
+def inventory_row(args, inventory=None):
+    inventory = inventory or Inventory(args.inventory, args.sha256, args.count)
     if not 0 <= args.row < len(inventory.offsets):
         raise ExportError("row outside immutable inventory")
     with Path(args.inventory).open("rb") as source:
@@ -110,10 +110,10 @@ def restore_original(ipfs, car, root, original_cid, expected_size, expected_dige
     return size
 
 
-def export(args):
+def export(args, inventory=None, emit=True):
     if not Path(args.ipfs_bin).is_file():
         raise ExportError("Kubo binary does not exist")
-    original_cid, size = inventory_row(args)
+    original_cid, size = inventory_row(args, inventory)
     output = Path(args.output)
     receipt = Path(str(output) + ".json")
     if output.exists() or receipt.exists():
@@ -181,7 +181,9 @@ def export(args):
         finally:
             pending_car.unlink(missing_ok=True)
             pending_receipt.unlink(missing_ok=True)
-        print(json.dumps(record, sort_keys=True))
+        if emit:
+            print(json.dumps(record, sort_keys=True))
+        return record
 
 
 def main():
