@@ -153,7 +153,8 @@ fifth: 987 listed blocks are pinned on each node, with equal checkpoints
 the other 50 blocks were already pinned from the earlier probe).
 
 The matching `deploy/{gad,xavier}-lake-replicate.{service,timer}` user units
-run a 512 MB batch hourly, staggered at 10 and 40 minutes UTC. Install the
+run a 512 MB batch every 30 minutes, staggered between gad (10/40 UTC) and
+Xavier (25/55 UTC). Install the
 node's service and timer as `~/.config/systemd/user/yataverse-lake-replicate.*`
 and the current script as `~/.local/bin/yataverse-lake-replicate` (mode 755),
 then reload and enable the timer. Each node retains its own state directory.

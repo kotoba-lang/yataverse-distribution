@@ -1,8 +1,8 @@
 [Unit]
-Description=Hourly bounded Yataverse lake replication on gad
+Description=Half-hourly bounded Yataverse lake replication on gad
 
 [Timer]
-OnCalendar=*-*-* *:10:00 UTC
+OnCalendar=*-*-* *:10,40:00 UTC
 Persistent=true
 Unit=yataverse-lake-replicate.service
 
