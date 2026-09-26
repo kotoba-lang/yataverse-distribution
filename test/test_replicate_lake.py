@@ -2,6 +2,7 @@ import importlib.util
 import json
 import shutil
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +44,7 @@ def args(directory, budget=100, pages=10):
         state_dir=Path(directory), api_url="https://example.test/blocks",
         block_url_base="https://example.test/ipfs/", max_pages=pages,
         max_new_bytes=budget, max_block_bytes=100, min_free_bytes=0,
+        fetch_workers=4, max_prefetch_bytes=100,
     )
 
 
@@ -56,6 +58,66 @@ def page(blocks, cursor=None):
 
 
 class ReplicationTests(unittest.TestCase):
+    def test_prefetch_overlaps_fetches_and_preserves_receipt_order(self):
+        barrier = threading.Barrier(2, timeout=3)
+        fetched = []
+
+        def fetch(url, _limit):
+            fetched.append(url.rsplit("/", 1)[-1])
+            barrier.wait()
+            return b"abc"
+
+        with tempfile.TemporaryDirectory() as directory:
+            node = FakeKubo()
+            result = replica.run_batch(
+                args(directory), node,
+                lambda _url, _cursor: page([(CID_A, b"abc"), (CID_B, b"abc")]),
+                fetch)
+            self.assertEqual("cycle-complete", result["status"])
+            self.assertEqual(2, result["new_blocks"])
+            receipts = [json.loads(line) for line in
+                        (Path(directory) / "receipts.jsonl").read_text().splitlines()]
+            self.assertEqual([CID_A, CID_B], [r["cid"] for r in receipts])
+            self.assertEqual({CID_A, CID_B}, set(fetched))
+
+    def test_prefetch_respects_byte_budget_before_network(self):
+        fetched = []
+        with tempfile.TemporaryDirectory() as directory:
+            node = FakeKubo()
+            result = replica.run_batch(
+                args(directory, budget=3), node,
+                lambda _url, _cursor: page([(CID_A, b"abc"), (CID_B, b"abc")], "next"),
+                lambda url, _limit: (fetched.append(url.rsplit("/", 1)[-1]) or b"abc"))
+            self.assertEqual("byte-budget", result["status"])
+            self.assertEqual([CID_A], fetched)
+            self.assertIsNone(json.loads((Path(directory) / "checkpoint.json").read_text())["cursor"])
+
+    def test_prefetch_memory_ceiling_refuses_before_network(self):
+        fetched = []
+        with self.assertRaisesRegex(replica.ReplicationError,
+                                    "block exceeds prefetch memory budget"):
+            list(replica.prefetch_ordered(
+                [{"cid": CID_A, "size": 4}],
+                lambda url, _limit: fetched.append(url), "https://example.test/",
+                100, 2, 3))
+        self.assertEqual([], fetched)
+
+    def test_failed_prefetch_keeps_page_cursor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            node = FakeKubo()
+
+            def fetch(url, _limit):
+                if url.endswith(CID_B):
+                    raise replica.ReplicationError("source unavailable")
+                return b"abc"
+
+            with self.assertRaisesRegex(replica.ReplicationError, "source unavailable"):
+                replica.run_batch(
+                    args(directory), node,
+                    lambda _url, _cursor: page([(CID_A, b"abc"), (CID_B, b"abc")], "next"),
+                    fetch)
+            self.assertIsNone(json.loads((Path(directory) / "checkpoint.json").read_text())["cursor"])
+
     def test_preflight_recognizes_existing_recursive_root(self):
         with tempfile.TemporaryDirectory() as directory:
             node = replica.Kubo(shutil.which("true"))
