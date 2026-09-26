@@ -47,11 +47,42 @@ The name is a family name: the serving family of `yataverse.com`
 
 ```sh
 kbb --backend sci --classpath "src:test:../io-libp2p/src" \
-    test/yataverse/distribution/test_runner.cljk
+    -e '(require (quote [yataverse.distribution.test-runner :as runner])) (runner/-main)'
 ```
 
 Explicit-namespace runner; exits non-zero on any failure. Current: 14
 tests / 51 assertions, 0 failures.
+
+## Xavier replica (2026-09-26)
+
+The owner selected `gad` and `xavier` for the first physical replication
+slice. `gad` already runs Kubo. Xavier has Kubo v0.43.1 for Linux ARM64 at
+`/mnt/nvme/ipfs-xavier/bin/ipfs`, with a repo on the NVMe volume. The binary
+was obtained from `dist.ipfs.tech` and checked against its `.sha512` file.
+The Xavier RPC API (`5001`) and HTTP gateway (`8080`) bind only to
+`127.0.0.1`; the swarm listens on `4001`.
+
+The user service is [deploy/xavier-ipfs.service](deploy/xavier-ipfs.service).
+Install it as the `xavier` user after checking the binary and repo paths:
+
+```sh
+install -Dm644 deploy/xavier-ipfs.service ~/.config/systemd/user/ipfs.service
+systemctl --user daemon-reload
+systemctl --user enable --now ipfs.service
+```
+
+The unit was enabled and observed active after a fresh SSH connection.
+`loginctl show-user xavier -p Linger` now says `Linger=yes`. A reboot/reconnect
+check remains necessary before calling the replica boot-qualified.
+
+Measured CID: `bafkreibmsfku23elxwds53iriwuwueot2rsb72pxvr35nisowufmlvf6w4`
+(46 bytes, SHA-256
+`2c91554d6c8bbd872eed1145a96a11d3d4641fe9f7ac77d6a24eb50ac5d4beb7`).
+Xavier pinned it from gad over a direct libp2p WebRTC path. Xavier's local
+gateway returned the same bytes, and `ipfs --offline cat` after daemon
+shutdown returned the same digest. This proves two pinned copies and Xavier
+offline custody for that probe. It does not qualify public gateway ingress,
+Filecoin storage, or a service-wide failover.
 
 ## Honest state (what this repo does NOT do yet)
 

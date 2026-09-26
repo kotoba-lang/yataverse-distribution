@@ -1,0 +1,17 @@
+[Unit]
+Description=Yataverse IPFS replica on Xavier
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=IPFS_PATH=/mnt/nvme/ipfs-xavier/repo
+Environment=IPFS_TELEMETRY=off
+ExecStart=/mnt/nvme/ipfs-xavier/bin/ipfs daemon --enable-gc
+Restart=on-failure
+RestartSec=5s
+MemoryMax=768M
+CPUQuota=50%
+LimitNOFILE=8192
+
+[Install]
+WantedBy=default.target
