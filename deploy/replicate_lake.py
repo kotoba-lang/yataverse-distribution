@@ -463,10 +463,13 @@ def peer_first_block_fetcher(args, public_fetch):
         if not valid_cid(cid):
             raise ReplicationError("block source URL has invalid CID")
         try:
-            return curl(peer_base + cid, limit, resolve=resolve, max_seconds=12, retries=0)
+            # A peer can briefly refuse reads while its own Kubo daemon pins
+            # the same page. Retry transient HTTP failures without enabling a
+            # public-source fallback in peer-only mode. curl does not retry 404.
+            return curl(peer_base + cid, limit, resolve=resolve, max_seconds=12, retries=3)
         except ReplicationError as exc:
             if getattr(args, "peer_only", False):
-                raise ReplicationError("peer-only block source unavailable: " + cid) from exc
+                raise ReplicationError("peer-only block source unavailable: {}: {}".format(cid, exc)) from exc
             return public_fetch(url, limit)
 
     return fetch
