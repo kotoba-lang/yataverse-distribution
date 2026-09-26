@@ -161,6 +161,14 @@ then reload and enable the timer. Each node retains its own state directory.
 The timer does not change Kubo's `StorageMax`; measure the lake and physical
 capacity before increasing that limit.
 
+After measuring the dated lake at 88,410,406,176 bytes and checking 120 GB
+Kubo limits plus physical free space on both nodes, the deployed user units
+allow up to 100 pages / 2 GB of new bytes per invocation and a three-hour
+start timeout. The script's default remains 20 pages / 512 MB for manual
+bounded probes. A service that fails or crosses the disk reserve refuses;
+the next invocation resumes at its persisted cursor. These unit settings
+reduce idle time between successful batches and do not prove full replication.
+
 ## Local read API from the dated lake snapshot
 
 `deploy/serve_lake.py` serves the complete, dated inventory and locally pinned
