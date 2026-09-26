@@ -116,6 +116,36 @@ verified on both. These timers keep a verified snapshot's name alive; they
 do not fetch new site revisions. The public HTTP gateway and node-loss
 drill are still separate qualification steps.
 
+## Lake block replication
+
+`deploy/replicate_lake.py` copies the public lake block listing to a local
+Kubo node in bounded batches. It checks each listed byte count, makes Kubo
+rederive the original CID, reads the block back, then direct-pins it. It
+records a receipt for each new block and advances the durable page cursor
+only when every block on that page is accounted for. Reruns skip pinned
+blocks after checking their size. The source listing and bytes endpoint
+still depend on Cloudflare; this is a physical copy path, not an independent
+read API or a public gateway.
+
+Run as the node owner with `IPFS_PATH` set to its local repo. For example,
+gad uses `/usr/local/bin/ipfs` and `/home/gad/.ipfs`, while Xavier uses
+`/mnt/nvme/ipfs-xavier/bin/ipfs` and `/mnt/nvme/ipfs-xavier/repo`.
+Give each node its own persistent `--state-dir`. The default batch copies at
+most 20 pages and 512 MB of new bytes. `--max-pages`, `--max-new-bytes`, and
+`--max-block-bytes` bound an invocation; an exceeded byte budget returns a
+`byte-budget` status and retains the current page cursor. A failed source,
+CID mismatch, unreadable capacity, or invalid listing exits with `REFUSED`.
+
+Some listed blocks exceed Kubo's standard 2 MiB Bitswap block size. The
+script uses Kubo's explicit large-block option for these. Their local copy
+does not establish standard Bitswap delivery; an independent large-block
+transport or a compatible HTTP gateway must be qualified separately.
+
+Before increasing Kubo `StorageMax` or scheduling full replication, measure
+the whole listing and leave enough capacity for both nodes. A bounded live
+run on each node copied 3 new blocks / 786,474 bytes and verified 53 listed
+blocks, stopping before the first page cursor on the 1 MB byte budget.
+
 ## Honest state (what this repo does NOT do yet)
 
 - The murakumo overlay adapter (QUIC delivery of gossip forwards and
