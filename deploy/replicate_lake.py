@@ -98,8 +98,12 @@ class Kubo:
         return command([self.binary] + list(args), data=data)
 
     def preflight(self):
-        pins = self.run("pin", "ls", "--type=direct").decode("utf-8")
-        self.pins = {line.split()[0] for line in pins.splitlines() if line.strip()}
+        # Recursive roots are already durable pins. Kubo refuses a second,
+        # direct pin on the same CID, so include both kinds on every resume.
+        self.pins = set()
+        for pin_type in ("direct", "recursive"):
+            pins = self.run("pin", "ls", "--type=" + pin_type).decode("utf-8")
+            self.pins.update(line.split()[0] for line in pins.splitlines() if line.strip())
         stat = self.run("repo", "stat").decode("utf-8")
         fields = dict(
             line.split(":", 1) for line in stat.splitlines() if ":" in line
@@ -127,6 +131,14 @@ class Kubo:
             raise ReplicationError("Kubo block size unreadable for " + cid)
         return int(found.group(1))
 
+    def durable_pin_type(self, cid):
+        try:
+            result = self.run("pin", "ls", "--type=all", cid).decode("utf-8").strip()
+        except ReplicationError:
+            return None
+        match = re.fullmatch(re.escape(cid) + r"\s+(direct|recursive)", result)
+        return match.group(1) if match else None
+
     def put_verified(self, cid, data):
         prefix = self.run("cid", "format", "-f", "%v %c %h %L", cid).decode("utf-8").strip().split()
         if len(prefix) != 4:
@@ -147,7 +159,13 @@ class Kubo:
         reread = self.run("block", "get", cid)
         if reread != data:
             raise ReplicationError("Kubo readback differs for " + cid)
-        self.run("pin", "add", "--recursive=false", cid)
+        try:
+            self.run("pin", "add", "--recursive=false", cid)
+        except ReplicationError:
+            # Another writer may have pinned it after preflight. A failed pin
+            # is acceptable only when Kubo itself confirms a durable pin.
+            if self.durable_pin_type(cid) is None:
+                raise
         self.pins.add(cid)
 
 
