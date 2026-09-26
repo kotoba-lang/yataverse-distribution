@@ -7,6 +7,8 @@ advances only after every block on a page has been checked.
 """
 
 import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import datetime
 import fcntl
 import hashlib
@@ -208,6 +210,35 @@ def append_receipt(path, cid, size, data):
         os.fsync(handle.fileno())
 
 
+def prefetch_ordered(items, block_fn, base, max_block_bytes, workers, max_prefetch_bytes):
+    """Fetch a bounded window concurrently; yield bytes in inventory order.
+
+    The caller alone writes Kubo and the cursor. A failed fetch therefore
+    leaves the page cursor where it was, and completed downloads are disposable.
+    """
+    pending = deque()
+    pending_bytes = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for item in items:
+            size = item["size"]
+            if size > max_prefetch_bytes:
+                raise ReplicationError("block exceeds prefetch memory budget: " + item["cid"])
+            while pending and (len(pending) >= workers or
+                               pending_bytes + size > max_prefetch_bytes):
+                oldest, future = pending.popleft()
+                pending_bytes -= oldest["size"]
+                yield oldest, future.result()
+            # Bound actual response bytes by the inventory claim as well as
+            # the aggregate in-flight reservation above.
+            pending.append((item, pool.submit(block_fn, base + item["cid"],
+                                              min(size, max_block_bytes))))
+            pending_bytes += size
+        while pending:
+            oldest, future = pending.popleft()
+            pending_bytes -= oldest["size"]
+            yield oldest, future.result()
+
+
 def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
     args.state_dir.mkdir(parents=True, exist_ok=True)
     state_path = args.state_dir / "checkpoint.json"
@@ -221,6 +252,9 @@ def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
 
     for _ in range(args.max_pages):
         listing = listing_fn(args.api_url, state["cursor"])
+        selected = []
+        planned_bytes = 0
+        budget_stop = False
         for item in listing["blocks"]:
             cid, size = item["cid"], item["size"]
             if size > args.max_block_bytes:
@@ -230,14 +264,21 @@ def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
                     raise ReplicationError("pinned block size differs from listing: " + cid)
                 checked_blocks += 1
                 continue
-            if new_bytes + size > args.max_new_bytes:
-                return {"status": "byte-budget", "pages": pages,
-                        "checked_blocks": checked_blocks, "new_blocks": new_blocks,
-                        "new_bytes": new_bytes, "cursor_advanced": False}
-            if kubo.repo_size + 2 * (new_bytes + size) >= kubo.storage_max:
+            if new_bytes + planned_bytes + size > args.max_new_bytes:
+                budget_stop = True
+                break
+            if kubo.repo_size + 2 * (new_bytes + planned_bytes + size) >= kubo.storage_max:
                 raise ReplicationError("Kubo storage limit would be exceeded before " + cid)
-            kubo.require_disk_reserve(size, args.min_free_bytes)
-            data = block_fn(args.block_url_base + cid, args.max_block_bytes)
+            # free disk already reflects earlier pages in this batch; reserve
+            # only the page whose downloads may be in flight concurrently.
+            kubo.require_disk_reserve(planned_bytes + size, args.min_free_bytes)
+            selected.append(item)
+            planned_bytes += size
+
+        for item, data in prefetch_ordered(
+                selected, block_fn, args.block_url_base, args.max_block_bytes,
+                args.fetch_workers, args.max_prefetch_bytes):
+            cid, size = item["cid"], item["size"]
             if len(data) != size:
                 raise ReplicationError("source byte count differs from listing: " + cid)
             kubo.put_verified(cid, data)
@@ -248,6 +289,11 @@ def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
             state["new_blocks_total"] += 1
             state["new_bytes_total"] += size
             state_save(state_path, state)
+
+        if budget_stop:
+            return {"status": "byte-budget", "pages": pages,
+                    "checked_blocks": checked_blocks, "new_blocks": new_blocks,
+                    "new_bytes": new_bytes, "cursor_advanced": False}
 
         pages += 1
         state["pages_total"] += 1
@@ -275,9 +321,12 @@ def main():
     parser.add_argument("--max-pages", type=int, default=20)
     parser.add_argument("--max-new-bytes", type=int, default=512_000_000)
     parser.add_argument("--max-block-bytes", type=int, default=256_000_000)
+    parser.add_argument("--fetch-workers", type=int, default=4)
+    parser.add_argument("--max-prefetch-bytes", type=int, default=256_000_000)
     parser.add_argument("--min-free-bytes", type=int, default=50_000_000_000)
     args = parser.parse_args()
-    if args.max_pages < 1 or args.max_new_bytes < 1 or args.max_block_bytes < 1 or args.min_free_bytes < 0:
+    if (args.max_pages < 1 or args.max_new_bytes < 1 or args.max_block_bytes < 1 or
+            args.fetch_workers < 1 or args.max_prefetch_bytes < 1 or args.min_free_bytes < 0):
         parser.error("batch budgets must be positive and disk reserve nonnegative")
     args.state_dir.mkdir(parents=True, exist_ok=True)
     lock_path = args.state_dir / "replicate.lock"
