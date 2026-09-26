@@ -173,6 +173,25 @@ class ReplicationTests(unittest.TestCase):
                                         "peer-only block source unavailable"):
                 replica.peer_first_block_fetcher(args_peer, public)(
                     args_peer.block_url_base + CID_A, 3)
+        args_peer.peer_wait_seconds = 30
+        public_calls = len([entry for entry in urls if entry[0] == "public"])
+        with (patch.object(replica, "curl", side_effect=[
+                replica.ReplicationError("peer HTTP 404"), b"abc"]) as fetch,
+              patch.object(replica.time, "monotonic", return_value=0),
+              patch.object(replica.time, "sleep") as sleeper):
+            self.assertEqual(b"abc", replica.peer_first_block_fetcher(args_peer, public)(
+                args_peer.block_url_base + CID_A, 3))
+        self.assertEqual(2, fetch.call_count)
+        sleeper.assert_called_once_with(10)
+        self.assertEqual(public_calls, len([entry for entry in urls if entry[0] == "public"]))
+        with (patch.object(replica, "curl", side_effect=replica.ReplicationError("peer HTTP 404")),
+              patch.object(replica.time, "monotonic", side_effect=[0, 31]),
+              patch.object(replica.time, "sleep") as sleeper):
+            with self.assertRaisesRegex(replica.ReplicationError, "peer HTTP 404"):
+                replica.peer_first_block_fetcher(args_peer, public)(
+                    args_peer.block_url_base + CID_A, 3)
+        sleeper.assert_not_called()
+        self.assertEqual(public_calls, len([entry for entry in urls if entry[0] == "public"]))
 
     def test_prefetch_overlaps_fetches_and_preserves_receipt_order(self):
         barrier = threading.Barrier(2, timeout=3)
