@@ -1,7 +1,9 @@
 import hashlib
+import base64
 import importlib.util
 import json
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ from unittest.mock import patch
 
 
 source = Path(__file__).resolve().parents[1] / "deploy" / "audit_lake.py"
+sys.path.insert(0, str(source.parent))
 spec = importlib.util.spec_from_file_location("audit_lake", source)
 audit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(audit)
@@ -58,6 +61,21 @@ class AuditTests(unittest.TestCase):
                     returncode=1, stderr=b"daemon unavailable", stdout=b"")):
             with self.assertRaisesRegex(audit.AuditError, "daemon unavailable"):
                 audit.durable_pins("/bin/ipfs")
+
+    def test_cid_verified_raw_block_covers_only_its_inventory_row(self):
+        data = b"\x0a\x03not-valid-dag-pb"
+        cid = "b" + base64.b32encode(b"\x01\x70\x12\x20" + hashlib.sha256(data).digest()).decode().lower().rstrip("=")
+        with tempfile.TemporaryDirectory() as directory:
+            store = audit.RawBlockStore(Path(directory) / "raw")
+            store.put(cid, data)
+            path, digest = self.inventory(directory, [{"cid": cid, "bytes": len(data)}])
+            report = audit.audit_inventory(path, digest, 1, set(), store)
+            self.assertEqual(("complete", 1, len(data), 0),
+                             (report["status"], report["raw_rows"],
+                              report["raw_bytes"], report["missing_rows"]))
+            store._paths(cid)[0].write_bytes(data + b"x")
+            with self.assertRaisesRegex(audit.RawBlockStoreError, "data differs"):
+                audit.audit_inventory(path, digest, 1, set(), store)
 
     def test_require_complete_exit_distinguishes_partial_from_refusal(self):
         report = {"status": "partial"}

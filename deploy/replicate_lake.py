@@ -24,6 +24,7 @@ import sys
 import urllib.parse
 import uuid
 from pathlib import Path
+from raw_block_store import RawBlockStore, RawBlockStoreError
 
 
 CID_V0 = re.compile(r"^Qm[1-9A-HJ-NP-Za-km-z]{44}$")
@@ -111,7 +112,7 @@ def fetch_listing(api_url, cursor):
 
 
 class Kubo:
-    def __init__(self, binary):
+    def __init__(self, binary, raw_store=None):
         if not Path(binary).is_file():
             raise ReplicationError("Kubo binary does not exist")
         self.binary = binary
@@ -119,6 +120,8 @@ class Kubo:
         self.repo_size = 0
         self.storage_max = 0
         self.repo_path = None
+        self.raw_store = raw_store
+        self.raw_cids = set()
 
     def run(self, *args, data=None):
         return command([self.binary] + list(args), data=data)
@@ -130,6 +133,9 @@ class Kubo:
         for pin_type in ("direct", "recursive"):
             pins = self.run("pin", "ls", "--type=" + pin_type).decode("utf-8")
             self.pins.update(line.split()[0] for line in pins.splitlines() if line.strip())
+        if self.raw_store is not None:
+            self.raw_cids = self.raw_store.cids()
+            self.pins.update(self.raw_cids)
         stat = self.run("repo", "stat").decode("utf-8")
         fields = dict(
             line.split(":", 1) for line in stat.splitlines() if ":" in line
@@ -151,6 +157,8 @@ class Kubo:
             raise ReplicationError("physical disk reserve would be crossed")
 
     def block_size(self, cid):
+        if cid in self.raw_cids:
+            return len(self.raw_store.read(cid))
         stat = self.run("block", "stat", cid).decode("utf-8")
         found = re.search(r"^Size:\s*(\d+)\s*$", stat, re.MULTILINE)
         if not found:
@@ -202,8 +210,8 @@ class KuboRPC(Kubo):
     the speedup cannot silently write to a different Kubo daemon.
     """
 
-    def __init__(self, binary, api_url):
-        super().__init__(binary)
+    def __init__(self, binary, api_url, raw_store=None):
+        super().__init__(binary, raw_store=raw_store)
         parsed = urllib.parse.urlsplit(api_url)
         if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or
                 parsed.path not in ("", "/") or parsed.query or parsed.fragment or
@@ -237,7 +245,13 @@ class KuboRPC(Kubo):
             if len(body) > max_response:
                 raise ReplicationError("Kubo RPC response exceeds bound: " + command_name)
             if response.status != 200:
-                raise ReplicationError("Kubo RPC refused " + command_name + " (HTTP " + str(response.status) + ")")
+                try:
+                    detail = json.loads(body).get("Message", "")
+                except (ValueError, UnicodeDecodeError, AttributeError):
+                    detail = ""
+                detail = detail[:160] if isinstance(detail, str) else ""
+                raise ReplicationError("Kubo RPC refused " + command_name +
+                                       " (HTTP " + str(response.status) + "): " + detail)
             return body
         except (OSError, http.client.HTTPException) as exc:
             raise ReplicationError("Kubo RPC unavailable: " + command_name) from exc
@@ -264,6 +278,8 @@ class KuboRPC(Kubo):
             raise ReplicationError("Kubo RPC and CLI repository paths differ")
 
     def block_size(self, cid):
+        if cid in self.raw_cids:
+            return len(self.raw_store.read(cid))
         result = self._json("block/stat", {"arg": cid})
         if type(result.get("Size")) is not int or result["Size"] < 0:
             raise ReplicationError("Kubo RPC block size unreadable for " + cid)
@@ -305,9 +321,19 @@ class KuboRPC(Kubo):
             pinned = self._json("pin/add", {"arg": cid, "recursive": "false"})
             if not isinstance(pinned.get("Pins"), list) or cid not in pinned["Pins"]:
                 raise ReplicationError("Kubo RPC pin receipt differs for " + cid)
-        except ReplicationError:
+        except ReplicationError as exc:
             if self.durable_pin_type(cid) is None:
-                raise
+                # Some upstream blocks carry a dag-pb CID over bytes that are
+                # not decodable as dag-pb. Kubo rederived the CID and returned
+                # the exact bytes above, but its pin/add decoder refuses them.
+                # Preserve only this observed refusal in an independently
+                # CID-checked, fsynced raw store; all other pin errors fail.
+                if (self.raw_store is None or "pin: protobuf:" not in str(exc)):
+                    raise
+                self.raw_store.put(cid, data)
+                self.raw_cids.add(cid)
+                self.pins.add(cid)
+                return
         if self.durable_pin_type(cid) is None:
             raise ReplicationError("Kubo RPC durable pin missing for " + cid)
         self.pins.add(cid)
@@ -564,6 +590,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ipfs-bin", required=True)
     parser.add_argument("--kubo-api-url", help="loopback Kubo RPC origin for per-block operations")
+    parser.add_argument("--raw-block-store", type=Path,
+                        help="durable CID-checked store for Kubo-undecodable blocks")
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--api-url", default=DEFAULT_API)
     parser.add_argument("--inventory-path", type=Path)
@@ -592,10 +620,12 @@ def main():
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise ReplicationError("another lake replication is running")
-            kubo = KuboRPC(args.ipfs_bin, args.kubo_api_url) if args.kubo_api_url else Kubo(args.ipfs_bin)
+            raw_store = RawBlockStore(args.raw_block_store) if args.raw_block_store else None
+            kubo = (KuboRPC(args.ipfs_bin, args.kubo_api_url, raw_store=raw_store)
+                    if args.kubo_api_url else Kubo(args.ipfs_bin, raw_store=raw_store))
             result = run_batch(args, kubo)
         print(json.dumps(result, sort_keys=True))
-    except (ReplicationError, OSError, subprocess.TimeoutExpired) as exc:
+    except (ReplicationError, RawBlockStoreError, OSError, subprocess.TimeoutExpired) as exc:
         print("REFUSED: {}".format(exc), file=sys.stderr)
         return 2
     return 0
