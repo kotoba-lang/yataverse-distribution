@@ -192,6 +192,8 @@ the matching CID and byte digest on both nodes, and a successful LAN peer
 response in Xavier's web-server log. A peer 404 is an incomplete copy, not a
 reason to fetch from Cloudflare on gad. Xavier remains the bootstrap source
 until the full dated inventory is stored on both nodes.
+Gad limits peer fetches to two simultaneous requests and retries transient
+peer HTTP errors three times; a persistent refusal still stops the batch.
 
 After measuring the dated lake at 88,410,406,176 bytes and checking 120 GB
 Kubo limits plus physical free space on both nodes, the deployed user units

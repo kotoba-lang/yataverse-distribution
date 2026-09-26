@@ -156,7 +156,7 @@ class ReplicationTests(unittest.TestCase):
         self.assertEqual(b"abc", data)
         self.assertEqual("peer", urls[0][0])
         self.assertEqual(args_peer.peer_resolve, urls[0][3])
-        self.assertEqual({"max_seconds": 12, "retries": 0}, urls[0][4])
+        self.assertEqual({"max_seconds": 12, "retries": 3}, urls[0][4])
         self.assertEqual(1, len(urls))
         with patch.object(replica, "command", return_value=b"abc") as invoke:
             replica.curl(peer + CID_A, 3, resolve=args_peer.peer_resolve,
