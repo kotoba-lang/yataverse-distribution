@@ -706,6 +706,30 @@ def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
             "new_bytes": new_bytes, "cursor_advanced": True})
 
 
+def run_and_record_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
+    """Persist the completed batch and its source counts before reporting success."""
+    started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    result = run_batch(args, kubo, listing_fn, block_fn)
+    checkpoint = state_load(args.state_dir / "checkpoint.json")
+    receipt = {
+        "schema": 1,
+        "started_at": started_at,
+        "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "pid": os.getpid(),
+        "systemd_invocation_id": os.environ.get("INVOCATION_ID"),
+        "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "inventory_sha256": getattr(args, "inventory_sha256", None),
+        "listing_source": checkpoint.get("listing_source"),
+        "checkpoint": checkpoint,
+        "result": result,
+    }
+    receipt_dir = args.state_dir / "batch-receipts"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    name = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    state_save(receipt_dir / (name + "-" + uuid.uuid4().hex + ".json"), receipt)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ipfs-bin", required=True)
@@ -748,7 +772,7 @@ def main():
             raw_store = RawBlockStore(args.raw_block_store) if args.raw_block_store else None
             kubo = (KuboRPC(args.ipfs_bin, args.kubo_api_url, raw_store=raw_store)
                     if args.kubo_api_url else Kubo(args.ipfs_bin, raw_store=raw_store))
-            result = run_batch(args, kubo)
+            result = run_and_record_batch(args, kubo)
         print(json.dumps(result, sort_keys=True))
     except (ReplicationError, RawBlockStoreError, OSError, subprocess.TimeoutExpired) as exc:
         print("REFUSED: {}".format(exc), file=sys.stderr)

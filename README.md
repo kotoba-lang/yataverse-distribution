@@ -155,7 +155,12 @@ ssh -N -o ExitOnForwardFailure=yes \
 Run the tunnel as a separate process. Xavier's service first tries its local
 peer, then the bridge, then the existing public gateway. The batch JSON
 records `origin_sources` so public fallback cannot be reported as bridge
-success. When the bridge is unavailable, attempts are suppressed for one
+success. Each completed invocation also writes one JSON file under
+`--state-dir/batch-receipts/` with the result, source counts, checkpoint,
+script digest, and systemd invocation ID when present. A failed or interrupted
+batch has no completion file; an invocation ID identifies a systemd service
+run but does not by itself prove that the timer triggered it. When the bridge
+is unavailable, attempts are suppressed for one
 minute before another probe; the public path remains usable. This operator
 relay accelerates a dated bootstrap and does not qualify independent ongoing
 ingress or ownership of the canonical hostname. In a bounded live probe, 100
