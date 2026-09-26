@@ -7,7 +7,7 @@ Requires=ipfs.service yataverse-lake-read.service
 [Service]
 Type=oneshot
 Environment=IPFS_PATH=/mnt/nvme/ipfs-xavier/repo
-ExecStart=/usr/bin/python3 /home/xavier/.local/bin/yataverse-lake-replicate --ipfs-bin /mnt/nvme/ipfs-xavier/bin/ipfs --state-dir /mnt/nvme/ipfs-xavier/lake-state --api-url http://127.0.0.1:8090/api/v1/lake/blocks --inventory-path /mnt/nvme/ipfs-xavier/lake-state/inventory-20260926.jsonl --inventory-sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 --peer-block-url-base https://yataverse-data.220-146-170-114.sslip.io/ipfs/ --peer-resolve yataverse-data.220-146-170-114.sslip.io:443:192.168.1.16 --max-pages 100 --max-new-bytes 2000000000
+ExecStart=/usr/bin/python3 /home/xavier/.local/bin/yataverse-lake-replicate --ipfs-bin /mnt/nvme/ipfs-xavier/bin/ipfs --kubo-api-url http://127.0.0.1:5001 --state-dir /mnt/nvme/ipfs-xavier/lake-state --api-url http://127.0.0.1:8090/api/v1/lake/blocks --inventory-path /mnt/nvme/ipfs-xavier/lake-state/inventory-20260926.jsonl --inventory-sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 --peer-block-url-base https://yataverse-data.220-146-170-114.sslip.io/ipfs/ --peer-resolve yataverse-data.220-146-170-114.sslip.io:443:192.168.1.16 --max-pages 100 --max-new-bytes 2000000000
 TimeoutStartSec=10800
 MemoryMax=1G
 Nice=10
