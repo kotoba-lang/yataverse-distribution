@@ -161,6 +161,29 @@ then reload and enable the timer. Each node retains its own state directory.
 The timer does not change Kubo's `StorageMax`; measure the lake and physical
 capacity before increasing that limit.
 
+## Local read API from the dated lake snapshot
+
+`deploy/serve_lake.py` serves the complete, dated inventory and locally pinned
+raw blocks without fetching from Cloudflare. It refuses startup unless the
+inventory's SHA-256 and row count match the declared snapshot. Its
+`/api/v1/lake/blocks` response uses the same `blocks`, `cursor`, and
+`truncated?` fields as the replication source, with a local integer cursor.
+`/ipfs/{cid}` accepts only a CID in that inventory, confirms a direct or
+recursive Kubo pin, then reads the block with `ipfs --offline`. Unpinned,
+missing, or oversized blocks return an error. `/health` describes the
+inventory only; it does not certify that all block bytes have been copied.
+
+The first deployment uses the dated `inventory-20260926.jsonl` snapshot
+(821,533 rows; SHA-256
+`f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188`)
+and binds `127.0.0.1:8090`. Install `serve_lake.py` as
+`~/.local/bin/yataverse-lake-read` and the matching
+`deploy/{gad,xavier}-lake-read.service` as
+`~/.config/systemd/user/yataverse-lake-read.service`. Copy the verified
+inventory to the path in the unit, then enable the service. This local route
+can be tested with a direct node connection. Public ingress and a live
+snapshot refresh still need separate qualification.
+
 ## Honest state (what this repo does NOT do yet)
 
 - The murakumo overlay adapter (QUIC delivery of gossip forwards and
