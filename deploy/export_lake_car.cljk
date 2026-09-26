@@ -1,0 +1,133 @@
+(ns export-lake-car
+  "Export one bounded range of the dated lake inventory from a node's HTTPS
+  block reader. Run with kbb/SCI; no Kubo admin API is exposed."
+  (:require [ipld.car :as car]
+            [ipld.car.bytes :as b]
+            [multiformats.core :as mf]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:crypto" :as crypto]
+            ["node:child_process" :as cp]))
+
+(defn refuse [reason data]
+  (throw (ex-info (str "lake CAR: " reason) (assoc data :reason reason))))
+
+(defn opts [args]
+  (when (odd? (count args)) (refuse "unpaired-argument" {}))
+  (let [m (apply hash-map args)
+        required ["--inventory" "--inventory-sha256" "--inventory-count"
+                  "--start-row" "--max-blocks" "--max-bytes" "--base-url" "--output"]]
+    (when (or (not= (set required) (set (keys m)))
+              (some #(not (string? (get m %))) required))
+      (refuse "arguments" {:required required}))
+    (doseq [k ["--inventory-count" "--start-row" "--max-blocks" "--max-bytes"]]
+      (when-not (re-matches #"(?:0|[1-9][0-9]*)" (get m k))
+        (refuse "integer-argument" {:option k})))
+    (let [n (fn [k] (js/Number (get m k)))
+          base (get m "--base-url")]
+      (when-not (and (pos? (n "--inventory-count"))
+                     (<= 0 (n "--start-row"))
+                     (<= 1 (n "--max-blocks") 200)
+                     (<= 1 (n "--max-bytes") 536870912)
+                     (every? js/Number.isSafeInteger
+                             (map n ["--inventory-count" "--start-row"
+                                     "--max-blocks" "--max-bytes"])))
+        (refuse "bounds" {}))
+      (when-not (re-matches #"https://[A-Za-z0-9.-]+(?::[0-9]+)?/ipfs/" base)
+        (refuse "block-source-must-be-https-ipfs" {}))
+      m)))
+
+(defn cidv1 [cid]
+  (cond
+    (re-matches #"Qm[1-9A-HJ-NP-Za-km-z]{44}" cid)
+    (mf/cidv1 0x70 (mf/base58btc-decode cid))
+    (re-matches #"b[a-z2-7]{20,200}" cid)
+    (do (car/read-cid (car/cid->bytes cid) 0) cid)
+    :else (refuse "invalid-cid" {:cid cid})))
+
+(defn inventory-range [path expected-sha expected-count start max-blocks]
+  (let [stat (.statSync fs path)]
+    (when (> (.-size stat) 134217728)
+      (refuse "inventory-too-large" {:bytes (.-size stat)}))
+    (let [bytes (.readFileSync fs path)
+          sha (.digest (.update (.createHash crypto "sha256") bytes) "hex")
+          lines (.split (.toString bytes "utf8") "\n")
+          lines (if (= "" (last lines)) (pop (vec lines)) (vec lines))]
+      (when-not (and (= sha expected-sha) (= expected-count (count lines)))
+        (refuse "inventory-identity" {:actual-sha sha :actual-count (count lines)}))
+      (when (>= start (count lines))
+        (refuse "start-outside-inventory" {:start start}))
+      (mapv (fn [line]
+              (let [row (try (js->clj (.parse js/JSON line) :keywordize-keys true)
+                             (catch :default _ (refuse "invalid-inventory-row" {})))
+                    cid (:cid row) size (:bytes row)]
+                (when-not (and (string? cid) (integer? size) (pos? size)
+                               (<= size 8000000))
+                  (refuse "invalid-inventory-row" {:cid cid :size size}))
+                {:source-cid cid :cid (cidv1 cid) :size size}))
+            (subvec lines start (min (count lines) (+ start max-blocks)))))))
+
+(defn fetch-block [base {:keys [source-cid cid size]}]
+  (let [bytes (.execFileSync cp "curl"
+                             (clj->js ["-fsS" "--proto" "=https" "--max-redirs" "0"
+                                       "--connect-timeout" "5" "--max-time" "120"
+                                       "--max-filesize" (str size)
+                                       (str base source-cid)])
+                             #js {:maxBuffer 8000001 :timeout 125000})]
+    (when-not (= size (.-length bytes))
+      (refuse "block-size" {:cid source-cid :expected size :actual (.-length bytes)}))
+    {:cid cid :bytes (b/as-bytes bytes)}))
+
+(defn export! [m]
+  (let [start (js/Number (get m "--start-row"))
+        max-blocks (js/Number (get m "--max-blocks"))
+        max-bytes (js/Number (get m "--max-bytes"))
+        selected (inventory-range (get m "--inventory")
+                                  (get m "--inventory-sha256")
+                                  (js/Number (get m "--inventory-count"))
+                                  start max-blocks)
+        output (get m "--output")
+        temp (str output "." (.randomUUID crypto) ".partial")
+        roots (mapv :cid selected)]
+    (when (.existsSync fs output) (refuse "output-exists" {:output output}))
+    (let [fd (.openSync fs temp "wx" 384)
+          digest (.createHash crypto "sha256")]
+      (try
+        (let [result (car/stream-encode!
+                      {:roots roots
+                       :blocks (map #(fetch-block (get m "--base-url") %) selected)
+                       :max-bytes max-bytes
+                       :write! (fn [part]
+                                 (let [bytes (b/as-bytes part)
+                                       written (.writeSync fs fd bytes)]
+                                   (when (= written (b/bcount bytes))
+                                     (.update digest bytes))
+                                   written))})]
+          (.fsyncSync fs fd)
+          (.closeSync fs fd)
+          (let [sha (.digest digest "hex")]
+            ;; A hard link publishes without replacing a concurrent output.
+            (.linkSync fs temp output)
+            (.unlinkSync fs temp)
+            (let [dirfd (.openSync fs (.dirname path output) "r")]
+              (try (.fsyncSync fs dirfd)
+                   (finally (.closeSync fs dirfd))))
+            (println (.stringify js/JSON (clj->js
+                       {:status "complete" :output output :sha256 sha
+                        :bytes (:bytes-written result) :blocks (:block-count result)
+                        :start-row start :end-row (+ start (count selected))
+                        :inventory-sha256 (get m "--inventory-sha256")})))))
+        (catch :default e
+          (try (.closeSync fs fd) (catch :default _ nil))
+          (try (.unlinkSync fs temp) (catch :default _ nil))
+          (throw e))))))
+
+(defn -main []
+  (try
+    (export! (opts (vec *command-line-args*)))
+    (catch :default e
+      (binding [*print-fn* (fn [s] (.error js/console s))]
+        (println "REFUSED" (or (:reason (ex-data e)) (.-message e))))
+      (set! (.-exitCode js/process) 2))))
+
+(-main)
