@@ -64,6 +64,8 @@
                 (when-not (and (string? cid) (integer? size) (pos? size)
                                (<= size 256000000))
                   (refuse "invalid-inventory-row" {:cid cid :size size}))
+                (when (> size 8000000)
+                  (refuse "oversized-block-use-unixfs-recovery" {:cid cid :size size}))
                 {:source-cid cid :cid (cidv1 cid) :size size}))
             (subvec lines start (min (count lines) (+ start max-blocks)))))))
 
@@ -124,6 +126,15 @@
 
 (defn -main []
   (try
+    ;; The portable ClojureScript digest converts a 200 MB block to a giant
+    ;; sequence and can exhaust V8. Prove and install Node's native SHA-256
+    ;; before the CAR writer verifies any bytes.
+    (mf/install-sha256!
+     (fn [bytes]
+       (js/Uint8Array.
+        (.digest (.update (.createHash crypto "sha256") (b/as-bytes bytes))))))
+    (when-not (= :installed (mf/sha256-provider))
+      (refuse "native-sha256-not-installed" {}))
     (export! (opts (vec *command-line-args*)))
     (catch :default e
       (binding [*print-fn* (fn [s] (.error js/console s))]
