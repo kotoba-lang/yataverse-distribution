@@ -1,0 +1,14 @@
+[Unit]
+Description=Read-only Yataverse lake snapshot from gad
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/gad/.local/bin/yataverse-lake-read --inventory /home/gad/.local/share/yataverse/inventory-20260926.jsonl --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 --count 821533 --ipfs-bin /usr/local/bin/ipfs --ipfs-path /home/gad/.ipfs --host 127.0.0.1 --port 8090
+Restart=on-failure
+RestartSec=10
+MemoryMax=1G
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
