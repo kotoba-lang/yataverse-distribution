@@ -130,6 +130,18 @@ read API or a public gateway.
 Run as the node owner with `IPFS_PATH` set to its local repo. For example,
 gad uses `/usr/local/bin/ipfs` and `/home/gad/.ipfs`, while Xavier uses
 `/mnt/nvme/ipfs-xavier/bin/ipfs` and `/mnt/nvme/ipfs-xavier/repo`.
+The deployed units set `--kubo-api-url http://127.0.0.1:5001` so each block
+uses the daemon's loopback RPC instead of starting a CLI process repeatedly.
+Startup still reads the CLI pin list and repo status, and refuses when the RPC
+daemon reports a different repo path. Every new block still requires the
+expected CID, exact byte readback, and a confirmed direct or recursive pin
+before its receipt or page cursor is advanced. The RPC URL accepts loopback
+only; do not publish Kubo's admin API. Omitting the option retains the CLI
+path for bounded manual probes. On gad, 20 already-pinned `block stat`
+measurements had 25.4 ms CLI and 1.3 ms RPC median; this measures call
+overhead, not full-batch throughput. A new 38-byte gad canary and 41-byte
+Xavier canary each passed CID, readback, size, and direct-pin checks through
+the RPC path.
 Give each node its own persistent `--state-dir`. The default batch copies at
 most 20 pages and 512 MB of new bytes. `--max-pages`, `--max-new-bytes`, and
 `--max-block-bytes` bound an invocation; an exceeded byte budget returns a

@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import datetime
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -21,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import urllib.parse
+import uuid
 from pathlib import Path
 
 
@@ -190,6 +192,124 @@ class Kubo:
             # is acceptable only when Kubo itself confirms a durable pin.
             if self.durable_pin_type(cid) is None:
                 raise
+        self.pins.add(cid)
+
+
+class KuboRPC(Kubo):
+    """Use the daemon's loopback RPC for per-block work; retain CLI preflight.
+
+    RPC never leaves loopback. The CLI and RPC repository paths must agree so
+    the speedup cannot silently write to a different Kubo daemon.
+    """
+
+    def __init__(self, binary, api_url):
+        super().__init__(binary)
+        parsed = urllib.parse.urlsplit(api_url)
+        if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or
+                parsed.path not in ("", "/") or parsed.query or parsed.fragment or
+                parsed.username or parsed.password or not parsed.port):
+            raise ReplicationError("Kubo RPC must be a loopback HTTP origin")
+        self.api_port = parsed.port
+        self.connection = None
+
+    def _request(self, command_name, params=None, data=None, max_response=2_000_000):
+        query = urllib.parse.urlencode(params or {})
+        path = "/api/v0/" + command_name + ("?" + query if query else "")
+        if self.connection is None:
+            self.connection = http.client.HTTPConnection("127.0.0.1", self.api_port, timeout=300)
+        try:
+            if data is None:
+                self.connection.request("POST", path)
+            else:
+                boundary = "yataverse-" + uuid.uuid4().hex
+                prefix = ("--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; "
+                          "filename=\"block\"\r\nContent-Type: application/octet-stream\r\n\r\n").encode()
+                suffix = ("\r\n--" + boundary + "--\r\n").encode()
+                self.connection.putrequest("POST", path)
+                self.connection.putheader("Content-Type", "multipart/form-data; boundary=" + boundary)
+                self.connection.putheader("Content-Length", str(len(prefix) + len(data) + len(suffix)))
+                self.connection.endheaders()
+                self.connection.send(prefix)
+                self.connection.send(data)
+                self.connection.send(suffix)
+            response = self.connection.getresponse()
+            body = response.read(max_response + 1)
+            if len(body) > max_response:
+                raise ReplicationError("Kubo RPC response exceeds bound: " + command_name)
+            if response.status != 200:
+                raise ReplicationError("Kubo RPC refused " + command_name + " (HTTP " + str(response.status) + ")")
+            return body
+        except (OSError, http.client.HTTPException) as exc:
+            raise ReplicationError("Kubo RPC unavailable: " + command_name) from exc
+        finally:
+            # An error may leave unread response bytes or an uncertain write.
+            if sys.exc_info()[0] is not None and self.connection is not None:
+                self.connection.close()
+                self.connection = None
+
+    def _json(self, command_name, params=None, data=None):
+        try:
+            result = json.loads(self._request(command_name, params, data))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ReplicationError("Kubo RPC returned invalid JSON: " + command_name) from exc
+        if not isinstance(result, dict):
+            raise ReplicationError("Kubo RPC returned wrong shape: " + command_name)
+        return result
+
+    def preflight(self):
+        super().preflight()
+        status = self._json("repo/stat")
+        if (not isinstance(status.get("RepoPath"), str) or
+                Path(status["RepoPath"]).resolve() != self.repo_path.resolve()):
+            raise ReplicationError("Kubo RPC and CLI repository paths differ")
+
+    def block_size(self, cid):
+        result = self._json("block/stat", {"arg": cid})
+        if type(result.get("Size")) is not int or result["Size"] < 0:
+            raise ReplicationError("Kubo RPC block size unreadable for " + cid)
+        return result["Size"]
+
+    def durable_pin_type(self, cid):
+        try:
+            result = self._json("pin/ls", {"arg": cid, "type": "all"})
+        except ReplicationError:
+            return None
+        pins = result.get("Keys")
+        if isinstance(pins, dict) and isinstance(pins.get(cid), dict):
+            kind = pins[cid].get("Type")
+            if kind in ("direct", "recursive"):
+                return kind
+        return None
+
+    def put_verified(self, cid, data):
+        result = self._json("cid/format", {"arg": cid, "f": "%v %c %h %L"})
+        prefix = str(result.get("Formatted", "")).split()
+        if len(prefix) != 4:
+            raise ReplicationError("Kubo RPC could not decode CID prefix " + cid)
+        version, codec, hash_name, hash_length = prefix
+        if version == "cidv0":
+            options = {"format": "v0"}
+        elif version == "cidv1":
+            options = {"cid-codec": codec, "mhtype": hash_name, "mhlen": hash_length}
+        else:
+            raise ReplicationError("unsupported CID version " + cid)
+        if len(data) > 2 * 1024 * 1024:
+            options["allow-big-block"] = "true"
+        produced = self._json("block/put", options, data).get("Key")
+        if produced != cid:
+            raise ReplicationError("Kubo RPC rederived a different CID for " + cid)
+        reread = self._request("block/get", {"arg": cid}, max_response=len(data))
+        if reread != data:
+            raise ReplicationError("Kubo RPC readback differs for " + cid)
+        try:
+            pinned = self._json("pin/add", {"arg": cid, "recursive": "false"})
+            if not isinstance(pinned.get("Pins"), list) or cid not in pinned["Pins"]:
+                raise ReplicationError("Kubo RPC pin receipt differs for " + cid)
+        except ReplicationError:
+            if self.durable_pin_type(cid) is None:
+                raise
+        if self.durable_pin_type(cid) is None:
+            raise ReplicationError("Kubo RPC durable pin missing for " + cid)
         self.pins.add(cid)
 
 
@@ -443,6 +563,7 @@ def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ipfs-bin", required=True)
+    parser.add_argument("--kubo-api-url", help="loopback Kubo RPC origin for per-block operations")
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--api-url", default=DEFAULT_API)
     parser.add_argument("--inventory-path", type=Path)
@@ -471,7 +592,8 @@ def main():
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise ReplicationError("another lake replication is running")
-            result = run_batch(args, Kubo(args.ipfs_bin))
+            kubo = KuboRPC(args.ipfs_bin, args.kubo_api_url) if args.kubo_api_url else Kubo(args.ipfs_bin)
+            result = run_batch(args, kubo)
         print(json.dumps(result, sort_keys=True))
     except (ReplicationError, OSError, subprocess.TimeoutExpired) as exc:
         print("REFUSED: {}".format(exc), file=sys.stderr)
