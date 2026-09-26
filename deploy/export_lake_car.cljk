@@ -62,7 +62,7 @@
                              (catch :default _ (refuse "invalid-inventory-row" {})))
                     cid (:cid row) size (:bytes row)]
                 (when-not (and (string? cid) (integer? size) (pos? size)
-                               (<= size 8000000))
+                               (<= size 256000000))
                   (refuse "invalid-inventory-row" {:cid cid :size size}))
                 {:source-cid cid :cid (cidv1 cid) :size size}))
             (subvec lines start (min (count lines) (+ start max-blocks)))))))
@@ -70,10 +70,10 @@
 (defn fetch-block [base {:keys [source-cid cid size]}]
   (let [bytes (.execFileSync cp "curl"
                              (clj->js ["-fsS" "--proto" "=https" "--max-redirs" "0"
-                                       "--connect-timeout" "5" "--max-time" "120"
+                                       "--connect-timeout" "5" "--max-time" "300"
                                        "--max-filesize" (str size)
                                        (str base source-cid)])
-                             #js {:maxBuffer 8000001 :timeout 125000})]
+                             #js {:maxBuffer 256000001 :timeout 305000})]
     (when-not (= size (.-length bytes))
       (refuse "block-size" {:cid source-cid :expected size :actual (.-length bytes)}))
     {:cid cid :bytes (b/as-bytes bytes)}))

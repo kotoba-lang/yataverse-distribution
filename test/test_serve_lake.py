@@ -58,6 +58,8 @@ class ServingTests(unittest.TestCase):
     def test_block_requires_exact_pin_and_measured_size(self):
         with tempfile.TemporaryDirectory() as directory:
             inventory = self.inventory(directory)
+            with self.assertRaisesRegex(serve.InventoryError, "block byte limit"):
+                serve.LocalBlocks(shutil.which("true"), directory, inventory, 256_000_001)
             blocks = serve.LocalBlocks(shutil.which("true"), directory, inventory, 8)
             direct = SimpleNamespace(returncode=0, stdout=(CID_A + " direct\n").encode())
             body = SimpleNamespace(returncode=0, stdout=b"abc")
@@ -96,6 +98,56 @@ class ServingTests(unittest.TestCase):
                 self.assertEqual(200, response.status)
                 connection.close()
             finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
+    def test_second_large_read_is_refused_while_first_is_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inventory = self.inventory(directory)
+            inventory.sizes[CID_A] = serve.LARGE_BLOCK_THRESHOLD + 1
+            entered = threading.Event()
+            release = threading.Event()
+            first = {}
+
+            def read(_cid):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test reader did not unblock")
+                return b"abc"
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), serve.handler_for(inventory, SimpleNamespace(read=read)))
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+
+            def first_request():
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    conn.request("GET", "/ipfs/" + CID_A)
+                    response = conn.getresponse()
+                    first["status"] = response.status
+                    first["body"] = response.read()
+                finally:
+                    conn.close()
+
+            reader = threading.Thread(target=first_request, daemon=True)
+            reader.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    conn.request("GET", "/ipfs/" + CID_A)
+                    response = conn.getresponse()
+                    response.read()
+                    self.assertEqual(503, response.status)
+                    self.assertIn("large block reader busy", response.reason)
+                finally:
+                    conn.close()
+                release.set()
+                reader.join(timeout=5)
+                self.assertEqual({"status": 200, "body": b"abc"}, first)
+            finally:
+                release.set()
                 server.shutdown()
                 server.server_close()
                 worker.join(timeout=2)

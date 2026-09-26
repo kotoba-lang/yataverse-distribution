@@ -281,8 +281,12 @@ CAR, SHA-256 `bc7aff2c03e7294a0f5bc141f23f5752b16f11a17eb2730e74a83bc2f075c482`.
 The fresh offline Kubo repo imported it and read back both the first and last
 CIDv0 blocks in that range. This larger canary is still a subset. The dated
 inventory totals 88,410,406,176 block bytes; 446 blocks exceed the current
-public reader's 8 MB per-block limit (largest 204,123,728 bytes). Those need
-a separately bounded large-block read path before a complete export.
+public reader's 8 MB per-block limit (largest 204,123,728 bytes). The updated
+reader accepts an explicit 256 MB ceiling for the dated inventory and allows
+only one request above 8 MB at a time, returning 503 to a second large read.
+Both node units set `MemoryMax=2G`. The reader still buffers one block, so
+live qualification must include a largest-class block from each node and
+memory observation before treating the whole inventory as exportable.
 
 For the first public read entry, `deploy/xavier-public-lake.conf` exposes this
 same local service at `https://yataverse-data.220-146-170-114.sslip.io:8443/`
