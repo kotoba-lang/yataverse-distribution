@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Bounded, resumable copy of the public Yataverse R2 block listing into Kubo.
+"""Bounded, resumable Yataverse lake copy into Kubo.
 
-This is an interim source adapter: the read API still runs on Cloudflare.
+The pinned inventory and a peer's HTTPS gateway can replace Cloudflare reads.
 Kubo rederives every listed CID before a block is pinned. A durable cursor
 advances only after every block on a page has been checked.
 """
 
 import argparse
+import base64
+import binascii
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import datetime
@@ -47,12 +49,32 @@ def command(argv, data=None, max_seconds=300):
     return result.stdout
 
 
-def curl(url, limit):
+def local_listing(url):
+    parsed = urllib.parse.urlsplit(url)
+    return (parsed.scheme == "http" and parsed.hostname == "127.0.0.1" and
+            parsed.path == "/api/v1/lake/blocks" and not parsed.query)
+
+
+def curl(url, limit, resolve=None, max_seconds=240, retries=2):
+    parsed = urllib.parse.urlsplit(url)
+    protocol = "=http" if parsed.scheme == "http" and parsed.hostname == "127.0.0.1" else "=https"
+    if ((protocol == "=http" and parsed.hostname != "127.0.0.1") or
+            (protocol == "=https" and parsed.scheme != "https")):
+        raise ReplicationError("HTTP source must be loopback or HTTPS")
+    # The public IPFS gateway may redirect to a CID host. A loopback inventory
+    # or named LAN peer must not redirect outside its own authority.
+    follow = protocol == "=https" and resolve is None
+    argv = ["curl", "-fLsS" if follow else "-fsS", "--retry", str(retries),
+            "--retry-delay", "1", "--max-redirs", "3" if follow else "0",
+            "--proto", protocol, "--proto-redir", protocol,
+            "--connect-timeout", "2", "--max-time", str(max_seconds),
+            "--max-filesize", str(limit)]
+    if resolve:
+        argv += ["--noproxy", "*", "--resolve", resolve]
+    argv.append(url)
     data = command(
-        ["curl", "-fLsS", "--retry", "2", "--retry-delay", "1",
-         "--max-redirs", "3", "--proto", "=https", "--proto-redir", "=https",
-         "--max-time", "240", "--max-filesize", str(limit), url],
-        max_seconds=270,
+        argv,
+        max_seconds=max_seconds + 30,
     )
     if len(data) > limit:
         raise ReplicationError("HTTP body exceeds configured maximum")
@@ -60,9 +82,9 @@ def curl(url, limit):
 
 
 def fetch_listing(api_url, cursor):
-    query = "?limit=200"
+    query = "" if local_listing(api_url) else "?limit=200"
     if cursor:
-        query += "&cursor=" + urllib.parse.quote(cursor, safe="")
+        query += ("?" if not query else "&") + "cursor=" + urllib.parse.quote(cursor, safe="")
     try:
         listing = json.loads(curl(api_url + query, 2_000_000))
     except (ValueError, UnicodeDecodeError) as exc:
@@ -199,6 +221,111 @@ def state_save(path, state):
     os.replace(str(temp), str(path))
 
 
+def legacy_cursor_cid(cursor):
+    if not isinstance(cursor, str) or not re.fullmatch(r"1-[A-Za-z0-9_-]+", cursor):
+        raise ReplicationError("legacy listing cursor has unknown format")
+    encoded = cursor[2:]
+    try:
+        padded = encoded + "=" * ((4 - len(encoded) % 4) % 4)
+        payload = json.loads(urllib.parse.unquote(
+            base64.urlsafe_b64decode(padded).decode("utf-8")))
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise ReplicationError("legacy listing cursor cannot be decoded") from exc
+    key = payload.get("startAfter") if isinstance(payload, dict) and payload.get("v") == 1 else None
+    cid = key[5:] if isinstance(key, str) and key.startswith("ipld/") else None
+    if not valid_cid(cid):
+        raise ReplicationError("legacy listing cursor has no valid block CID")
+    return cid
+
+
+def inventory_offset(path, expected_sha256, after_cid):
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise ReplicationError("inventory digest is invalid")
+    digest = hashlib.sha256()
+    offset = None
+    with path.open("rb") as source:
+        for index, line in enumerate(source):
+            digest.update(line)
+            if after_cid is not None and offset is None:
+                try:
+                    row = json.loads(line)
+                except ValueError as exc:
+                    raise ReplicationError("inventory row is unreadable") from exc
+                if row.get("cid") == after_cid:
+                    offset = index + 1
+    if digest.hexdigest() != expected_sha256:
+        raise ReplicationError("inventory digest differs from pinned snapshot")
+    if after_cid is not None and offset is None:
+        raise ReplicationError("legacy cursor CID absent from local inventory")
+    return str(offset) if offset is not None else None
+
+
+def prepare_listing_state(args, path, state):
+    local = local_listing(args.api_url)
+    marker = state.get("listing_source")
+    if marker is not None and not isinstance(marker, str):
+        raise ReplicationError("checkpoint listing source is invalid")
+    if not local:
+        if marker is not None:
+            raise ReplicationError("checkpoint listing source cannot use public listing")
+        return state
+    inventory = getattr(args, "inventory_path", None)
+    expected = getattr(args, "inventory_sha256", None)
+    if not inventory or not expected:
+        raise ReplicationError("local listing requires a pinned inventory path and digest")
+    target_marker = "local-inventory:" + expected
+    if marker and marker != target_marker:
+        raise ReplicationError("checkpoint inventory identity differs")
+    if marker and state["cursor"] is not None and not re.fullmatch(r"[0-9]+", state["cursor"]):
+        raise ReplicationError("local listing cursor is not a numeric offset")
+    after_cid = legacy_cursor_cid(state["cursor"]) if not marker and state["cursor"] else None
+    offset = inventory_offset(inventory, expected, after_cid)
+    if not marker:
+        if path.exists():
+            old = path.read_bytes()
+            backup = path.with_name("checkpoint.pre-local-inventory.json")
+            if backup.exists():
+                if backup.read_bytes() != old:
+                    raise ReplicationError("checkpoint migration backup differs")
+            else:
+                with backup.open("xb") as handle:
+                    handle.write(old)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+        state["cursor"] = offset
+        state["listing_source"] = target_marker
+        state_save(path, state)
+    return state
+
+
+def peer_first_block_fetcher(args, public_fetch):
+    peer_base = getattr(args, "peer_block_url_base", None)
+    if not peer_base:
+        if getattr(args, "peer_only", False):
+            raise ReplicationError("peer-only mode has no peer source")
+        return public_fetch
+    peer = urllib.parse.urlsplit(peer_base)
+    resolve = getattr(args, "peer_resolve", None)
+    if (peer.scheme != "https" or not peer.hostname or not peer_base.endswith("/ipfs/") or
+            not resolve or not resolve.startswith(peer.hostname + ":443:")):
+        raise ReplicationError("peer source must be an explicit HTTPS host and address")
+
+    def fetch(url, limit):
+        if not url.startswith(args.block_url_base):
+            raise ReplicationError("block source URL differs from configured base")
+        cid = url[len(args.block_url_base):]
+        if not valid_cid(cid):
+            raise ReplicationError("block source URL has invalid CID")
+        try:
+            return curl(peer_base + cid, limit, resolve=resolve, max_seconds=12, retries=0)
+        except ReplicationError as exc:
+            if getattr(args, "peer_only", False):
+                raise ReplicationError("peer-only block source unavailable: " + cid) from exc
+            return public_fetch(url, limit)
+
+    return fetch
+
+
 def append_receipt(path, cid, size, data):
     receipt = {
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -243,7 +370,8 @@ def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
     args.state_dir.mkdir(parents=True, exist_ok=True)
     state_path = args.state_dir / "checkpoint.json"
     receipt_path = args.state_dir / "receipts.jsonl"
-    state = state_load(state_path)
+    state = prepare_listing_state(args, state_path, state_load(state_path))
+    fetch_block = peer_first_block_fetcher(args, block_fn)
     kubo.preflight()
     new_bytes = 0
     new_blocks = 0
@@ -276,7 +404,7 @@ def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
             planned_bytes += size
 
         for item, data in prefetch_ordered(
-                selected, block_fn, args.block_url_base, args.max_block_bytes,
+                selected, fetch_block, args.block_url_base, args.max_block_bytes,
                 args.fetch_workers, args.max_prefetch_bytes):
             cid, size = item["cid"], item["size"]
             if len(data) != size:
@@ -317,7 +445,12 @@ def main():
     parser.add_argument("--ipfs-bin", required=True)
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--api-url", default=DEFAULT_API)
+    parser.add_argument("--inventory-path", type=Path)
+    parser.add_argument("--inventory-sha256")
     parser.add_argument("--block-url-base", default=DEFAULT_BLOCKS)
+    parser.add_argument("--peer-block-url-base")
+    parser.add_argument("--peer-resolve")
+    parser.add_argument("--peer-only", action="store_true")
     parser.add_argument("--max-pages", type=int, default=20)
     parser.add_argument("--max-new-bytes", type=int, default=512_000_000)
     parser.add_argument("--max-block-bytes", type=int, default=256_000_000)
@@ -328,6 +461,8 @@ def main():
     if (args.max_pages < 1 or args.max_new_bytes < 1 or args.max_block_bytes < 1 or
             args.fetch_workers < 1 or args.max_prefetch_bytes < 1 or args.min_free_bytes < 0):
         parser.error("batch budgets must be positive and disk reserve nonnegative")
+    if args.peer_only and not local_listing(args.api_url):
+        parser.error("peer-only mode requires a local inventory listing")
     args.state_dir.mkdir(parents=True, exist_ok=True)
     lock_path = args.state_dir / "replicate.lock"
     try:
