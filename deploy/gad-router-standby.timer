@@ -1,0 +1,11 @@
+[Unit]
+Description=Check independent gateway and router mapping every 30 seconds
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=30s
+Persistent=true
+Unit=gad-router-standby.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep the independent HTTPS gateway available when Xavier is offline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/gad/.local/bin/yataverse-router-standby --apply
+TimeoutStartSec=45
+
