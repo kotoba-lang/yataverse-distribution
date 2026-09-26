@@ -239,9 +239,15 @@ is a separate CID, so the original CID retains its original bytes. The
 2026-09-26 build was 17,826 bytes, SHA-256
 `2fd28ac84111bd181090f4ea712f8988c80dbad9162edf52c108865a3b636e97`,
 raw CID `bafkreibp2kfmqqirxumbbehu5jys7cmizag3vwiwf3pvfqiiqzndwy3os4`.
-gad and Xavier both direct-pinned and read back those exact bytes. After
-publishing this CID under the existing `yataverse-apex` IPNS key on both
-nodes, their public Nginx root path can proxy the local IPNS gateway.
+gad and Xavier both recursively pinned and read back those exact bytes. The
+existing `yataverse-apex` IPNS key on both nodes now resolves to this CID,
+and their Nginx root path proxies the local IPNS gateway. A public HTTPS GET
+returned the new source hash and all 50 relative block links returned 200,
+totaling 12,845,901 bytes from the own-node path. With Xavier's Nginx
+stopped and the router's external 8443 mapping moved to gad, the same public
+hostname returned the new HTML hash and a linked block; Xavier and its
+mapping were then restored and rechecked. This is a manual gateway drill,
+not automatic failover or proof that every lake block is replicated.
 The document is a dated, read-only snapshot; changing the canonical
 `yataverse.com` origin and updating snapshots remain separate work.
 
