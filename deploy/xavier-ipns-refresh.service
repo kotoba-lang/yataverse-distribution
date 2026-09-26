@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh the Yataverse IPNS name from Xavier
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=IPFS_PATH=/mnt/nvme/ipfs-xavier/repo
+Environment=IPFS_TELEMETRY=off
+ExecStart=/home/xavier/.local/bin/yataverse-ipns-refresh /mnt/nvme/ipfs-xavier/bin/ipfs /home/xavier/.local/share/yataverse/current-cid k51qzi5uqu5dlrtqhevrfpyrdr2c1thxug3iqys76xxbi7bgzm16mjti2bwrf2
+TimeoutStartSec=180
+MemoryMax=256M
+CPUQuota=50%

@@ -84,6 +84,38 @@ shutdown returned the same digest. This proves two pinned copies and Xavier
 offline custody for that probe. It does not qualify public gateway ingress,
 Filecoin storage, or a service-wide failover.
 
+## IPNS name renewal
+
+`yataverse-apex` is an Ed25519 IPNS key in the Kubo keystores on both gad
+and Xavier. Its public name is
+`k51qzi5uqu5dlrtqhevrfpyrdr2c1thxug3iqys76xxbi7bgzm16mjti2bwrf2`.
+The private key is not in this repository. Both nodes published the current
+HTML CID, and Xavier resolved gad's record with `--nocache`.
+
+`deploy/refresh-ipns.sh` refuses a missing or malformed CID file and a
+CID that is not recursively pinned on the local node. It checks that Kubo
+published exactly the expected name and CID. The two user timers renew
+the record at staggered times, before its 168-hour expiry:
+
+| node | files to install as the node user | UTC schedule |
+|---|---|---|
+| gad | `deploy/gad-ipns-refresh.{service,timer}` | 00:07 and 12:07 |
+| Xavier | `deploy/xavier-ipns-refresh.{service,timer}` | 06:07 and 18:07 |
+
+Install the script as `~/.local/bin/yataverse-ipns-refresh` (mode 755),
+the corresponding unit files as
+`~/.config/systemd/user/yataverse-ipns-refresh.{service,timer}`, and put
+the locally pinned CID in `~/.local/share/yataverse/current-cid` (one
+line). Then run `systemctl --user daemon-reload`,
+`systemctl --user enable --now yataverse-ipns-refresh.timer`, and
+`systemctl --user start yataverse-ipns-refresh.service`. The service
+requires a running local Kubo daemon. Both users have `Linger=yes`.
+
+Update the CID file on both nodes only after the new CID is pinned and
+verified on both. These timers keep a verified snapshot's name alive; they
+do not fetch new site revisions. The public HTTP gateway and node-loss
+drill are still separate qualification steps.
+
 ## Honest state (what this repo does NOT do yet)
 
 - The murakumo overlay adapter (QUIC delivery of gossip forwards and
