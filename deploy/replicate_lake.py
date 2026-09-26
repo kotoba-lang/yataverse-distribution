@@ -407,6 +407,28 @@ def inventory_offset(path, expected_sha256, after_cid):
     return str(offset) if offset is not None else None
 
 
+def inventory_sizes(path, expected_sha256):
+    """Read a complete pinned snapshot before changing the durable cursor."""
+    if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise ReplicationError("inventory digest is invalid")
+    digest = hashlib.sha256()
+    sizes = {}
+    with Path(path).open("rb") as source:
+        for line in source:
+            digest.update(line)
+            try:
+                row = json.loads(line)
+                cid, size = row["cid"], row["bytes"]
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ReplicationError("inventory row is unreadable") from exc
+            if not valid_cid(cid) or type(size) is not int or size <= 0 or cid in sizes:
+                raise ReplicationError("inventory CID, size, or uniqueness is invalid")
+            sizes[cid] = size
+    if digest.hexdigest() != expected_sha256 or not sizes:
+        raise ReplicationError("inventory digest differs from pinned snapshot or is empty")
+    return sizes
+
+
 def prepare_listing_state(args, path, state):
     local = local_listing(args.api_url)
     marker = state.get("listing_source")
@@ -422,7 +444,34 @@ def prepare_listing_state(args, path, state):
         raise ReplicationError("local listing requires a pinned inventory path and digest")
     target_marker = "local-inventory:" + expected
     if marker and marker != target_marker:
-        raise ReplicationError("checkpoint inventory identity differs")
+        previous_path = getattr(args, "previous_inventory_path", None)
+        previous_sha256 = getattr(args, "previous_inventory_sha256", None)
+        if not previous_path or marker != "local-inventory:" + str(previous_sha256):
+            raise ReplicationError("checkpoint inventory identity differs")
+        if state["cursor"] is not None and not re.fullmatch(r"[0-9]+", state["cursor"]):
+            raise ReplicationError("previous inventory cursor is not a numeric offset")
+        old_sizes = inventory_sizes(previous_path, previous_sha256)
+        new_sizes = inventory_sizes(inventory, expected)
+        for cid, size in old_sizes.items():
+            if new_sizes.get(cid) != size:
+                raise ReplicationError("new inventory omits or changes previous CID")
+        if fetch_listing(args.api_url, None).get("inventory-sha256") != expected:
+            raise ReplicationError("local listing is not serving the new inventory")
+        if path.exists():
+            old = path.read_bytes()
+            backup = path.with_name("checkpoint.pre-inventory-" + previous_sha256 + ".json")
+            if backup.exists():
+                if backup.read_bytes() != old:
+                    raise ReplicationError("inventory migration backup differs")
+            else:
+                with backup.open("xb") as handle:
+                    handle.write(old)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+        state["cursor"] = "0"
+        state["listing_source"] = target_marker
+        state_save(path, state)
+        return state
     if marker and state["cursor"] is not None and not re.fullmatch(r"[0-9]+", state["cursor"]):
         raise ReplicationError("local listing cursor is not a numeric offset")
     after_cid = legacy_cursor_cid(state["cursor"]) if not marker and state["cursor"] else None
@@ -536,6 +585,8 @@ def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
 
     for _ in range(args.max_pages):
         listing = listing_fn(args.api_url, state["cursor"])
+        if local_listing(args.api_url) and listing.get("inventory-sha256") != args.inventory_sha256:
+            raise ReplicationError("local listing inventory identity differs")
         selected = []
         planned_bytes = 0
         budget_stop = False
@@ -606,6 +657,8 @@ def main():
     parser.add_argument("--api-url", default=DEFAULT_API)
     parser.add_argument("--inventory-path", type=Path)
     parser.add_argument("--inventory-sha256")
+    parser.add_argument("--previous-inventory-path", type=Path)
+    parser.add_argument("--previous-inventory-sha256")
     parser.add_argument("--block-url-base", default=DEFAULT_BLOCKS)
     parser.add_argument("--peer-block-url-base")
     parser.add_argument("--peer-resolve")
