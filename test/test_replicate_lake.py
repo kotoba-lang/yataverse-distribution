@@ -301,6 +301,19 @@ class ReplicationTests(unittest.TestCase):
         with self.assertRaisesRegex(replica.ReplicationError, "explicit HTTPS host and address"):
             replica.peer_first_block_fetcher(args, self.fail)
 
+    def test_large_peer_block_gets_bounded_transfer_time(self):
+        args = SimpleNamespace(
+            block_url_base="https://public.example/ipfs/",
+            peer_block_url_base="https://yataverse-data.example:8443/ipfs/",
+            peer_resolve="yataverse-data.example:8443:192.168.1.16",
+            peer_only=True)
+        with patch.object(replica, "curl", return_value=b"block") as fetch:
+            result = replica.peer_first_block_fetcher(args, self.fail)(
+                args.block_url_base + CID_A, 203_519_718)
+        self.assertEqual(b"block", result)
+        self.assertEqual(400, fetch.call_args.kwargs["max_seconds"])
+        self.assertEqual(3, fetch.call_args.kwargs["retries"])
+
     def test_prefetch_overlaps_fetches_and_preserves_receipt_order(self):
         barrier = threading.Barrier(2, timeout=3)
         fetched = []
