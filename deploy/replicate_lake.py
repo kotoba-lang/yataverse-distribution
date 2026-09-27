@@ -508,6 +508,12 @@ def peer_first_block_fetcher(args, public_fetch):
             not resolve or not resolve.startswith(peer.hostname + ":{}:".format(peer_port))):
         raise ReplicationError("peer source must be an explicit HTTPS host and address")
 
+    def transfer_seconds(limit):
+        # A fixed 12 s is enough for small blocks but cuts off a valid 200 MiB
+        # block across the third site's WAN. Budget at 512 KiB/s, capped so a
+        # stalled gateway cannot hold a batch indefinitely.
+        return min(600, 12 + limit // (512 * 1024))
+
     def fetch(url, limit):
         if not url.startswith(args.block_url_base):
             raise ReplicationError("block source URL differs from configured base")
@@ -520,7 +526,8 @@ def peer_first_block_fetcher(args, public_fetch):
         deadline = time.monotonic() + getattr(args, "peer_wait_seconds", 0)
         while True:
             try:
-                return curl(peer_base + cid, limit, resolve=resolve, max_seconds=12, retries=3)
+                return curl(peer_base + cid, limit, resolve=resolve,
+                            max_seconds=transfer_seconds(limit), retries=3)
             except ReplicationError as exc:
                 if not getattr(args, "peer_only", False):
                     return public_fetch(url, limit)
