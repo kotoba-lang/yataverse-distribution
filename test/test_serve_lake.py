@@ -163,6 +163,58 @@ class ServingTests(unittest.TestCase):
                 server.server_close()
                 worker.join(timeout=2)
 
+    def test_reader_refuses_excess_concurrent_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inventory = self.inventory(directory)
+            entered = threading.Event()
+            release = threading.Event()
+            first = {}
+
+            def read(_cid):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test reader did not unblock")
+                return b"abc"
+
+            with self.assertRaisesRegex(serve.InventoryError, "concurrent request limit"):
+                serve.handler_for(inventory, SimpleNamespace(read=read), 0)
+            server = ThreadingHTTPServer(("127.0.0.1", 0),
+                                         serve.handler_for(inventory, SimpleNamespace(read=read), 1))
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+
+            def first_request():
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    conn.request("GET", "/ipfs/" + CID_A)
+                    response = conn.getresponse()
+                    first["status"] = response.status
+                    first["body"] = response.read()
+                finally:
+                    conn.close()
+
+            reader = threading.Thread(target=first_request, daemon=True)
+            reader.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    conn.request("GET", "/health")
+                    response = conn.getresponse()
+                    response.read()
+                    self.assertEqual(503, response.status)
+                    self.assertIn("reader busy", response.reason)
+                finally:
+                    conn.close()
+                release.set()
+                reader.join(timeout=5)
+                self.assertEqual({"status": 200, "body": b"abc"}, first)
+            finally:
+                release.set()
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()

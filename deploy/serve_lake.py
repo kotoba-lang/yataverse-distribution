@@ -114,11 +114,17 @@ class LocalBlocks:
         return block.stdout
 
 
-def handler_for(inventory, blocks):
+def handler_for(inventory, blocks, max_concurrent_requests=8):
+    if not 1 <= max_concurrent_requests <= 64:
+        raise InventoryError("concurrent request limit must be within 1..64")
+    request_slots = threading.BoundedSemaphore(max_concurrent_requests)
     large_block_slot = threading.BoundedSemaphore(1)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            if not request_slots.acquire(blocking=False):
+                self.send_error(503, "reader busy")
+                return
             parsed = urlsplit(self.path)
             large_block_acquired = False
             try:
@@ -162,6 +168,7 @@ def handler_for(inventory, blocks):
             finally:
                 if large_block_acquired:
                     large_block_slot.release()
+                request_slots.release()
 
     return Handler
 
@@ -175,6 +182,7 @@ def main():
     parser.add_argument("--ipfs-path", required=True)
     parser.add_argument("--raw-block-store", type=Path)
     parser.add_argument("--max-block-bytes", type=int, default=LARGE_BLOCK_THRESHOLD)
+    parser.add_argument("--max-concurrent-requests", type=int, default=8)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
     args = parser.parse_args()
@@ -182,7 +190,8 @@ def main():
     raw_store = RawBlockStore(args.raw_block_store) if args.raw_block_store else None
     blocks = LocalBlocks(args.ipfs_bin, args.ipfs_path, inventory,
                          args.max_block_bytes, raw_store=raw_store)
-    ThreadingHTTPServer((args.host, args.port), handler_for(inventory, blocks)).serve_forever()
+    ThreadingHTTPServer((args.host, args.port),
+                        handler_for(inventory, blocks, args.max_concurrent_requests)).serve_forever()
 
 
 if __name__ == "__main__":
