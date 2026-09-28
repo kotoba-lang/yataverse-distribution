@@ -21,13 +21,15 @@ CID_B = "QmNLhRArQBktFvoG2vgmoM3oMZC8vgWGhk9sM4Q4KkGUxh"
 
 
 class ImportLakeCarTests(unittest.TestCase):
-    def test_pin_listing_requires_every_exact_inventory_cid(self):
-        module.verified_pins(CID_A + " indirect through " + CID_B + "\n" +
-                             CID_B + " direct\n", [CID_A, CID_B])
-        for output in (CID_A + " indirect\n", CID_A + " direct\n",
-                       CID_A + " direct\n" + CID_A + " direct\n"):
-            with self.subTest(output=output), self.assertRaises(module.ImportError):
-                module.verified_pins(output, [CID_A, CID_B])
+    def test_root_must_preserve_every_exact_inventory_link(self):
+        record = {"schema": 1, "inventory-sha256": "a" * 64,
+                  "start-row": 0, "end-row": 2,
+                  "links": [{"/": CID_A}, {"/": CID_B}]}
+        module.verified_root(json.dumps(record), record)
+        for changed in ({**record, "links": [{"/": CID_A}]},
+                        {**record, "inventory-sha256": "b" * 64}):
+            with self.subTest(changed=changed), self.assertRaises(module.ImportError):
+                module.verified_root(json.dumps(changed), record)
 
     def test_car_digest_mismatch_refuses_before_kubo(self):
         with tempfile.TemporaryDirectory() as directory:

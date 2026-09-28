@@ -167,7 +167,9 @@ def handler_for(inventory, blocks, max_concurrent_requests=8):
                 self.send_header("Cache-Control", "public, max-age=60")
                 self.end_headers()
                 self.wfile.write(payload)
-            except (InventoryError, subprocess.TimeoutExpired) as exc:
+            except subprocess.TimeoutExpired:
+                self.send_error(503, "local IPFS temporarily busy")
+            except InventoryError as exc:
                 self.send_error(404, str(exc))
             finally:
                 if large_block_acquired:
