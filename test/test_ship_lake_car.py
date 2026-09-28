@@ -4,6 +4,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 source = Path(__file__).resolve().parents[1] / "deploy" / "ship_lake_car.py"
@@ -65,6 +67,32 @@ class ShipLakeCarTests(unittest.TestCase):
     def test_missing_remote_receipt_refuses_without_checkpoint(self):
         with self.assertRaisesRegex(ship.ShipError, "returned no receipt"):
             ship.last_receipt("", "Jacob importer")
+
+    def test_oversized_skip_requires_matching_jacob_archive(self):
+        skipped = {"row": 1, "cid": CID_B, "bytes": ship.MAX_CAR_BLOCK + 1,
+                   "reason": "oversized-for-car"}
+        args = SimpleNamespace(remote_large_archive="/recovery", ssh_host="jacob",
+                               sha256="a" * 64)
+        receipt = {"schema": 1, "row": 1, "inventory_sha256": args.sha256,
+                   "original_cid": CID_B, "original_bytes": skipped["bytes"],
+                   "validation": "fresh-offline-kubo-import-cat-and-original-cid-rehydration",
+                   "car_sha256": "b" * 64, "car_bytes": 8100000}
+        with patch.object(ship, "run", return_value=json.dumps(
+                {"receipt": receipt, "car_bytes_on_disk": 8100000})) as remote:
+            ship.verify_remote_large_archive(args, skipped)
+        self.assertIn("row-1-recovery.car", remote.call_args.args[0][-1])
+        with patch.object(ship, "run", return_value=json.dumps(
+                {"receipt": receipt, "car_bytes_on_disk": 8100001})):
+            with self.assertRaisesRegex(ship.ShipError, "receipt differs"):
+                ship.verify_remote_large_archive(args, skipped)
+        with patch.object(ship, "run", return_value=json.dumps(
+                {"receipt": {**receipt, "original_cid": CID_A},
+                 "car_bytes_on_disk": 8100000})):
+            with self.assertRaisesRegex(ship.ShipError, "receipt differs"):
+                ship.verify_remote_large_archive(args, skipped)
+        args.remote_large_archive = None
+        with self.assertRaisesRegex(ship.ShipError, "no Jacob recovery archive"):
+            ship.verify_remote_large_archive(args, skipped)
 
 
 if __name__ == "__main__":
