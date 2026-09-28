@@ -17,7 +17,7 @@
   (let [m (apply hash-map args)
         required ["--inventory" "--inventory-sha256" "--inventory-count"
                   "--start-row" "--max-blocks" "--max-bytes" "--base-url" "--output"]]
-    (when (or (not= (set required) (set (keys m)))
+    (when (or (not= (set required) (disj (set (keys m)) "--resolve"))
               (some #(not (string? (get m %))) required))
       (refuse "arguments" {:required required}))
     (doseq [k ["--inventory-count" "--start-row" "--max-blocks" "--max-bytes"]]
@@ -35,6 +35,17 @@
         (refuse "bounds" {}))
       (when-not (re-matches #"https://[A-Za-z0-9.-]+(?::[0-9]+)?/ipfs/" base)
         (refuse "block-source-must-be-https-ipfs" {}))
+      (when-let [resolve (get m "--resolve")]
+        (let [match (re-matches #"([A-Za-z0-9.-]+):([0-9]{1,5}):([0-9.]+)" resolve)
+              url (js/URL. base)
+              octets (when match (.split (nth match 3) "."))]
+          (when-not (and match
+                         (= (nth match 1) (.-hostname url))
+                         (= (nth match 2) (or (not-empty (.-port url)) "443"))
+                         (= 4 (count octets))
+                         (every? #(and (re-matches #"(?:0|[1-9][0-9]{0,2})" %)
+                                       (<= (js/Number %) 255)) octets))
+            (refuse "resolve-must-match-https-origin-and-ipv4" {}))))
       m)))
 
 (defn cidv1 [cid]
@@ -69,12 +80,13 @@
                 {:source-cid cid :cid (cidv1 cid) :size size}))
             (subvec lines start (min (count lines) (+ start max-blocks)))))))
 
-(defn fetch-block [base {:keys [source-cid cid size]}]
+(defn fetch-block [base resolve {:keys [source-cid cid size]}]
   (let [bytes (.execFileSync cp "curl"
-                             (clj->js ["-fsS" "--proto" "=https" "--max-redirs" "0"
-                                       "--connect-timeout" "5" "--max-time" "300"
-                                       "--max-filesize" (str size)
-                                       (str base source-cid)])
+                             (clj->js (concat ["-fsS" "--proto" "=https" "--max-redirs" "0"
+                                               "--connect-timeout" "5" "--max-time" "300"
+                                               "--max-filesize" (str size)]
+                                              (when resolve ["--noproxy" "*" "--resolve" resolve])
+                                              [(str base source-cid)]))
                              #js {:maxBuffer 256000001 :timeout 305000})]
     (when-not (= size (.-length bytes))
       (refuse "block-size" {:cid source-cid :expected size :actual (.-length bytes)}))
@@ -97,7 +109,7 @@
       (try
         (let [result (car/stream-encode!
                       {:roots roots
-                       :blocks (map #(fetch-block (get m "--base-url") %) selected)
+                       :blocks (map #(fetch-block (get m "--base-url") (get m "--resolve") %) selected)
                        :max-bytes max-bytes
                        :write! (fn [part]
                                  (let [bytes (b/as-bytes part)

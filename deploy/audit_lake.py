@@ -27,7 +27,7 @@ def durable_pins(ipfs_bin):
     if not Path(ipfs_bin).is_file():
         raise AuditError("Kubo binary does not exist")
     pins = set()
-    for pin_type in ("direct", "recursive"):
+    for pin_type in ("direct", "recursive", "indirect"):
         try:
             result = subprocess.run(
                 [ipfs_bin, "pin", "ls", "--type=" + pin_type],

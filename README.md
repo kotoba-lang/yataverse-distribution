@@ -300,9 +300,42 @@ kbb --backend sci --classpath "$(kbb -Spath)" deploy/export_lake_car.cljk \
   --inventory /path/to/inventory-20260926.jsonl \
   --inventory-sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
   --inventory-count 821533 --start-row 0 --max-blocks 3 --max-bytes 2000000 \
-  --base-url https://yataverse-data.220-146-170-114.sslip.io:8443/ipfs/ \
+  --base-url https://yataverse-data.220-146-170-114.sslip.io/ipfs/ \
+  --resolve yataverse-data.220-146-170-114.sslip.io:443:100.87.226.80 \
   --output /path/to/first-3.car
 ```
+
+`--resolve` pins the HTTPS hostname to Xavier's private node address for this
+transfer, bypassing public DNS and proxies while retaining TLS hostname checks.
+Replace the address if Xavier's private endpoint changes.
+
+On a destination node, copy the CAR and its export receipt, then import using
+the receipt's exact SHA-256. `import_lake_car.py` checks the dated inventory,
+CAR digest, repository identity and disk reserve. It imports blocks without
+pinning the CAR header's normalized CIDv1 roots, then pins one DAG-CBOR root
+whose links use the original inventory CIDs. It confirms all selected CIDs are
+durably pinned before writing a receipt. The read API, audit and replicator
+recognize Kubo's `indirect through <root>` pin type. Keep the CAR until the
+import receipt and API readback are confirmed; a failed import may leave
+unpinned blocks that Kubo can garbage collect.
+
+```bash
+python3 deploy/import_lake_car.py \
+  --inventory /path/to/inventory-20260926.jsonl \
+  --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
+  --count 821533 --start-row 0 --max-blocks 3 \
+  --car /path/to/first-3.car --car-sha256 4e86a913a863b47f9067b52f9a3080d75345beb2e78d67fe07b19fd33e22c9ea \
+  --ipfs-bin /path/to/ipfs --ipfs-path /path/to/dedicated/repo \
+  --receipt /path/to/first-3-import.json
+```
+
+On Jacob's dedicated 18 TiB HDD repo on 2026-09-28, a 10-block CAR imported
+without per-root pinning in 1.1 seconds. A single 10-link root pinned in 2.1
+seconds; the original CIDv0 was reported by Kubo as indirectly pinned and the
+local read API returned its 262,158 bytes. A 200-link root pinned in 3.4
+seconds. Per-root CAR import for the same 200 blocks took 910 seconds, so the
+single-root path is the measured basis for further bulk replication. This is
+only the tested range, not a full-lake or Filecoin custody claim.
 
 On 2026-09-26 the first three actual rows exported from Xavier :8443 and gad
 :8444 to byte-identical 786,733-byte CARs, SHA-256

@@ -129,10 +129,10 @@ class Kubo:
         return command([self.binary] + list(args), data=data)
 
     def preflight(self):
-        # Recursive roots are already durable pins. Kubo refuses a second,
-        # direct pin on the same CID, so include both kinds on every resume.
+        # Blocks reached through a recursive root are durable too. Include all
+        # three kinds so a CAR batch root is not copied a second time.
         self.pins = set()
-        for pin_type in ("direct", "recursive"):
+        for pin_type in ("direct", "recursive", "indirect"):
             pins = self.run("pin", "ls", "--type=" + pin_type).decode("utf-8")
             self.pins.update(line.split()[0] for line in pins.splitlines() if line.strip())
         if self.raw_store is not None:
@@ -172,7 +172,9 @@ class Kubo:
             result = self.run("pin", "ls", "--type=all", cid).decode("utf-8").strip()
         except ReplicationError:
             return None
-        match = re.fullmatch(re.escape(cid) + r"\s+(direct|recursive)", result)
+        match = re.fullmatch(re.escape(cid) +
+                             r"\s+(direct|recursive|indirect through (?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,200}))",
+                             result)
         return match.group(1) if match else None
 
     def put_verified(self, cid, data):
@@ -295,7 +297,8 @@ class KuboRPC(Kubo):
         pins = result.get("Keys")
         if isinstance(pins, dict) and isinstance(pins.get(cid), dict):
             kind = pins[cid].get("Type")
-            if kind in ("direct", "recursive"):
+            if kind in ("direct", "recursive") or (isinstance(kind, str) and
+                    re.fullmatch(r"indirect through (?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,200})", kind)):
                 return kind
         return None
 

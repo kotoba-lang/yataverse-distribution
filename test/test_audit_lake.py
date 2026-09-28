@@ -62,6 +62,13 @@ class AuditTests(unittest.TestCase):
             with self.assertRaisesRegex(audit.AuditError, "daemon unavailable"):
                 audit.durable_pins("/bin/ipfs")
 
+    def test_indirect_batch_root_counts_as_durable(self):
+        outputs = [CID_A + " direct\n", CID_B + " recursive\n", CID_A + " indirect\n"]
+        with patch.object(audit.Path, "is_file", return_value=True), patch.object(
+                audit.subprocess, "run", side_effect=[SimpleNamespace(
+                    returncode=0, stderr=b"", stdout=entry.encode()) for entry in outputs]):
+            self.assertEqual({CID_A, CID_B}, audit.durable_pins("/bin/ipfs"))
+
     def test_cid_verified_raw_block_covers_only_its_inventory_row(self):
         data = b"\x0a\x03not-valid-dag-pb"
         cid = "b" + base64.b32encode(b"\x01\x70\x12\x20" + hashlib.sha256(data).digest()).decode().lower().rstrip("=")
