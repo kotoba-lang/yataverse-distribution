@@ -270,8 +270,8 @@ can be tested with a direct node connection. Public ingress and a live
 snapshot refresh still need separate qualification.
 
 `deploy/audit_lake.py` compares the dated inventory against Kubo's durable
-direct/recursive pins and, when `--raw-block-store` is supplied, checks the
-CID and bytes of each raw sidecar block. It refuses an absent or changed
+direct, recursive, and indirect pins. When `--raw-block-store` is supplied,
+it checks the CID and bytes of each raw sidecar block. It refuses an absent or changed
 inventory, a failed pin listing, corrupted sidecar bytes, and invalid or
 duplicate rows, then reports pinned, raw, and missing coverage separately.
 `--require-complete` exits 1 while any inventory CID is missing, 2 when the
@@ -285,6 +285,24 @@ python3 deploy/audit_lake.py \
   --inventory /path/to/inventory-20260926.jsonl \
   --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
   --count 821533 --ipfs-bin /path/to/ipfs --require-complete
+```
+
+For a CAR-fed node, supply both import receipt directories and `--ipfs-path`.
+This mode checks the current recursive roots, reads every receipted CAR root
+offline to compare its exact inventory links, checks direct pins and verified
+raw sidecars, and reports a lower bound on retained rows. It avoids Kubo's
+costly complete indirect-pin listing. `--require-complete` still fails while
+rows are missing. A complete receipt audit proves the linked roots and pin
+state at audit time; a separate leaf readback or `ipfs pin verify` is required
+to prove that every linked block remains readable.
+
+```
+python3 deploy/audit_lake.py \
+  --inventory /path/to/inventory-20260926.jsonl \
+  --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
+  --count 821533 --ipfs-bin /path/to/ipfs --ipfs-path /path/to/kubo-repo \
+  --car-receipts /path/to/lake-state --large-receipts /path/to/recovery \
+  --raw-block-store /path/to/raw-blocks --require-complete
 ```
 
 `deploy/export_lake_car.cljk` writes one bounded range of the dated inventory

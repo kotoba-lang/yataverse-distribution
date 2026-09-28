@@ -84,6 +84,42 @@ class AuditTests(unittest.TestCase):
             with self.assertRaisesRegex(audit.RawBlockStoreError, "data differs"):
                 audit.audit_inventory(path, digest, 1, set(), store)
 
+    def test_receipt_audit_requires_current_root_links_and_counts_direct_pins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            path, digest = self.inventory(directory, [
+                {"cid": CID_A, "bytes": 3}, {"cid": CID_B, "bytes": 5}])
+            inventory = audit.Inventory(path, digest, 2)
+            car_dir = home / "car"
+            large_dir = home / "large"
+            car_dir.mkdir()
+            large_dir.mkdir()
+            root = "bafyreibhgy7xyqmqkr5z3l5k2zjbi3gezjj4h5vu5td6wquntyg3mpsu7e"
+            receipt = {"status": "complete", "inventory_sha256": digest,
+                       "start_row": 0, "end_row": 1, "blocks": 1,
+                       "bytes": 3, "car_sha256": "a" * 64,
+                       "root": root, "repository": str(home.resolve())}
+            (car_dir / "row-0-0-import.json").write_text(json.dumps(receipt))
+            expected = {"schema": 1, "inventory-sha256": digest,
+                        "start-row": 0, "end-row": 1,
+                        "links": [{"/": CID_A}]}
+            report = audit.audit_receipts(inventory, car_dir, large_dir, home,
+                                          {root}, {CID_B}, None,
+                                          lambda _root: expected)
+            self.assertEqual(("complete", 2, 1, 1),
+                             (report["status"], report["covered_rows"],
+                              report["car_root_rows"], report["direct_pin_rows"]))
+            with self.assertRaisesRegex(audit.AuditError, "root differs"):
+                audit.audit_receipts(inventory, car_dir, large_dir, home,
+                                     {root}, {CID_B}, None,
+                                     lambda _root: {**expected, "links": []})
+            receipt["bytes"] = 4
+            (car_dir / "row-0-0-import.json").write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(audit.AuditError, "receipt differs"):
+                audit.audit_receipts(inventory, car_dir, large_dir, home,
+                                     {root}, {CID_B}, None,
+                                     lambda _root: expected)
+
     def test_require_complete_exit_distinguishes_partial_from_refusal(self):
         report = {"status": "partial"}
         with patch.object(audit, "durable_pins", return_value=set()), patch.object(
