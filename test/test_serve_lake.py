@@ -116,6 +116,29 @@ class ServingTests(unittest.TestCase):
                 server.server_close()
                 worker.join(timeout=2)
 
+    def test_ipfs_timeout_reports_busy_instead_of_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inventory = self.inventory(directory)
+
+            def read(_cid):
+                raise serve.subprocess.TimeoutExpired("ipfs pin ls", 15)
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0),
+                                         serve.handler_for(inventory, SimpleNamespace(read=read)))
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+                connection.request("GET", "/ipfs/" + CID_A)
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(503, response.status)
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=2)
+
     def test_second_large_read_is_refused_while_first_is_active(self):
         with tempfile.TemporaryDirectory() as directory:
             inventory = self.inventory(directory)

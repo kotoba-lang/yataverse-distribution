@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import uuid
@@ -57,7 +58,18 @@ def run(argv, *, cwd=None, timeout=900):
     return result.stdout
 
 
-def selected_rows(path, expected_sha, expected_count, start, max_blocks, max_bytes):
+def last_receipt(output, source):
+    lines = [line for line in output.splitlines() if line.strip()]
+    if not lines:
+        raise ShipError(source + " returned no receipt")
+    try:
+        return json.loads(lines[-1])
+    except ValueError as exc:
+        raise ShipError(source + " returned invalid receipt") from exc
+
+
+def selected_rows(path, expected_sha, expected_count, start, max_blocks, max_bytes,
+                  raw_cids=None):
     digest = hashlib.sha256()
     rows = []
     count = 0
@@ -73,7 +85,9 @@ def selected_rows(path, expected_sha, expected_count, start, max_blocks, max_byt
                     raise ShipError("invalid inventory row") from exc
                 if not isinstance(cid, str) or not CID.fullmatch(cid) or type(size) is not int or size < 1:
                     raise ShipError("invalid inventory CID or size")
-                if size > MAX_CAR_BLOCK or total + size + 1024 * (len(rows) + 1) > max_bytes:
+                if cid in (raw_cids or set()):
+                    pass
+                elif size > MAX_CAR_BLOCK or total + size + 1024 * (len(rows) + 1) > max_bytes:
                     # A contiguous CAR ends before the first oversized row.
                     pass
                 elif len(rows) == count - start:
@@ -90,6 +104,9 @@ def selected_rows(path, expected_sha, expected_count, start, max_blocks, max_byt
         for index, line in enumerate(source):
             if index == start:
                 row = json.loads(line)
+                if row["cid"] in (raw_cids or set()):
+                    return [], {"row": start, "cid": row["cid"],
+                                "bytes": row["bytes"], "reason": "verified-raw-block-store"}
                 if row["bytes"] > MAX_CAR_BLOCK:
                     return [], {"row": start, "cid": row["cid"],
                                 "bytes": row["bytes"], "reason": "oversized-for-car"}
@@ -102,6 +119,17 @@ def ship_once(args):
         raise ShipError("invalid inventory identity or start")
     if not 1 <= args.max_blocks <= 200 or not 1 <= args.max_bytes <= 536_870_912:
         raise ShipError("invalid CAR bounds")
+    raw_cids = set()
+    if args.raw_cids_file:
+        record = json.loads(args.raw_cids_file.read_text())
+        cids = record.get("cids")
+        if (record.get("inventory_sha256") != args.sha256 or
+                not isinstance(cids, list) or
+                not all(isinstance(cid, str) and CID.fullmatch(cid) for cid in cids) or
+                len(cids) != len(set(cids)) or
+                not args.remote_raw_block_store):
+            raise ShipError("raw CID manifest or Jacob store argument differs")
+        raw_cids = set(cids)
     args.state_dir.mkdir(parents=True, exist_ok=True)
     with (args.state_dir / "ship.lock").open("a+") as lock:
         try:
@@ -117,8 +145,19 @@ def ship_once(args):
         if start >= args.count:
             return {"status": "complete", "cursor": start}
         rows, skipped = selected_rows(args.inventory, args.sha256, args.count,
-                                      start, args.max_blocks, args.max_bytes)
+                                      start, args.max_blocks, args.max_bytes,
+                                      raw_cids)
         if skipped:
+            if skipped["reason"] == "verified-raw-block-store":
+                code = ("import sys; from raw_block_store import RawBlockStore; "
+                        "data=RawBlockStore(sys.argv[1]).read(sys.argv[2],"
+                        "max_bytes=int(sys.argv[3])); "
+                        "assert data is not None and len(data)==int(sys.argv[3])")
+                verify = ["env", "PYTHONPATH=" + str(Path(args.remote_importer).parent),
+                          "python3", "-c", code, args.remote_raw_block_store,
+                          skipped["cid"], str(skipped["bytes"])]
+                run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                     args.ssh_host, shlex.join(verify)], timeout=60)
             skip = args.state_dir / ("skipped-" + str(start) + ".json")
             if skip.exists():
                 if json.loads(skip.read_text()) != skipped:
@@ -132,23 +171,41 @@ def ship_once(args):
         name = "row-{}-{}".format(start, end - 1)
         car = args.state_dir / (name + ".car")
         export_receipt = args.state_dir / (name + "-export.json")
+        if args.source_ssh_host:
+            source_car = args.source_output_dir.rstrip("/") + "/" + name + ".car"
+            source_receipt = source_car + ".json"
         if export_receipt.exists():
             exported = json.loads(export_receipt.read_text())
             if (not car.is_file() or exported.get("sha256") != sha_file(car) or
                     exported.get("start-row") != start or exported.get("end-row") != end):
                 raise ShipError("saved CAR differs from export receipt")
         else:
-            classpath = run([str(args.kbb), "-Spath"], cwd=args.source, timeout=120).strip()
-            command = [str(args.kbb), "--backend", "sci", "--classpath", classpath,
-                       "deploy/export_lake_car.cljk", "--inventory", str(args.inventory),
-                       "--inventory-sha256", args.sha256, "--inventory-count", str(args.count),
-                       "--start-row", str(start), "--max-blocks", str(len(rows)),
-                       "--max-bytes", str(args.max_bytes), "--base-url", args.base_url]
-            if args.resolve:
-                command += ["--resolve", args.resolve]
-            command += ["--output", str(car)]
-            output = run(command, cwd=args.source, timeout=1800)
-            exported = json.loads(output.splitlines()[-1])
+            if args.source_ssh_host:
+                command = ["python3", args.source_exporter,
+                           "--inventory", args.source_inventory,
+                           "--sha256", args.sha256, "--count", str(args.count),
+                           "--start-row", str(start), "--max-blocks", str(len(rows)),
+                           "--max-bytes", str(args.max_bytes),
+                           "--ipfs-bin", args.source_ipfs_bin,
+                           "--ipfs-path", args.source_ipfs_path,
+                           "--output", source_car, "--receipt", source_receipt]
+                ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+                output = run(["ssh", *ssh_opts, args.source_ssh_host,
+                              shlex.join(command)], timeout=1800)
+                run(["scp", *ssh_opts, args.source_ssh_host + ":" + source_car,
+                     str(car)], timeout=900)
+            else:
+                classpath = run([str(args.kbb), "-Spath"], cwd=args.source, timeout=120).strip()
+                command = [str(args.kbb), "--backend", "sci", "--classpath", classpath,
+                           "deploy/export_lake_car.cljk", "--inventory", str(args.inventory),
+                           "--inventory-sha256", args.sha256, "--inventory-count", str(args.count),
+                           "--start-row", str(start), "--max-blocks", str(len(rows)),
+                           "--max-bytes", str(args.max_bytes), "--base-url", args.base_url]
+                if args.resolve:
+                    command += ["--resolve", args.resolve]
+                command += ["--output", str(car)]
+                output = run(command, cwd=args.source, timeout=1800)
+            exported = last_receipt(output, "CAR exporter")
             if (exported.get("status") != "complete" or
                     exported.get("start-row") != start or exported.get("end-row") != end or
                     exported.get("blocks") != len(rows) or
@@ -168,9 +225,9 @@ def ship_once(args):
                           "--ipfs-path", args.remote_ipfs_path,
                           "--receipt", remote_receipt]
         # OpenSSH joins remote arguments into a shell command; quote each one.
-        import shlex
-        imported = json.loads(run(["ssh", *ssh_opts, args.ssh_host,
-                                   shlex.join(import_command)], timeout=1200).splitlines()[-1])
+        imported = last_receipt(run(["ssh", *ssh_opts, args.ssh_host,
+                                     shlex.join(import_command)], timeout=1200),
+                                "Jacob importer")
         if (imported.get("status") != "complete" or
                 imported.get("start_row") != start or imported.get("end_row") != end or
                 imported.get("car_sha256") != exported["sha256"] or
@@ -180,22 +237,32 @@ def ship_once(args):
                                  "last_root": imported["root"],
                                  "last_car_sha256": exported["sha256"]})
         car.unlink()
+        if args.source_ssh_host:
+            run(["ssh", *ssh_opts, args.source_ssh_host,
+                 shlex.join(["rm", "-f", "--", source_car, source_receipt])], timeout=120)
         return {"status": "shipped", "start_row": start, "end_row": end,
                 "blocks": len(rows), "root": imported["root"]}
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", required=True, type=Path)
-    parser.add_argument("--kbb", required=True, type=Path)
+    parser.add_argument("--source", type=Path)
+    parser.add_argument("--kbb", type=Path)
     parser.add_argument("--inventory", required=True, type=Path)
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--count", required=True, type=int)
     parser.add_argument("--start-row", required=True, type=int)
     parser.add_argument("--max-blocks", type=int, default=200)
     parser.add_argument("--max-bytes", type=int, default=100_000_000)
-    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--base-url")
     parser.add_argument("--resolve")
+    parser.add_argument("--source-ssh-host")
+    parser.add_argument("--source-exporter")
+    parser.add_argument("--source-inventory")
+    parser.add_argument("--source-ipfs-bin")
+    parser.add_argument("--source-ipfs-path")
+    parser.add_argument("--source-output-dir")
+    parser.add_argument("--raw-cids-file", type=Path)
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--ssh-host", required=True)
     parser.add_argument("--remote-dir", required=True)
@@ -203,8 +270,16 @@ def main():
     parser.add_argument("--remote-inventory", required=True)
     parser.add_argument("--remote-ipfs-bin", required=True)
     parser.add_argument("--remote-ipfs-path", required=True)
+    parser.add_argument("--remote-raw-block-store")
     args = parser.parse_args()
     try:
+        source_args = (args.source_exporter, args.source_inventory, args.source_ipfs_bin,
+                       args.source_ipfs_path, args.source_output_dir)
+        if args.source_ssh_host:
+            if not all(source_args) or args.base_url or args.resolve:
+                raise ShipError("remote Kubo source arguments are incomplete or mixed with HTTPS")
+        elif not args.source or not args.kbb or not args.base_url or any(source_args):
+            raise ShipError("HTTPS source arguments are incomplete or mixed with remote Kubo")
         print(json.dumps(ship_once(args), sort_keys=True))
         return 0
     except (ShipError, OSError, ValueError, KeyError, IndexError) as exc:

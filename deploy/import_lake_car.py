@@ -42,21 +42,13 @@ def kubo(binary, env, *args, data=None, timeout=300):
     return result.stdout.decode("utf-8", "replace")
 
 
-def verified_pins(output, cids):
-    expected = set(cids)
-    found = set()
-    for line in output.splitlines():
-        parts = line.split()
-        if (len(parts) == 2 and parts[1] in ("direct", "recursive") or
-                len(parts) == 4 and parts[1:3] == ["indirect", "through"] and
-                CID.fullmatch(parts[3])):
-            if parts[0] not in expected or parts[0] in found:
-                raise ImportError("Kubo returned an unexpected or duplicate pin")
-            found.add(parts[0])
-        else:
-            raise ImportError("Kubo returned an invalid pin listing")
-    if found != expected:
-        raise ImportError("Kubo did not confirm every inventory CID")
+def verified_root(output, expected):
+    try:
+        actual = json.loads(output)
+    except ValueError as exc:
+        raise ImportError("Kubo returned invalid batch root JSON") from exc
+    if actual != expected:
+        raise ImportError("Kubo batch root differs from inventory links")
 
 
 def import_batch(args):
@@ -90,10 +82,11 @@ def import_batch(args):
     kubo(str(args.ipfs_bin), env, "dag", "import", "--allow-big-block",
          "--pin-roots=false", "--fast-provide-root=false",
          "--fast-provide-dag=false", str(args.car), timeout=600)
-    root_data = json.dumps({"schema": 1, "inventory-sha256": args.sha256,
-                            "start-row": args.start_row,
-                            "end-row": args.start_row + len(cids),
-                            "links": [{"/": cid} for cid in cids]},
+    root_record = {"schema": 1, "inventory-sha256": args.sha256,
+                   "start-row": args.start_row,
+                   "end-row": args.start_row + len(cids),
+                   "links": [{"/": cid} for cid in cids]}
+    root_data = json.dumps(root_record,
                            separators=(",", ":")).encode()
     root = kubo(str(args.ipfs_bin), env, "dag", "put", "--pin",
                 data=root_data, timeout=600).strip()
@@ -102,8 +95,8 @@ def import_batch(args):
     if kubo(str(args.ipfs_bin), env, "pin", "ls", "--type=recursive", root,
             timeout=60).strip() != root + " recursive":
         raise ImportError("batch root is not recursively pinned")
-    verified_pins(kubo(str(args.ipfs_bin), env, "pin", "ls", "--type=all",
-                       *cids, timeout=300), cids)
+    verified_root(kubo(str(args.ipfs_bin), env, "dag", "get", root, timeout=60),
+                  root_record)
     result = {"status": "complete", "inventory_sha256": args.sha256,
               "start_row": args.start_row, "end_row": args.start_row + len(cids),
               "blocks": len(cids), "bytes": sum(row["size"] for row in rows),
