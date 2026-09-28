@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Read-only Yataverse lake listing and pinned raw blocks from one local node."""
+"""Read-only Yataverse lake listing and CID-checked local blocks."""
 
 import argparse
+import bisect
 import hashlib
 import json
 import re
@@ -10,7 +11,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
-from raw_block_store import RawBlockStore, RawBlockStoreError
+from raw_block_store import RawBlockStore, RawBlockStoreError, verify_cid
 
 
 CID = re.compile(r"^[a-zA-Z0-9]{46,100}$")
@@ -28,6 +29,7 @@ class Inventory:
         self.path = Path(path)
         self.offsets = []
         self.sizes = {}
+        self.positions = {}
         digest = hashlib.sha256()
         total = 0
         with self.path.open("rb") as source:
@@ -46,6 +48,7 @@ class Inventory:
                     raise InventoryError("invalid CID or size at offset {}".format(offset))
                 if cid in self.sizes:
                     raise InventoryError("duplicate CID in inventory: " + cid)
+                self.positions[cid] = len(self.offsets)
                 self.offsets.append(offset)
                 self.sizes[cid] = size
                 total += size
@@ -75,8 +78,72 @@ class Inventory:
                 "truncated?": end < len(self.offsets)}
 
 
+class CarReceipts:
+    """Exact inventory ranges proven by completed CAR import receipts."""
+
+    def __init__(self, directory, inventory, ipfs_path):
+        self.directory = Path(directory)
+        self.inventory = inventory
+        self.ipfs_path = Path(ipfs_path).resolve()
+        self.lock = threading.RLock()
+        self.mtime_ns = None
+        self.starts = []
+        self.ranges = []
+        self.refresh()
+
+    def refresh(self):
+        if not self.directory.is_dir():
+            raise InventoryError("CAR receipt directory is absent")
+        mtime = self.directory.stat().st_mtime_ns
+        if mtime == self.mtime_ns:
+            return
+        ranges = []
+        for path in self.directory.glob("row-*-import.json"):
+            match = re.fullmatch(r"row-([0-9]+)-([0-9]+)-import\.json", path.name)
+            if not match:
+                raise InventoryError("invalid CAR receipt name")
+            try:
+                record = json.loads(path.read_text())
+            except (OSError, ValueError) as exc:
+                raise InventoryError("CAR receipt unreadable") from exc
+            if not isinstance(record, dict):
+                raise InventoryError("CAR receipt must be an object")
+            start, last = map(int, match.groups())
+            end = last + 1
+            root = record.get("root")
+            if (record.get("status") != "complete" or
+                    record.get("inventory_sha256") != self.inventory.sha256 or
+                    record.get("start_row") != start or record.get("end_row") != end or
+                    record.get("blocks") != end - start or
+                    not 0 <= start < end <= len(self.inventory.offsets) or
+                    not isinstance(root, str) or not CID.fullmatch(root) or
+                    not isinstance(record.get("car_sha256"), str) or
+                    not re.fullmatch(r"[0-9a-f]{64}", record["car_sha256"]) or
+                    record.get("repository") != str(self.ipfs_path)):
+                raise InventoryError("CAR receipt differs from inventory or repository")
+            ranges.append((start, end))
+        ranges.sort()
+        covered = []
+        for start, end in ranges:
+            if covered and start <= covered[-1][1]:
+                covered[-1] = (covered[-1][0], max(covered[-1][1], end))
+            else:
+                covered.append((start, end))
+        self.starts = [item[0] for item in covered]
+        self.ranges = covered
+        self.mtime_ns = mtime
+
+    def covers(self, cid):
+        with self.lock:
+            self.refresh()
+            row = self.inventory.positions[cid]
+            index = bisect.bisect_right(self.starts, row) - 1
+            return index >= 0 and row < self.ranges[index][1]
+
+
 class LocalBlocks:
-    def __init__(self, ipfs_bin, ipfs_path, inventory, max_block_bytes, raw_store=None):
+    def __init__(self, ipfs_bin, ipfs_path, inventory, max_block_bytes,
+                 raw_store=None, car_receipts=None):
         if not 1 <= max_block_bytes <= MAX_BLOCK_BYTES:
             raise InventoryError("block byte limit must be within 1..256000000")
         self.ipfs_bin = ipfs_bin
@@ -84,6 +151,7 @@ class LocalBlocks:
         self.inventory = inventory
         self.max_block_bytes = max_block_bytes
         self.raw_store = raw_store
+        self.car_receipts = car_receipts
 
     def read(self, cid):
         size = self.inventory.sizes.get(cid)
@@ -102,19 +170,24 @@ class LocalBlocks:
                 return data
         import os
         env = dict(os.environ, IPFS_PATH=self.ipfs_path)
-        pin = subprocess.run([self.ipfs_bin, "pin", "ls", "--type=all", cid],
-                             capture_output=True, env=env, timeout=15)
-        pin_line = pin.stdout.decode("utf-8", "replace").strip()
-        durable = (pin_line in (cid + " direct", cid + " recursive") or
-                   bool(re.fullmatch(re.escape(cid) +
-                                     r" indirect through (?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,200})",
-                                     pin_line)))
-        if pin.returncode or not durable:
-            raise InventoryError("block is not durably pinned")
+        if self.car_receipts is None or not self.car_receipts.covers(cid):
+            pin = subprocess.run([self.ipfs_bin, "pin", "ls", "--type=all", cid],
+                                 capture_output=True, env=env, timeout=15)
+            pin_line = pin.stdout.decode("utf-8", "replace").strip()
+            durable = (pin_line in (cid + " direct", cid + " recursive") or
+                       bool(re.fullmatch(re.escape(cid) +
+                                         r" indirect through (?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,200})",
+                                         pin_line)))
+            if pin.returncode or not durable:
+                raise InventoryError("block is not durably pinned or receipted")
         block = subprocess.run([self.ipfs_bin, "--offline", "block", "get", cid],
                                capture_output=True, env=env, timeout=30)
         if block.returncode or len(block.stdout) != size:
             raise InventoryError("local block unavailable or size differs")
+        try:
+            verify_cid(cid, block.stdout)
+        except RawBlockStoreError as exc:
+            raise InventoryError("local block CID differs from bytes") from exc
         return block.stdout
 
 
@@ -187,6 +260,7 @@ def main():
     parser.add_argument("--ipfs-bin", required=True)
     parser.add_argument("--ipfs-path", required=True)
     parser.add_argument("--raw-block-store", type=Path)
+    parser.add_argument("--car-receipts", type=Path)
     parser.add_argument("--max-block-bytes", type=int, default=LARGE_BLOCK_THRESHOLD)
     parser.add_argument("--max-concurrent-requests", type=int, default=8)
     parser.add_argument("--host", default="127.0.0.1")
@@ -194,8 +268,11 @@ def main():
     args = parser.parse_args()
     inventory = Inventory(args.inventory, args.sha256, args.count)
     raw_store = RawBlockStore(args.raw_block_store) if args.raw_block_store else None
+    car_receipts = (CarReceipts(args.car_receipts, inventory, args.ipfs_path)
+                    if args.car_receipts else None)
     blocks = LocalBlocks(args.ipfs_bin, args.ipfs_path, inventory,
-                         args.max_block_bytes, raw_store=raw_store)
+                         args.max_block_bytes, raw_store=raw_store,
+                         car_receipts=car_receipts)
     ThreadingHTTPServer((args.host, args.port),
                         handler_for(inventory, blocks, args.max_concurrent_requests)).serve_forever()
 

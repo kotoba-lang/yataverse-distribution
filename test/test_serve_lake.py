@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import http.client
 import importlib.util
@@ -73,11 +74,13 @@ class ServingTests(unittest.TestCase):
             blocks = serve.LocalBlocks(shutil.which("true"), directory, inventory, 8)
             direct = SimpleNamespace(returncode=0, stdout=(CID_A + " direct\n").encode())
             body = SimpleNamespace(returncode=0, stdout=b"abc")
-            with patch.object(serve.subprocess, "run", side_effect=[direct, body]) as invoke:
+            with patch.object(serve.subprocess, "run", side_effect=[direct, body]) as invoke, \
+                    patch.object(serve, "verify_cid"):
                 self.assertEqual(b"abc", blocks.read(CID_A))
             self.assertIn("--offline", invoke.call_args_list[1].args[0])
             indirect = SimpleNamespace(returncode=0, stdout=(CID_A + " indirect through " + CID_B + "\n").encode())
-            with patch.object(serve.subprocess, "run", side_effect=[indirect, body]):
+            with patch.object(serve.subprocess, "run", side_effect=[indirect, body]), \
+                    patch.object(serve, "verify_cid"):
                 self.assertEqual(b"abc", blocks.read(CID_A))
             malformed = SimpleNamespace(returncode=0, stdout=(CID_A + " indirect\n").encode())
             with patch.object(serve.subprocess, "run", return_value=malformed):
@@ -86,6 +89,39 @@ class ServingTests(unittest.TestCase):
             with patch.object(serve.subprocess, "run", side_effect=[direct, SimpleNamespace(returncode=0, stdout=b"ab")]):
                 with self.assertRaisesRegex(serve.InventoryError, "size differs"):
                     blocks.read(CID_A)
+
+    def test_completed_car_receipt_serves_cid_checked_bytes_without_live_pin_query(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = b"abc"
+            cid = "b" + base64.b32encode(b"\x01\x55\x12\x20" +
+                                           hashlib.sha256(data).digest()).decode().lower().rstrip("=")
+            inventory_path = root / "inventory.jsonl"
+            payload = (json.dumps({"cid": cid, "bytes": len(data)}) + "\n").encode()
+            inventory_path.write_bytes(payload)
+            inventory = serve.Inventory(inventory_path, hashlib.sha256(payload).hexdigest(), 1)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            record = {"status": "complete", "inventory_sha256": inventory.sha256,
+                      "start_row": 0, "end_row": 1, "blocks": 1,
+                      "root": CID_A, "car_sha256": "a" * 64,
+                      "repository": str(root.resolve())}
+            receipt = receipts / "row-0-0-import.json"
+            receipt.write_text(json.dumps(record))
+            blocks = serve.LocalBlocks("/fake/ipfs", str(root), inventory, 100,
+                                       car_receipts=serve.CarReceipts(receipts, inventory, root))
+            with patch.object(serve.subprocess, "run",
+                              return_value=SimpleNamespace(returncode=0, stdout=data)) as invoke:
+                self.assertEqual(data, blocks.read(cid))
+            self.assertEqual(1, invoke.call_count)
+            self.assertIn("--offline", invoke.call_args.args[0])
+            with patch.object(serve.subprocess, "run",
+                              return_value=SimpleNamespace(returncode=0, stdout=b"abd")):
+                with self.assertRaisesRegex(serve.InventoryError, "CID differs"):
+                    blocks.read(cid)
+            receipt.write_text(json.dumps({**record, "inventory_sha256": "0" * 64}))
+            with self.assertRaisesRegex(serve.InventoryError, "receipt differs"):
+                serve.CarReceipts(receipts, inventory, root)
 
     def test_http_serves_snapshot_and_refuses_bad_cursor(self):
         with tempfile.TemporaryDirectory() as directory:
