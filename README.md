@@ -305,6 +305,17 @@ python3 deploy/audit_lake.py \
   --raw-block-store /path/to/raw-blocks --require-complete
 ```
 
+Jacob runs this receipt audit every six hours with
+`deploy/jacob-lake-receipt-audit.plist`. Install the plist in
+`~/Library/LaunchAgents/` after installing the matching script and checking
+its paths, then load it with
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/cloud.kotoba.jacob.lake-receipt-audit.plist`.
+Each run appends one JSON report to `receipt-audit.stdout.log`; failures go to
+`receipt-audit.stderr.log` with a nonzero launchd exit code. Partial coverage
+is expected during transfer and is reported as `status: partial` with exit 0.
+The report remains a lower bound: it verifies current roots and receipts,
+not every leaf's bytes. Read individual blocks back for content checks.
+
 `deploy/export_lake_car.cljk` writes one bounded range of the dated inventory
 to CARv1 with `io-ipld-car`'s streaming writer. It checks the complete
 inventory SHA-256 and row count, downloads original blocks through one node's
