@@ -58,7 +58,7 @@ class Inventory:
         self.total_bytes = total
         self.file_identity = self.path.stat()
 
-    def page(self, offset):
+    def rows(self, offset, limit):
         current = self.path.stat()
         if (current.st_ino, current.st_size, current.st_mtime_ns) != (
                 self.file_identity.st_ino, self.file_identity.st_size,
@@ -66,13 +66,19 @@ class Inventory:
             raise InventoryError("inventory file changed since startup")
         if offset < 0 or offset >= len(self.offsets):
             raise InventoryError("cursor outside inventory")
-        end = min(offset + PAGE_SIZE, len(self.offsets))
+        if not 1 <= limit <= 1000:
+            raise InventoryError("inventory row limit must be within 1..1000")
+        end = min(offset + limit, len(self.offsets))
         rows = []
         with self.path.open("rb") as source:
             source.seek(self.offsets[offset])
             for _ in range(offset, end):
                 row = json.loads(source.readline())
                 rows.append({"cid": row["cid"], "size": row["bytes"]})
+        return rows, end
+
+    def page(self, offset):
+        rows, end = self.rows(offset, PAGE_SIZE)
         return {"ok": True, "inventory-sha256": self.sha256, "blocks": rows,
                 "cursor": str(end) if end < len(self.offsets) else None,
                 "truncated?": end < len(self.offsets)}

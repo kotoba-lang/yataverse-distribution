@@ -145,7 +145,7 @@ def selected_rows(path, expected_sha, expected_count, start, max_blocks, max_byt
 
 def export(args):
     if (not SHA256.fullmatch(args.sha256) or args.count < 1 or args.start_row < 0 or
-            not 1 <= args.max_blocks <= 200 or not 1 <= args.max_bytes <= 536_870_912):
+            not 1 <= args.max_blocks <= 1000 or not 1 <= args.max_bytes <= 536_870_912):
         raise ExportError("invalid inventory identity or bounds")
     if not args.ipfs_bin.is_file() or not args.ipfs_path.is_dir():
         raise ExportError("Kubo binary or repository is absent")

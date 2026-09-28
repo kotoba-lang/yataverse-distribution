@@ -66,6 +66,25 @@ class ServingTests(unittest.TestCase):
             with self.assertRaisesRegex(serve.InventoryError, "cursor outside"):
                 inventory.page(2)
 
+    def test_car_reader_can_select_1000_rows_without_expanding_http_page(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.jsonl"
+            lines = []
+            for index in range(1001):
+                cid = "b" + base64.b32encode(
+                    b"\x01\x55\x12\x20" + hashlib.sha256(str(index).encode()).digest()
+                ).decode().lower().rstrip("=")
+                lines.append(json.dumps({"cid": cid, "bytes": 3}) + "\n")
+            payload = "".join(lines).encode()
+            path.write_bytes(payload)
+            inventory = serve.Inventory(path, hashlib.sha256(payload).hexdigest(), 1001)
+            rows, end = inventory.rows(0, 1000)
+            self.assertEqual((1000, 1000), (len(rows), end))
+            self.assertEqual(200, len(inventory.page(0)["blocks"]))
+            self.assertEqual(1, len(inventory.rows(1000, 1000)[0]))
+            with self.assertRaisesRegex(serve.InventoryError, "row limit"):
+                inventory.rows(0, 1001)
+
     def test_block_requires_exact_pin_and_measured_size(self):
         with tempfile.TemporaryDirectory() as directory:
             inventory = self.inventory(directory)
