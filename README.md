@@ -441,6 +441,48 @@ both nodes after placement. This proves restart/skip and two new rows, not
 all 446 rows. A later audit must reconcile the complete inventory with both
 nodes and perform provider retrieval before calling this Filecoin custody.
 
+For a third storage node, copy each recovery CAR and its `.json` receipt to
+the node's own disk, then use `deploy/import_large_lake_recovery.py`. It checks
+the dated inventory and source CAR, pins the UnixFS recovery root, restores
+the original bytes offline, rederives the original raw CID in Kubo, and pins
+that CID directly. The intermediate restored file is removed after validation;
+the CAR and its source receipt remain for recovery. The output receipt is
+written only after Kubo confirms the original CID and size. A rerun is safe.
+
+```bash
+python3 deploy/import_large_lake_recovery.py \
+  --inventory /path/to/inventory-20260926.jsonl \
+  --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
+  --count 821533 --row 16866 \
+  --car /path/to/row-16866-recovery.car \
+  --source-receipt /path/to/row-16866-recovery.car.json \
+  --ipfs-bin /path/to/ipfs --ipfs-path /path/to/dedicated/repo \
+  --output-receipt /path/to/row-16866-jacob-import.json
+```
+
+`deploy/import_large_lake_batch.py` advances the fixed set of 446 oversized
+rows in inventory order. It waits for absent CAR/receipt pairs, verifies
+previously receipted Kubo pins, imports a bounded number per invocation, and
+advances its checkpoint after each confirmed row. It must use a complete,
+digest-verified recovery archive; a partially transferred CAR is refused.
+On Jacob's dedicated HDD, row 16866 restored and pinned its original
+203,519,718 bytes; the local read API returned SHA-256
+`1ae98a9fe61f9d70ac7f94f1a2e4129c3ca858b68273f8a5ddcf079644f6b499`.
+That one row does not establish custody of the other 445 oversized rows.
+
+```bash
+python3 deploy/import_large_lake_batch.py \
+  --inventory /path/to/inventory-20260926.jsonl \
+  --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
+  --count 821533 --expected-large-count 446 \
+  --expected-large-bytes 13454005391 \
+  --archive /path/to/recovery-archive --receipt-dir /path/to/import-receipts \
+  --state-dir /path/to/import-state \
+  --importer /path/to/import_large_lake_recovery.py \
+  --ipfs-bin /path/to/ipfs --ipfs-path /path/to/dedicated/repo \
+  --max-new 5
+```
+
 For the first public read entry, `deploy/xavier-public-lake.conf` exposes this
 same local service at `https://yataverse-data.220-146-170-114.sslip.io:8443/`
 through Xavier's Nginx and the shared router mapping (public 8443 to Xavier
