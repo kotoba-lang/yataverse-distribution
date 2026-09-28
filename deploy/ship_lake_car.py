@@ -152,7 +152,7 @@ def selected_rows(path, expected_sha, expected_count, start, max_blocks, max_byt
 def ship_once(args):
     if not SHA256.fullmatch(args.sha256) or args.count < 1 or args.start_row < 0:
         raise ShipError("invalid inventory identity or start")
-    if not 1 <= args.max_blocks <= 200 or not 1 <= args.max_bytes <= 536_870_912:
+    if not 1 <= args.max_blocks <= 1000 or not 1 <= args.max_bytes <= 536_870_912:
         raise ShipError("invalid CAR bounds")
     raw_cids = set()
     if args.raw_cids_file:

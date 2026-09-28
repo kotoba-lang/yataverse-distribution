@@ -54,14 +54,13 @@ def verified_root(output, expected):
 def import_batch(args):
     if not SHA256.fullmatch(args.sha256) or not SHA256.fullmatch(args.car_sha256):
         raise ImportError("invalid SHA-256 argument")
-    if (not 1 <= args.max_blocks <= 200 or args.start_row < 0 or args.count < 1 or
+    if (not 1 <= args.max_blocks <= 1000 or args.start_row < 0 or args.count < 1 or
             args.min_free_bytes < 0):
         raise ImportError("invalid inventory range")
     if not args.ipfs_bin.is_file() or not args.ipfs_path.is_dir() or not args.car.is_file():
         raise ImportError("Kubo binary, repository, or CAR is absent")
     inventory = Inventory(args.inventory, args.sha256, args.count)
-    page = inventory.page(args.start_row)
-    rows = page["blocks"][:args.max_blocks]
+    rows, _end = inventory.rows(args.start_row, args.max_blocks)
     cids = [row["cid"] for row in rows]
     if not cids or any(not CID.fullmatch(cid) for cid in cids):
         raise ImportError("invalid selected CID")
