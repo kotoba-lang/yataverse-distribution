@@ -68,6 +68,41 @@ def last_receipt(output, source):
         raise ShipError(source + " returned invalid receipt") from exc
 
 
+def large_archive_receipt_matches(receipt, skipped, inventory_sha):
+    return (receipt.get("schema") == 1 and
+            receipt.get("row") == skipped["row"] and
+            receipt.get("inventory_sha256") == inventory_sha and
+            receipt.get("original_cid") == skipped["cid"] and
+            receipt.get("original_bytes") == skipped["bytes"] and
+            receipt.get("validation") ==
+            "fresh-offline-kubo-import-cat-and-original-cid-rehydration" and
+            isinstance(receipt.get("car_sha256"), str) and
+            SHA256.fullmatch(receipt["car_sha256"]) is not None and
+            type(receipt.get("car_bytes")) is int and receipt["car_bytes"] > 0)
+
+
+def verify_remote_large_archive(args, skipped):
+    if not args.remote_large_archive:
+        raise ShipError("oversized row has no Jacob recovery archive")
+    name = "row-{}-recovery.car".format(skipped["row"])
+    car = args.remote_large_archive.rstrip("/") + "/" + name
+    receipt = car + ".json"
+    code = ("import json,pathlib,sys; car=pathlib.Path(sys.argv[1]); "
+            "receipt=pathlib.Path(sys.argv[2]); "
+            "sys.exit(2) if not car.is_file() or not receipt.is_file() "
+            "else print(json.dumps({'receipt':json.loads(receipt.read_text()),"
+            "'car_bytes_on_disk':car.stat().st_size}))")
+    output = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                  args.ssh_host, shlex.join(["python3", "-c", code, car, receipt])],
+                 timeout=60)
+    result = last_receipt(output, "Jacob large recovery archive")
+    source = result.get("receipt") if isinstance(result, dict) else None
+    if (not isinstance(source, dict) or not large_archive_receipt_matches(
+            source, skipped, args.sha256) or
+            result.get("car_bytes_on_disk") != source["car_bytes"]):
+        raise ShipError("Jacob large recovery receipt differs from skipped row")
+
+
 def selected_rows(path, expected_sha, expected_count, start, max_blocks, max_bytes,
                   raw_cids=None):
     digest = hashlib.sha256()
@@ -158,6 +193,8 @@ def ship_once(args):
                           skipped["cid"], str(skipped["bytes"])]
                 run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                      args.ssh_host, shlex.join(verify)], timeout=60)
+            else:
+                verify_remote_large_archive(args, skipped)
             skip = args.state_dir / ("skipped-" + str(start) + ".json")
             if skip.exists():
                 if json.loads(skip.read_text()) != skipped:
@@ -272,6 +309,7 @@ def main():
     parser.add_argument("--ssh-host", required=True)
     parser.add_argument("--remote-dir", required=True)
     parser.add_argument("--remote-car-dir")
+    parser.add_argument("--remote-large-archive")
     parser.add_argument("--remote-importer", required=True)
     parser.add_argument("--remote-inventory", required=True)
     parser.add_argument("--remote-ipfs-bin", required=True)
