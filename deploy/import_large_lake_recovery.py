@@ -127,14 +127,16 @@ def recover(args):
                        timeout=900).strip()
         if produced != cid:
             raise RecoveryError("Kubo rederived a different original CID")
+        # type=all traverses indirect pins and can stall on Jacob's growing
+        # CAR graph. Only an explicit pin on the original CID is sufficient.
         try:
-            pin = run(ipfs, env, "pin", "ls", "--type=all", cid, timeout=60).strip()
+            pin = run(ipfs, env, "pin", "ls", "--type=direct", cid, timeout=60).strip()
         except RecoveryError:
             pin = None
         if pin not in (cid + " direct", cid + " recursive"):
             run(ipfs, env, "pin", "add", "--recursive=false", cid, timeout=300)
-        if run(ipfs, env, "pin", "ls", "--type=all", cid,
-               timeout=60).strip() not in (cid + " direct", cid + " recursive"):
+        if run(ipfs, env, "pin", "ls", "--type=direct", cid,
+               timeout=60).strip() != cid + " direct":
             raise RecoveryError("original CID is not durably pinned")
         block_stat = run(ipfs, env, "block", "stat", cid, timeout=60)
         if "Size: " + str(size) not in block_stat.splitlines():
