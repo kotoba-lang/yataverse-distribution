@@ -64,7 +64,7 @@ def cid_bytes(cid):
     codec, offset = read_varint(data, offset)
     hash_code, offset = read_varint(data, offset)
     hash_length, offset = read_varint(data, offset)
-    if (version != 1 or codec not in (0x55, 0x70, 0x71) or
+    if (version != 1 or codec not in (0x55, 0x70, 0x71, 0x129) or
             hash_code != 0x12 or hash_length != 32 or len(data) != offset + 32):
         raise ExportError("unsupported inventory CID")
     return data, data[offset:]
