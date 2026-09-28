@@ -212,7 +212,7 @@ def ship_once(args):
                     exported.get("sha256") != sha_file(car)):
                 raise ShipError("CAR export receipt differs")
             atomic_json(export_receipt, exported)
-        remote_car = args.remote_dir.rstrip("/") + "/" + name + ".car"
+        remote_car = (args.remote_car_dir or args.remote_dir).rstrip("/") + "/" + name + ".car"
         remote_receipt = args.remote_dir.rstrip("/") + "/" + name + "-import.json"
         ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
         run(["scp", *ssh_opts, str(car), args.ssh_host + ":" + remote_car], timeout=900)
@@ -233,13 +233,18 @@ def ship_once(args):
                 imported.get("car_sha256") != exported["sha256"] or
                 imported.get("blocks") != len(rows)):
             raise ShipError("Jacob import receipt differs")
+        # Keep the durable import receipt, but remove the transient CAR before
+        # advancing. A failed cleanup leaves the checkpoint at this range so
+        # the next run can retry from its local verified CAR.
+        run(["ssh", *ssh_opts, args.ssh_host,
+             shlex.join(["rm", "-f", "--", remote_car])], timeout=120)
+        if args.source_ssh_host:
+            run(["ssh", *ssh_opts, args.source_ssh_host,
+                 shlex.join(["rm", "-f", "--", source_car, source_receipt])], timeout=120)
         atomic_json(checkpoint, {"cursor": end, "inventory_sha256": args.sha256,
                                  "last_root": imported["root"],
                                  "last_car_sha256": exported["sha256"]})
         car.unlink()
-        if args.source_ssh_host:
-            run(["ssh", *ssh_opts, args.source_ssh_host,
-                 shlex.join(["rm", "-f", "--", source_car, source_receipt])], timeout=120)
         return {"status": "shipped", "start_row": start, "end_row": end,
                 "blocks": len(rows), "root": imported["root"]}
 
@@ -266,6 +271,7 @@ def main():
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--ssh-host", required=True)
     parser.add_argument("--remote-dir", required=True)
+    parser.add_argument("--remote-car-dir")
     parser.add_argument("--remote-importer", required=True)
     parser.add_argument("--remote-inventory", required=True)
     parser.add_argument("--remote-ipfs-bin", required=True)
