@@ -128,11 +128,14 @@ class Kubo:
     def run(self, *args, data=None):
         return command([self.binary] + list(args), data=data)
 
-    def preflight(self):
+    def preflight(self, include_indirect=True):
         # Blocks reached through a recursive root are durable too. Include all
-        # three kinds so a CAR batch root is not copied a second time.
+        # three kinds for the CLI path. On the RPC path, listing every indirect
+        # pin grows with the full DAG and can exceed the 300-second command
+        # bound. That path checks individual unknown CIDs as pages advance.
         self.pins = set()
-        for pin_type in ("direct", "recursive", "indirect"):
+        pin_types = ("direct", "recursive", "indirect") if include_indirect else ("direct", "recursive")
+        for pin_type in pin_types:
             pins = self.run("pin", "ls", "--type=" + pin_type).decode("utf-8")
             self.pins.update(line.split()[0] for line in pins.splitlines() if line.strip())
         if self.raw_store is not None:
@@ -275,7 +278,7 @@ class KuboRPC(Kubo):
         return result
 
     def preflight(self):
-        super().preflight()
+        super().preflight(include_indirect=False)
         status = self._json("repo/stat")
         if (not isinstance(status.get("RepoPath"), str) or
                 Path(status["RepoPath"]).resolve() != self.repo_path.resolve()):
@@ -664,6 +667,12 @@ def run_batch(args, kubo, listing_fn=fetch_listing, block_fn=curl):
             cid, size = item["cid"], item["size"]
             if size > args.max_block_bytes:
                 raise ReplicationError("block exceeds configured maximum: " + cid)
+            if cid not in kubo.pins and isinstance(kubo, KuboRPC):
+                # Avoid a full indirect-pin enumeration on large Jacob repos.
+                # A CID already reached by a recursive CAR root is durable;
+                # verify its size before moving the inventory cursor.
+                if kubo.durable_pin_type(cid) is not None:
+                    kubo.pins.add(cid)
             if cid in kubo.pins:
                 if kubo.block_size(cid) != size:
                     raise ReplicationError("pinned block size differs from listing: " + cid)

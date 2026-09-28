@@ -447,6 +447,38 @@ class ReplicationTests(unittest.TestCase):
             node.preflight()
             self.assertIn(CID_A, node.pins)
 
+    def test_rpc_preflight_avoids_full_indirect_pin_listing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            node = replica.KuboRPC(shutil.which("true"), "http://127.0.0.1:5002")
+            calls = []
+
+            def run(*argv, data=None):
+                calls.append(argv)
+                if argv == ("repo", "stat"):
+                    return ("RepoSize: 10\nStorageMax: 1000\nRepoPath: " + directory + "\n").encode()
+                if argv[:2] == ("pin", "ls") and argv[2] != "--type=indirect":
+                    return b""
+                self.fail("full indirect listing was attempted")
+
+            node.run = run
+            node._json = lambda name: {"RepoPath": directory} if name == "repo/stat" else self.fail(name)
+            node.preflight()
+            self.assertNotIn(("pin", "ls", "--type=indirect"), calls)
+
+    def test_rpc_page_checks_indirect_pin_before_fetch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            node = replica.KuboRPC(shutil.which("true"), "http://127.0.0.1:5002")
+            node.preflight = lambda: setattr(node, "pins", set())
+            node.durable_pin_type = lambda cid: "indirect through " + CID_B
+            node.block_size = lambda cid: 3
+            node.put_verified = lambda cid, data: self.fail("existing indirect pin was recopied")
+            result = replica.run_batch(
+                args(directory), node,
+                lambda _url, _cursor: page([(CID_A, b"abc")]),
+                lambda _url, _limit: self.fail("existing indirect pin was fetched"))
+            self.assertEqual(("cycle-complete", 0, 1),
+                             (result["status"], result["new_blocks"], result["checked_blocks"]))
+
     def test_pin_add_race_accepts_confirmed_recursive_pin(self):
         node = replica.Kubo(shutil.which("true"))
         data = b"abc"
