@@ -4,6 +4,7 @@
 import argparse
 import base64
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+import urllib.parse
 from pathlib import Path
 
 
@@ -21,6 +23,46 @@ BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 class ExportError(Exception):
     pass
+
+
+def local_rpc(url, ipfs_path):
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "::1") or
+            parsed.username or parsed.password or parsed.path not in ("", "/") or
+            parsed.query or parsed.fragment or not parsed.port):
+        raise ExportError("Kubo RPC must be an uncredentialed loopback HTTP endpoint")
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=60)
+    try:
+        connection.request("POST", "/api/v0/repo/stat")
+        response = connection.getresponse()
+        body = response.read(1_000_001)
+        if response.status != 200 or len(body) > 1_000_000:
+            raise ExportError("Kubo RPC repository check failed")
+        repo = json.loads(body)
+        if Path(repo.get("RepoPath", "")).resolve() != ipfs_path.resolve():
+            raise ExportError("Kubo RPC uses a different repository")
+        return connection
+    except (OSError, http.client.HTTPException, ValueError, TypeError):
+        connection.close()
+        raise ExportError("Kubo RPC repository check failed")
+    except ExportError:
+        connection.close()
+        raise
+
+
+def rpc_block(connection, cid, expected_size):
+    try:
+        path = "/api/v0/block/get?" + urllib.parse.urlencode({"arg": cid, "offline": "true"})
+        connection.request("POST", path)
+        response = connection.getresponse()
+        body = response.read(expected_size + 1)
+        if response.status != 200 or len(body) != expected_size:
+            raise ExportError("local Kubo RPC block unavailable or wrong size: " + cid)
+        if response.read(1):
+            raise ExportError("local Kubo RPC block exceeds inventory size: " + cid)
+        return body
+    except (OSError, http.client.HTTPException) as exc:
+        raise ExportError("local Kubo RPC block unavailable: " + cid) from exc
 
 
 def varint(value):
@@ -177,6 +219,7 @@ def export(args):
                  if line.startswith("RepoPath:")), None)
     if path is None or Path(path).resolve() != args.ipfs_path.resolve():
         raise ExportError("Kubo daemon uses a different repository")
+    rpc = local_rpc(args.rpc_url, args.ipfs_path) if args.rpc_url else None
     encoded = [cid_bytes(cid) for cid, _ in rows]
     temp = args.output.with_name(args.output.name + "." + uuid.uuid4().hex + ".partial")
     digest = hashlib.sha256()
@@ -192,13 +235,16 @@ def export(args):
                 digest.update(data)
             write(car_header([cid for cid, _ in encoded]))
             for (source_cid, expected_size), (binary_cid, expected_digest) in zip(rows, encoded):
-                try:
-                    result = subprocess.run([str(args.ipfs_bin), "--offline", "block", "get",
-                                             source_cid], capture_output=True, env=env,
-                                            timeout=60, check=True)
-                except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-                    raise ExportError("local Kubo block unavailable: " + source_cid) from exc
-                data = result.stdout
+                if rpc:
+                    data = rpc_block(rpc, source_cid, expected_size)
+                else:
+                    try:
+                        result = subprocess.run([str(args.ipfs_bin), "--offline", "block", "get",
+                                                 source_cid], capture_output=True, env=env,
+                                                timeout=60, check=True)
+                    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                        raise ExportError("local Kubo block unavailable: " + source_cid) from exc
+                    data = result.stdout
                 if len(data) != expected_size or hashlib.sha256(data).digest() != expected_digest:
                     raise ExportError("local block differs from inventory CID or size")
                 write(varint(len(binary_cid) + len(data)))
@@ -216,11 +262,13 @@ def export(args):
         receipt = {"status": "complete", "inventory-sha256": args.sha256,
                    "start-row": args.start_row, "end-row": args.start_row + len(rows),
                    "blocks": len(rows), "bytes": written, "sha256": digest.hexdigest(),
-                   "source": "local-kubo-offline"}
+                   "source": "local-kubo-offline-rpc" if rpc else "local-kubo-offline"}
         atomic_json(args.receipt, receipt)
         return receipt
     finally:
         temp.unlink(missing_ok=True)
+        if rpc:
+            rpc.close()
 
 
 def main():
@@ -233,6 +281,7 @@ def main():
     parser.add_argument("--max-bytes", required=True, type=int)
     parser.add_argument("--ipfs-bin", required=True, type=Path)
     parser.add_argument("--ipfs-path", required=True, type=Path)
+    parser.add_argument("--rpc-url")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--min-free-bytes", type=int, default=50_000_000_000)

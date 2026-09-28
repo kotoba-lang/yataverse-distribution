@@ -376,6 +376,20 @@ large-block recovery path before the dated inventory is complete. The regular
 block replicator can run alongside it and recognizes the batch root's
 indirect pins on its next invocation.
 
+For a Kubo source on Xavier, `--source-rpc-url http://127.0.0.1:5001`
+passes the source's loopback RPC endpoint to
+`deploy/export_lake_car_from_kubo.py`. The exporter verifies that the RPC
+daemon and the local CLI use the requested repository, requests each block
+with `offline=true` over one connection, and still checks its inventory size
+and CID digest before writing the CAR. The RPC URL must be loopback HTTP;
+Kubo's admin RPC must never be published. A 30-block live comparison on Xavier
+read the same bytes in 0.236 seconds over RPC versus 2.372 seconds through
+individual CLI calls. This is a source-read microbenchmark, not end-to-end
+CAR transfer throughput. A separate 200-block, 50,179,997-byte CAR from
+rows 4200–4399 was byte-identical between the two paths; full source export
+took 7.977 seconds over RPC versus 20.190 seconds through the CLI. Network
+copy and Jacob import were not part of that comparison.
+
 ```bash
 python3 deploy/ship_lake_car.py \
   --source /path/to/yataverse-distribution --kbb /path/to/kbb \
