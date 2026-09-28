@@ -226,6 +226,8 @@ def ship_once(args):
                            "--ipfs-bin", args.source_ipfs_bin,
                            "--ipfs-path", args.source_ipfs_path,
                            "--output", source_car, "--receipt", source_receipt]
+                if args.source_rpc_url:
+                    command += ["--rpc-url", args.source_rpc_url]
                 ssh_opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
                 output = run(["ssh", *ssh_opts, args.source_ssh_host,
                               shlex.join(command)], timeout=1800)
@@ -303,6 +305,7 @@ def main():
     parser.add_argument("--source-inventory")
     parser.add_argument("--source-ipfs-bin")
     parser.add_argument("--source-ipfs-path")
+    parser.add_argument("--source-rpc-url")
     parser.add_argument("--source-output-dir")
     parser.add_argument("--raw-cids-file", type=Path)
     parser.add_argument("--state-dir", required=True, type=Path)
@@ -322,7 +325,7 @@ def main():
         if args.source_ssh_host:
             if not all(source_args) or args.base_url or args.resolve:
                 raise ShipError("remote Kubo source arguments are incomplete or mixed with HTTPS")
-        elif not args.source or not args.kbb or not args.base_url or any(source_args):
+        elif not args.source or not args.kbb or not args.base_url or any(source_args) or args.source_rpc_url:
             raise ShipError("HTTPS source arguments are incomplete or mixed with remote Kubo")
         print(json.dumps(ship_once(args), sort_keys=True))
         return 0
