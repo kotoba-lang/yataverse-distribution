@@ -76,9 +76,12 @@ class ServingTests(unittest.TestCase):
             with patch.object(serve.subprocess, "run", side_effect=[direct, body]) as invoke:
                 self.assertEqual(b"abc", blocks.read(CID_A))
             self.assertIn("--offline", invoke.call_args_list[1].args[0])
-            indirect = SimpleNamespace(returncode=0, stdout=(CID_A + " indirect\n").encode())
-            with patch.object(serve.subprocess, "run", return_value=indirect):
-                with self.assertRaisesRegex(serve.InventoryError, "not directly or recursively pinned"):
+            indirect = SimpleNamespace(returncode=0, stdout=(CID_A + " indirect through " + CID_B + "\n").encode())
+            with patch.object(serve.subprocess, "run", side_effect=[indirect, body]):
+                self.assertEqual(b"abc", blocks.read(CID_A))
+            malformed = SimpleNamespace(returncode=0, stdout=(CID_A + " indirect\n").encode())
+            with patch.object(serve.subprocess, "run", return_value=malformed):
+                with self.assertRaisesRegex(serve.InventoryError, "not durably pinned"):
                     blocks.read(CID_A)
             with patch.object(serve.subprocess, "run", side_effect=[direct, SimpleNamespace(returncode=0, stdout=b"ab")]):
                 with self.assertRaisesRegex(serve.InventoryError, "size differs"):

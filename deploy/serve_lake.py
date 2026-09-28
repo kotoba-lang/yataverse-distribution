@@ -104,9 +104,13 @@ class LocalBlocks:
         env = dict(os.environ, IPFS_PATH=self.ipfs_path)
         pin = subprocess.run([self.ipfs_bin, "pin", "ls", "--type=all", cid],
                              capture_output=True, env=env, timeout=15)
-        if pin.returncode or pin.stdout.strip() not in (
-                (cid + " direct").encode(), (cid + " recursive").encode()):
-            raise InventoryError("block is not directly or recursively pinned")
+        pin_line = pin.stdout.decode("utf-8", "replace").strip()
+        durable = (pin_line in (cid + " direct", cid + " recursive") or
+                   bool(re.fullmatch(re.escape(cid) +
+                                     r" indirect through (?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,200})",
+                                     pin_line)))
+        if pin.returncode or not durable:
+            raise InventoryError("block is not durably pinned")
         block = subprocess.run([self.ipfs_bin, "--offline", "block", "get", cid],
                                capture_output=True, env=env, timeout=30)
         if block.returncode or len(block.stdout) != size:

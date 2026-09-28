@@ -418,6 +418,8 @@ class ReplicationTests(unittest.TestCase):
                     return (CID_A + " direct\n").encode()
                 if argv == ("pin", "ls", "--type=recursive"):
                     return (CID_B + " recursive\n").encode()
+                if argv == ("pin", "ls", "--type=indirect"):
+                    return b""
                 if argv == ("repo", "stat"):
                     return ("RepoSize: 10\nStorageMax: 1000\nRepoPath: " + directory + "\n").encode()
                 self.fail("unexpected Kubo call: " + repr(argv))
@@ -426,6 +428,24 @@ class ReplicationTests(unittest.TestCase):
             node.preflight()
             self.assertEqual({CID_A, CID_B}, node.pins)
             self.assertIn(("pin", "ls", "--type=recursive"), calls)
+            self.assertIn(("pin", "ls", "--type=indirect"), calls)
+
+    def test_preflight_recognizes_indirect_batch_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            node = replica.Kubo(shutil.which("true"))
+
+            def run(*argv, data=None):
+                if argv == ("pin", "ls", "--type=indirect"):
+                    return (CID_A + " indirect\n").encode()
+                if argv[:2] == ("pin", "ls"):
+                    return b""
+                if argv == ("repo", "stat"):
+                    return ("RepoSize: 10\nStorageMax: 1000\nRepoPath: " + directory + "\n").encode()
+                self.fail("unexpected Kubo call: " + repr(argv))
+
+            node.run = run
+            node.preflight()
+            self.assertIn(CID_A, node.pins)
 
     def test_pin_add_race_accepts_confirmed_recursive_pin(self):
         node = replica.Kubo(shutil.which("true"))

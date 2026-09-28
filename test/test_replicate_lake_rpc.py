@@ -11,6 +11,7 @@ import tempfile
 import threading
 import sys
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 from raw_block_store import RawBlockStore, RawBlockStoreError
 
@@ -115,6 +116,16 @@ class RPCReplicationTests(unittest.TestCase):
                               "pin/add", "pin/ls", "block/stat"],
                              [name for name, _params, _body in server.calls])
             self.assertEqual(["false"], server.calls[4][1]["recursive"])
+
+    def test_rpc_recognizes_indirect_pin_with_exact_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            node, _server = self.make_node(directory)
+            with patch.object(node, "_json", return_value={"Keys": {
+                    CID: {"Type": "indirect through " + CID_V0}}}):
+                self.assertEqual("indirect through " + CID_V0, node.durable_pin_type(CID))
+            with patch.object(node, "_json", return_value={"Keys": {
+                    CID: {"Type": "indirect through untrusted"}}}):
+                self.assertIsNone(node.durable_pin_type(CID))
 
     def test_wrong_cid_bytes_or_pin_refuses_without_a_successful_pin(self):
         for fault, reason in (("cid", "different CID"), ("bytes", "readback differs"),
