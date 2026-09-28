@@ -293,15 +293,17 @@ class KuboRPC(Kubo):
         return result["Size"]
 
     def durable_pin_type(self, cid):
-        try:
-            result = self._json("pin/ls", {"arg": cid, "type": "all"})
-        except ReplicationError:
-            return None
-        pins = result.get("Keys")
-        if isinstance(pins, dict) and isinstance(pins.get(cid), dict):
-            kind = pins[cid].get("Type")
-            if kind in ("direct", "recursive") or (isinstance(kind, str) and
-                    re.fullmatch(r"indirect through (?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,200})", kind)):
+        # type=all walks every recursive DAG even with an arg, and Jacob's
+        # growing pinset made one lookup exceed minutes. Explicit direct and
+        # recursive indexes answer promptly. An indirect block is re-pinned
+        # directly after CID-verified source readback.
+        for kind in ("direct", "recursive"):
+            try:
+                result = self._json("pin/ls", {"arg": cid, "type": kind})
+            except ReplicationError:
+                continue
+            pins = result.get("Keys")
+            if isinstance(pins, dict) and isinstance(pins.get(cid), dict) and pins[cid].get("Type") == kind:
                 return kind
         return None
 

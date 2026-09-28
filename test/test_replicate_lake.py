@@ -479,6 +479,20 @@ class ReplicationTests(unittest.TestCase):
             self.assertEqual(("cycle-complete", 0, 1),
                              (result["status"], result["new_blocks"], result["checked_blocks"]))
 
+    def test_rpc_pin_lookup_never_traverses_indirect_graph(self):
+        node = replica.KuboRPC(shutil.which("true"), "http://127.0.0.1:5002")
+        calls = []
+
+        def query(name, params):
+            calls.append((name, params["type"]))
+            if params["type"] == "direct":
+                raise replica.ReplicationError("not directly pinned")
+            return {"Keys": {CID_A: {"Type": "recursive"}}}
+
+        node._json = query
+        self.assertEqual("recursive", node.durable_pin_type(CID_A))
+        self.assertEqual([("pin/ls", "direct"), ("pin/ls", "recursive")], calls)
+
     def test_pin_add_race_accepts_confirmed_recursive_pin(self):
         node = replica.Kubo(shutil.which("true"))
         data = b"abc"
