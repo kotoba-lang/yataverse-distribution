@@ -337,6 +337,32 @@ seconds. Per-root CAR import for the same 200 blocks took 910 seconds, so the
 single-root path is the measured basis for further bulk replication. This is
 only the tested range, not a full-lake or Filecoin custody claim.
 
+`deploy/ship_lake_car.py` transfers one bounded range per invocation. It
+checks the inventory identity, reuses a digest-checked CAR after a failed
+transfer, verifies Jacob's import receipt, and advances an atomic checkpoint
+only after the remote pin succeeds. Run it periodically on a source node with
+key-based SSH to Jacob. It records blocks above 8 MB in individual
+`skipped-<row>.json` receipts and advances past them; those rows still need the
+large-block recovery path before the dated inventory is complete. The regular
+block replicator can run alongside it and recognizes the batch root's
+indirect pins on its next invocation.
+
+```bash
+python3 deploy/ship_lake_car.py \
+  --source /path/to/yataverse-distribution --kbb /path/to/kbb \
+  --inventory /path/to/inventory-20260926.jsonl \
+  --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
+  --count 821533 --start-row 4200 \
+  --base-url https://yataverse-data.220-146-170-114.sslip.io/ipfs/ \
+  --resolve yataverse-data.220-146-170-114.sslip.io:443:100.87.226.80 \
+  --state-dir /path/to/ship-state --ssh-host junkawasaki@100.117.208.83 \
+  --remote-dir /path/to/jacob/lake-state \
+  --remote-importer /path/to/jacob/bin/import_lake_car.py \
+  --remote-inventory /path/to/jacob/inventory-20260926.jsonl \
+  --remote-ipfs-bin /path/to/jacob/ipfs \
+  --remote-ipfs-path /path/to/jacob/dedicated/repo
+```
+
 On 2026-09-26 the first three actual rows exported from Xavier :8443 and gad
 :8444 to byte-identical 786,733-byte CARs, SHA-256
 `4e86a913a863b47f9067b52f9a3080d75345beb2e78d67fe07b19fd33e22c9ea`.
