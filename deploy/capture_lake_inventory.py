@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 import uuid
@@ -126,6 +127,12 @@ def fetch_page(api_url, cursor):
         except ReplicationError as exc:
             if not str(exc).startswith("curl failed (") or attempt == 5:
                 raise
+            time.sleep(min(2 ** attempt, 16))
+        except subprocess.TimeoutExpired as exc:
+            if not isinstance(exc.cmd, (list, tuple)) or exc.cmd[0] != "curl":
+                raise
+            if attempt == 5:
+                raise CaptureError("lake listing curl timed out after retries") from exc
             time.sleep(min(2 ** attempt, 16))
 
 
