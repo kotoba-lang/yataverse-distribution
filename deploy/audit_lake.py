@@ -111,11 +111,14 @@ def audit_receipts(inventory, car_dir, large_dir, ipfs_path, recursive, direct,
     car_rows = native_rows = large_rows = direct_rows = raw_rows = 0
     unpinned_car_roots = unpinned_native_roots = unpinned_large_roots = 0
     repository = str(Path(ipfs_path).resolve())
+    native_dirs = ([] if native_dir is None else
+                   [native_dir] if isinstance(native_dir, (str, Path)) else
+                   list(native_dir))
     if receipt_paths is None:
         receipt_paths = (sorted(Path(car_dir).glob("row-*-import.json")),
                          sorted(Path(large_dir).glob("row-*-jacob-import.json")),
-                         sorted(Path(native_dir).glob("row-*-native.json"))
-                         if native_dir is not None else [])
+                         sorted(path for directory in native_dirs
+                                for path in Path(directory).glob("row-*-native.json")))
     car_paths, large_paths, native_paths = receipt_paths
     for path in car_paths:
         match = re.fullmatch(r"row-(\d+)-(\d+)-import\.json", path.name)
@@ -149,7 +152,7 @@ def audit_receipts(inventory, car_dir, large_dir, ipfs_path, recursive, direct,
         for row in range(start, end):
             covered[row] = 1
         car_rows += len(rows)
-    if native_dir is not None:
+    if native_dirs:
         for path in native_paths:
             match = re.fullmatch(r"row-(\d+)-(\d+)-native\.json", path.name)
             if not match:
@@ -305,7 +308,7 @@ def main():
     parser.add_argument("--raw-block-store", type=Path)
     parser.add_argument("--car-receipts", type=Path)
     parser.add_argument("--large-receipts", type=Path)
-    parser.add_argument("--native-receipts", type=Path)
+    parser.add_argument("--native-receipts", type=Path, action="append", default=[])
     parser.add_argument("--ipfs-path", type=Path)
     parser.add_argument("--require-complete", action="store_true")
     args = parser.parse_args()
@@ -316,7 +319,7 @@ def main():
                 raise AuditError("receipt audit requires both directories and Kubo repository")
             if not args.car_receipts.is_dir() or not args.large_receipts.is_dir():
                 raise AuditError("receipt directory is absent")
-            if args.native_receipts and not args.native_receipts.is_dir():
+            if any(not directory.is_dir() for directory in args.native_receipts):
                 raise AuditError("native receipt directory is absent")
             os.environ["IPFS_PATH"] = str(args.ipfs_path.resolve())
             verify_repo(args.ipfs_bin, args.ipfs_path)
@@ -327,8 +330,8 @@ def main():
             receipt_paths = (
                 sorted(args.car_receipts.glob("row-*-import.json")),
                 sorted(args.large_receipts.glob("row-*-jacob-import.json")),
-                sorted(args.native_receipts.glob("row-*-native.json"))
-                if args.native_receipts else [])
+                sorted(path for directory in args.native_receipts
+                       for path in directory.glob("row-*-native.json")))
             report = audit_receipts(
                 inventory, args.car_receipts, args.large_receipts, args.ipfs_path,
                 pins_of_type(args.ipfs_bin, "recursive"),
