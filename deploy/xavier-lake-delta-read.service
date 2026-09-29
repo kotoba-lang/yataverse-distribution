@@ -1,0 +1,15 @@
+[Unit]
+Description=Read-only verified Yataverse lake delta from Xavier
+After=network-online.target ipfs.service
+Requires=ipfs.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/xavier/.local/bin/yataverse-lake-read --inventory /mnt/nvme/ipfs-xavier/lake-state/inventory-delta-fence-20260929.jsonl --sha256 899e7e26087e98a9c6859db4cd697753f26745e5ac46dc3f3a071a05c585e7d1 --count 977 --ipfs-bin /mnt/nvme/ipfs-xavier/bin/ipfs --ipfs-path /mnt/nvme/ipfs-xavier/repo --raw-block-store /mnt/nvme/ipfs-xavier/lake-state/raw-blocks --max-block-bytes 256000000 --host 127.0.0.1 --port 8091
+Restart=on-failure
+RestartSec=10
+MemoryMax=2G
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
