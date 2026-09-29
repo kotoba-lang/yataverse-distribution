@@ -1,0 +1,155 @@
+(ns yataverse.distribution.filecoin-archive-e2e-test
+  "The archive/restore CLI against a real filecoin-cas process (../filecoin-cas).
+
+  Skipped, loudly, unless YATAVERSE_FILECOIN_E2E is set, so the ordinary suite
+  never spawns processes or touches a network:
+
+    YATAVERSE_FILECOIN_E2E=memory       kbb -M:test
+    YATAVERSE_FILECOIN_E2E=calibration  kbb -M:test   # real Filecoin, minutes
+
+  `calibration` needs ../filecoin-cas/.filecoin-cas/calibration.key."
+  (:require ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as nodepath]
+            [kotoba.test :refer [deftest is]]
+            [yataverse.distribution.filecoin-archive :as fa]))
+
+(def cas-dir (.resolve nodepath "../filecoin-cas"))
+
+(defn- sleep-seconds [n] (.spawnSync cp "sleep" #js [(str n)]))
+
+(defn- stop-sidecar!
+  "kbb runs the server as a child of its wrapper: signal the whole process
+  group (the child was spawned detached), or the server outlives the test."
+  [child]
+  (try (.kill js/process (- (.-pid child)) "SIGTERM") (catch :default _ nil)))
+
+(defn- start-sidecar!
+  "Spawn the service with its output in `log-file` and block until it prints its
+  listening line. The service is a separate process, so blocking here is fine
+  (and the repo's runner does not wait for asynchronous tests). -> {:child :url}"
+  [{:keys [port token-file state-dir log-file calibration?]}]
+  (let [env (js/Object.assign #js {} js/process.env
+                              #js {:FILECOIN_CAS_PORT (str port)
+                                   :FILECOIN_CAS_STATE_DIR state-dir
+                                   :FILECOIN_CAS_TOKEN_FILE token-file})
+        _ (when calibration?
+            (aset env "FILECOIN_CAS_CHAIN" "calibration")
+            (aset env "FILECOIN_CAS_KEY_FILE"
+                  (.join nodepath cas-dir ".filecoin-cas/calibration.key")))
+        log-fd (.openSync fs log-file "w")
+        child (.spawn cp "kbb"
+                      (to-array (cond-> ["--backend" "sci" "bin/filecoin-cas-server.cljk"]
+                                  (not calibration?) (conj "--memory-network")))
+                      #js {:cwd cas-dir :env env :detached true :stdio #js ["ignore" log-fd log-fd]})]
+    (.closeSync fs log-fd)
+    (loop [tries 100]
+      (let [text (.readFileSync fs log-file "utf8")]
+        (if-let [[_ url] (re-find #":listening \"([^\"]+)\"" text)]
+          {:child child :url url}
+          (do (when (zero? tries)
+                (stop-sidecar! child)
+                (throw (js/Error. (str "sidecar did not start: " text))))
+              (sleep-seconds 0.3)
+              (recur (dec tries))))))))
+
+(defn- cli
+  "Run the archive CLI synchronously (the sidecar is another process, so
+  blocking here is fine). -> {:code n :out s :err s}"
+  [& args]
+  (let [r (.spawnSync cp "kbb" (to-array (concat ["--backend" "sci" "deploy/filecoin_archive.cljk"] args))
+                      #js {:encoding "utf8"})]
+    {:code (.-status r) :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- json [s] (js->clj (.parse js/JSON s) :keywordize-keys true))
+(defn- sha-of [bytes] (.digest (.update (.createHash crypto "sha256") bytes) "hex"))
+
+(defn- run-e2e! [calibration?]
+  (let [tmp (.mkdtempSync fs (.join nodepath (.tmpdir os) "yfa-e2e-"))
+        p (fn [& parts] (apply (.-join nodepath) tmp parts))
+        token-file (p "token") bad-token (p "bad-token") receipts (p "receipts")
+        _ (.writeFileSync fs token-file "e2e-token-not-a-secret\n" #js {:mode 0600})
+        _ (.writeFileSync fs bad-token "wrong\n" #js {:mode 0600})
+        _ (.mkdirSync fs receipts)
+        car (p "row-0-200.car")
+        data (js/Buffer.from (.randomBytes crypto (* 2 1024 1024)))
+        sha (sha-of data)
+        cid (fa/car-cid sha)
+        sidecar (atom nil)]
+    (.writeFileSync fs car data)
+    (try
+      (let [{:keys [child url]} (start-sidecar! {:port (+ 20000 (rand-int 20000))
+                                                 :token-file token-file
+                                                 :state-dir (p "state")
+                                                 :log-file (p "sidecar.log")
+                                                 :calibration? calibration?})]
+        (reset! sidecar child)
+        (let [wait (if calibration? "600" "60")
+                  archive #(cli "archive" "--car" car "--sha256" sha "--start-row" "0"
+                                "--end-row" "200" "--url" url "--token-file" token-file
+                                "--receipt-dir" receipts "--wait-seconds" wait
+                                "--inventory-sha256" (apply str (repeat 64 "a")))
+                  a1 (archive)
+                  rec (when (zero? (:code a1)) (json (:out a1)))]
+              (is (zero? (:code a1)) (str "archive: " (:err a1)))
+              (is (= "stored" (:status rec)) "tier reports the CAR stored")
+              (is (= cid (:car-cid rec)))
+              (is (string? (:piece-cid rec)))
+              (is (.existsSync fs (p "receipts" "row-0-200-filecoin.json")) "receipt written")
+              (is (zero? (:code (archive))) "archiving the same CAR again is idempotent")
+
+              (let [bad (cli "archive" "--car" car "--sha256" (apply str (repeat 64 "0"))
+                             "--start-row" "200" "--end-row" "400" "--url" url
+                             "--receipt-dir" receipts)]
+                (is (= 2 (:code bad)))
+                (is (re-find #"car-sha256-mismatch" (:err bad)))
+                (is (not (.existsSync fs (p "receipts" "row-200-400-filecoin.json")))))
+
+              (let [other (p "other.car")
+                    odata (js/Buffer.from (.randomBytes crypto 1024))
+                    r (do (.writeFileSync fs other odata)
+                          (cli "archive" "--car" other "--sha256" (sha-of odata)
+                               "--start-row" "0" "--end-row" "200" "--url" url
+                               "--token-file" token-file "--receipt-dir" receipts))]
+                (is (re-find #"receipt-conflict" (:err r)) "a range never silently changes CAR"))
+
+              (is (re-find #"tier-rejected"
+                           (:err (cli "archive" "--car" car "--sha256" sha "--start-row" "400"
+                                      "--end-row" "600" "--url" url "--token-file" bad-token
+                                      "--receipt-dir" receipts)))
+                  "a wrong token is refused")
+              (is (re-find #"insecure-endpoint"
+                           (:err (cli "archive" "--car" car "--sha256" sha "--start-row" "0"
+                                      "--end-row" "200" "--url" "http://cas.example.org"
+                                      "--receipt-dir" receipts))))
+
+              (.unlinkSync fs car)
+              (let [out (p "restored.car")
+                    r (cli "restore" "--car-cid" cid "--sha256" sha "--output" out
+                           "--url" url "--token-file" token-file)]
+                (is (zero? (:code r)) (str "restore: " (:err r)))
+                (is (= sha (sha-of (.readFileSync fs out))) "restored bytes are the CAR")
+                (is (re-find #"output-exists"
+                             (:err (cli "restore" "--car-cid" cid "--sha256" sha "--output" out
+                                        "--url" url "--token-file" token-file)))
+                    "never replaces an existing file"))
+
+              (let [ghost-sha (sha-of (js/Buffer.from "nobody archived this"))
+                    out (p "ghost.car")
+                    r (cli "restore" "--car-cid" (fa/car-cid ghost-sha) "--sha256" ghost-sha
+                           "--output" out "--url" url "--token-file" token-file)]
+                (is (re-find #"tier-unavailable" (:err r)))
+                (is (not (.existsSync fs out)) "no output left behind")
+                (is (empty? (filter #(re-find #"\.partial$" %) (.readdirSync fs tmp)))
+                    "no partial file left behind"))))
+      (finally
+        (some-> @sidecar stop-sidecar!)
+        (.rmSync fs tmp #js {:recursive true :force true})))))
+
+(deftest archive-and-restore-through-a-real-filecoin-cas
+  (let [mode (aget js/process.env "YATAVERSE_FILECOIN_E2E")]
+    (if (empty? mode)
+      (println "SKIPPED yataverse.distribution.filecoin-archive-e2e-test (set YATAVERSE_FILECOIN_E2E=memory|calibration)")
+      (run-e2e! (= "calibration" mode)))))
