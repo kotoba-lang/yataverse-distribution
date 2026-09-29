@@ -21,6 +21,8 @@
 		<string>821533</string>
 		<string>--start-row</string>
 		<string>4200</string>
+		<string>--stop-row</string>
+		<string>100000</string>
 		<string>--max-blocks</string>
 		<string>1000</string>
 		<string>--max-bytes</string>

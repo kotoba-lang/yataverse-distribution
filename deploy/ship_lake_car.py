@@ -150,7 +150,9 @@ def selected_rows(path, expected_sha, expected_count, start, max_blocks, max_byt
 
 
 def ship_once(args):
-    if not SHA256.fullmatch(args.sha256) or args.count < 1 or args.start_row < 0:
+    stop = args.stop_row if args.stop_row is not None else args.count
+    if (not SHA256.fullmatch(args.sha256) or args.count < 1 or
+            not 0 <= args.start_row < stop <= args.count):
         raise ShipError("invalid inventory identity or start")
     if not 1 <= args.max_blocks <= 1000 or not 1 <= args.max_bytes <= 536_870_912:
         raise ShipError("invalid CAR bounds")
@@ -177,10 +179,13 @@ def ship_once(args):
         if state.get("inventory_sha256") != args.sha256 or type(state.get("cursor")) is not int:
             raise ShipError("checkpoint identity differs")
         start = state["cursor"]
-        if start >= args.count:
-            return {"status": "complete", "cursor": start}
+        if start > stop:
+            raise ShipError("checkpoint passed configured stop row")
+        if start == stop:
+            return {"status": "complete", "cursor": start, "stop_row": stop}
         rows, skipped = selected_rows(args.inventory, args.sha256, args.count,
-                                      start, args.max_blocks, args.max_bytes,
+                                      start, min(args.max_blocks, stop - start),
+                                      args.max_bytes,
                                       raw_cids)
         if skipped:
             if skipped["reason"] == "verified-raw-block-store":
@@ -296,6 +301,7 @@ def main():
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--count", required=True, type=int)
     parser.add_argument("--start-row", required=True, type=int)
+    parser.add_argument("--stop-row", type=int)
     parser.add_argument("--max-blocks", type=int, default=200)
     parser.add_argument("--max-bytes", type=int, default=100_000_000)
     parser.add_argument("--base-url")
