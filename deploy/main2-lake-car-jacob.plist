@@ -12,7 +12,7 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/opt/homebrew/bin/python3</string>
-		<string>/Users/junkawasaki/github/kotoba-lang/yataverse-distribution/deploy/ship_lake_car.py</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-car-jacob/bin/ship_lake_car.py</string>
 		<string>--inventory</string>
 		<string>/Users/junkawasaki/.local/share/yataverse/inventory-20260926.jsonl</string>
 		<string>--sha256</string>
@@ -42,7 +42,7 @@
 		<string>--source-output-dir</string>
 		<string>/mnt/nvme/ipfs-xavier/lake-state/car-exports-jacob</string>
 		<string>--raw-cids-file</string>
-		<string>/Users/junkawasaki/github/kotoba-lang/yataverse-distribution/deploy/lake_raw_cids_20260926.json</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-car-jacob/bin/lake_raw_cids_20260926.json</string>
 		<string>--state-dir</string>
 		<string>/Users/junkawasaki/.local/share/yataverse-car-jacob/state</string>
 		<string>--ssh-host</string>
@@ -73,6 +73,6 @@
 	<key>StartInterval</key>
 	<integer>10</integer>
 	<key>WorkingDirectory</key>
-	<string>/Users/junkawasaki/github/kotoba-lang/yataverse-distribution</string>
+	<string>/Users/junkawasaki/.local/share/yataverse-car-jacob</string>
 </dict>
 </plist>

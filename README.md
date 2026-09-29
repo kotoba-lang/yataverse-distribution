@@ -432,6 +432,11 @@ state lock. The checkpoint advances only after Jacob writes an import receipt.
 The installed `--stop-row 100000` confines this lane to the early inventory
 prefix. The final batch is shortened to end exactly there, and a checkpoint
 past the stop row refuses instead of silently claiming completion.
+The LaunchAgent reads an installed copy of `ship_lake_car.py` and its dated
+raw-CID manifest from `~/.local/share/yataverse-car-jacob/bin/`; install
+those exact files before loading the plist. The state directory and existing
+checkpoint stay in place across code updates, while the running job no longer
+depends on a moving source checkout.
 Before installing it on another Mac, adjust all absolute paths, the SSH hosts,
 and the disk reserve settings to that machine. An interval change does not
 establish full inventory custody; use `audit_lake.py` and leaf readback to
