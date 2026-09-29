@@ -54,12 +54,13 @@ def plan(inventory, expected_count, expected_bytes):
 def pinned(ipfs, repo, cid):
     env = dict(os.environ, IPFS_PATH=str(repo.resolve()))
     try:
-        result = subprocess.run([str(ipfs), "pin", "ls", "--type=all", cid],
+        # The recovery importer pins the original raw CID directly. Looking up
+        # indirect pins traverses Jacob's growing CAR graph and can time out.
+        result = subprocess.run([str(ipfs), "pin", "ls", "--type=direct", cid],
                                 env=env, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise BatchError("Kubo pin check failed") from exc
-    return result.returncode == 0 and result.stdout.strip() in (
-        cid + " direct", cid + " recursive")
+    return result.returncode == 0 and result.stdout.strip() == cid + " direct"
 
 
 def advance(args):
