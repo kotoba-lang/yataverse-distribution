@@ -406,6 +406,16 @@ python3 deploy/ship_lake_car.py \
   --remote-ipfs-path /path/to/jacob/dedicated/repo
 ```
 
+`deploy/main2-lake-car-jacob.plist` records the installed main-2 LaunchAgent
+for the dated inventory and Jacob's dedicated HDD repository. Its 10-second
+interval replaces the earlier 30-second interval; launchd keeps one instance
+of the same job active at a time, and `ship_lake_car.py` takes an exclusive
+state lock. The checkpoint advances only after Jacob writes an import receipt.
+Before installing it on another Mac, adjust all absolute paths, the SSH hosts,
+and the disk reserve settings to that machine. An interval change does not
+establish full inventory custody; use `audit_lake.py` and leaf readback to
+measure that separately.
+
 On 2026-09-26 the first three actual rows exported from Xavier :8443 and gad
 :8444 to byte-identical 786,733-byte CARs, SHA-256
 `4e86a913a863b47f9067b52f9a3080d75345beb2e78d67fe07b19fd33e22c9ea`.
