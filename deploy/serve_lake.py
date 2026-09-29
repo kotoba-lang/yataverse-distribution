@@ -177,14 +177,20 @@ class LocalBlocks:
         import os
         env = dict(os.environ, IPFS_PATH=self.ipfs_path)
         if self.car_receipts is None or not self.car_receipts.covers(cid):
-            pin = subprocess.run([self.ipfs_bin, "pin", "ls", "--type=all", cid],
-                                 capture_output=True, env=env, timeout=15)
-            pin_line = pin.stdout.decode("utf-8", "replace").strip()
-            durable = (pin_line in (cid + " direct", cid + " recursive") or
-                       bool(re.fullmatch(re.escape(cid) +
-                                         r" indirect through (?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,200})",
-                                         pin_line)))
-            if pin.returncode or not durable:
+            direct = subprocess.run([self.ipfs_bin, "pin", "ls", "--type=direct", cid],
+                                    capture_output=True, env=env, timeout=15)
+            durable = (direct.returncode == 0 and
+                       direct.stdout.decode("utf-8", "replace").strip() == cid + " direct")
+            if not durable:
+                pin = subprocess.run([self.ipfs_bin, "pin", "ls", "--type=all", cid],
+                                     capture_output=True, env=env, timeout=15)
+                pin_line = pin.stdout.decode("utf-8", "replace").strip()
+                durable = (pin.returncode == 0 and
+                           (pin_line == cid + " recursive" or
+                            bool(re.fullmatch(re.escape(cid) +
+                                              r" indirect through (?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,200})",
+                                              pin_line))))
+            if not durable:
                 raise InventoryError("block is not durably pinned or receipted")
         block = subprocess.run([self.ipfs_bin, "--offline", "block", "get", cid],
                                capture_output=True, env=env, timeout=30)
