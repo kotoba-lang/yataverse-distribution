@@ -100,7 +100,7 @@ def verify_repo(ipfs_bin, ipfs_path):
 
 
 def audit_receipts(inventory, car_dir, large_dir, ipfs_path, recursive, direct,
-                   raw_store, root_reader, native_dir=None):
+                   raw_store, root_reader, native_dir=None, receipt_paths=None):
     """Count CID-bound rows whose current durable roots still match receipts.
 
     This deliberately excludes unreceipted indirect pins and does not read
@@ -111,7 +111,13 @@ def audit_receipts(inventory, car_dir, large_dir, ipfs_path, recursive, direct,
     car_rows = native_rows = large_rows = direct_rows = raw_rows = 0
     unpinned_car_roots = unpinned_native_roots = unpinned_large_roots = 0
     repository = str(Path(ipfs_path).resolve())
-    for path in sorted(Path(car_dir).glob("row-*-import.json")):
+    if receipt_paths is None:
+        receipt_paths = (sorted(Path(car_dir).glob("row-*-import.json")),
+                         sorted(Path(large_dir).glob("row-*-jacob-import.json")),
+                         sorted(Path(native_dir).glob("row-*-native.json"))
+                         if native_dir is not None else [])
+    car_paths, large_paths, native_paths = receipt_paths
+    for path in car_paths:
         match = re.fullmatch(r"row-(\d+)-(\d+)-import\.json", path.name)
         if not match:
             raise AuditError("invalid CAR receipt name")
@@ -144,7 +150,7 @@ def audit_receipts(inventory, car_dir, large_dir, ipfs_path, recursive, direct,
             covered[row] = 1
         car_rows += len(rows)
     if native_dir is not None:
-        for path in sorted(Path(native_dir).glob("row-*-native.json")):
+        for path in native_paths:
             match = re.fullmatch(r"row-(\d+)-(\d+)-native\.json", path.name)
             if not match:
                 raise AuditError("invalid native receipt name")
@@ -176,7 +182,7 @@ def audit_receipts(inventory, car_dir, large_dir, ipfs_path, recursive, direct,
             for row in range(start, end):
                 covered[row] = 1
             native_rows += len(rows)
-    for path in sorted(Path(large_dir).glob("row-*-jacob-import.json")):
+    for path in large_paths:
         match = re.fullmatch(r"row-(\d+)-jacob-import\.json", path.name)
         if not match:
             raise AuditError("invalid large recovery receipt name")
@@ -315,11 +321,20 @@ def main():
             os.environ["IPFS_PATH"] = str(args.ipfs_path.resolve())
             verify_repo(args.ipfs_bin, args.ipfs_path)
             inventory = Inventory(args.inventory, args.sha256, args.count)
+            # Freeze receipt names before listing pins. New receipts appear
+            # only after their root is pinned; including one written after the
+            # pin snapshot would falsely classify that root as unpinned.
+            receipt_paths = (
+                sorted(args.car_receipts.glob("row-*-import.json")),
+                sorted(args.large_receipts.glob("row-*-jacob-import.json")),
+                sorted(args.native_receipts.glob("row-*-native.json"))
+                if args.native_receipts else [])
             report = audit_receipts(
                 inventory, args.car_receipts, args.large_receipts, args.ipfs_path,
                 pins_of_type(args.ipfs_bin, "recursive"),
                 pins_of_type(args.ipfs_bin, "direct"), raw,
-                lambda root: receipt_root(args.ipfs_bin, root), args.native_receipts)
+                lambda root: receipt_root(args.ipfs_bin, root), args.native_receipts,
+                receipt_paths)
         else:
             report = audit_inventory(args.inventory, args.sha256, args.count,
                                      durable_pins(args.ipfs_bin), raw)
