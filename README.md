@@ -440,8 +440,10 @@ Xavier, downloads bounded blocks through Jacob's Kubo daemon, checks every
 block's inventory size and CID digest, and recursively pins one batch root
 before checkpointing. Its native receipts are included in the receipt audit;
 a later offline leaf readback remains necessary. The installed
-`deploy/jacob-lake-native-bitswap.plist` targets rows 300000–399999, away from
-the main-2 CAR shipper's current prefix. The public peer check establishes a
+`deploy/jacob-lake-native-bitswap.plist` targets rows 300000–821532, away from
+the main-2 CAR shipper's current prefix. The state directory retains its
+initial `native-300000-400000` name so existing receipts and checkpoint remain
+valid. The public peer check establishes a
 usable independent route; it does not prove which Bitswap peer supplied every
 block, router failover, full inventory custody, or Filecoin storage.
 
