@@ -592,12 +592,15 @@ through Xavier's Nginx and the shared router mapping (public 8443 to Xavier
 443). Issue a certificate for that exact name using the port-80 webroot
 challenge before enabling the HTTPS server; retain the Isekai virtual host on
 the same listener. The Nginx config limits each source address to 8 requests
-per second and 8 simultaneous connections, permits GET only, and serves only
+per second and 8 simultaneous connections, permits GET and browser preflight
+OPTIONS, and serves only
 `/health`, `/api/v1/lake/blocks`, and `/ipfs/{cid}`. The response headers
 `X-Yataverse-Inventory-Scope: dated-full` and
 `X-Yataverse-Bytes-Scope: local-pinned-only` distinguish inventory coverage
-from locally copied bytes. A public `/health` response still describes the
-inventory, not full block availability. This temporary hostname does not
+from locally copied bytes. Public read responses have wildcard CORS so a
+browser can fetch these separate HTTPS origins without Cloudflare; no
+credentialed requests or writes are offered. A public `/health` response still
+describes the inventory, not full block availability. This temporary hostname does not
 replace `yataverse.com` and the shared router is a failure domain.
 
 `deploy/gad-public-lake-{http,}.conf` provides a standby virtual host for
