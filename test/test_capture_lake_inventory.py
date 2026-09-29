@@ -114,6 +114,24 @@ class CaptureLakeInventoryTests(unittest.TestCase):
         fetch.assert_called_once()
         sleep.assert_not_called()
 
+    def test_curl_process_timeout_retries_same_cursor(self):
+        page = {"blocks": [{"cid": CID_A, "size": 3}],
+                "cursor": "next", "truncated?": True}
+        error = capture.subprocess.TimeoutExpired(["curl", "https://example.invalid"], 75)
+        with patch.object(capture, "fetch_listing", side_effect=[error, page]) as fetch:
+            with patch.object(capture.time, "sleep") as sleep:
+                self.assertIs(page, capture.fetch_page("https://example.invalid", "saved"))
+        self.assertEqual(["saved", "saved"], [call.args[1] for call in fetch.call_args_list])
+        sleep.assert_called_once_with(1)
+
+    def test_repeated_curl_process_timeout_fails_cleanly(self):
+        error = capture.subprocess.TimeoutExpired(["curl", "https://example.invalid"], 75)
+        with patch.object(capture, "fetch_listing", side_effect=error) as fetch:
+            with patch.object(capture.time, "sleep"):
+                with self.assertRaisesRegex(capture.CaptureError, "timed out after retries"):
+                    capture.fetch_page("https://example.invalid", "saved")
+        self.assertEqual(6, fetch.call_count)
+
 
 if __name__ == "__main__":
     unittest.main()

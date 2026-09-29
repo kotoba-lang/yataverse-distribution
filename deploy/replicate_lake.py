@@ -91,7 +91,7 @@ def fetch_listing(api_url, cursor):
     if cursor:
         query += ("?" if not query else "&") + "cursor=" + urllib.parse.quote(cursor, safe="")
     try:
-        listing = json.loads(curl(api_url + query, 2_000_000))
+        listing = json.loads(curl(api_url + query, 2_000_000, max_seconds=45))
     except (ValueError, UnicodeDecodeError) as exc:
         raise ReplicationError("lake listing is not JSON: {}".format(exc))
     if listing.get("ok") is not True:
