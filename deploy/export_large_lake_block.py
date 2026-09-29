@@ -56,12 +56,22 @@ def digest_file(path, ceiling):
 
 def checked_source_url(base, cid):
     parts = urlsplit(base)
-    if (parts.scheme != "https" or not parts.hostname or
-            parts.path != "/ipfs/" or parts.query or parts.fragment or
-            parts.username or parts.password or
-            not re.fullmatch(r"[A-Za-z0-9.-]+", parts.hostname)):
-        raise ExportError("source must be an HTTPS /ipfs/ gateway base")
+    remote_https = (parts.scheme == "https" and parts.hostname and
+                    re.fullmatch(r"[A-Za-z0-9.-]+", parts.hostname))
+    local_http = (parts.scheme == "http" and parts.hostname == "127.0.0.1" and
+                  parts.port is not None)
+    if (not (remote_https or local_http) or parts.path != "/ipfs/" or
+            parts.query or parts.fragment or parts.username or parts.password):
+        raise ExportError("source must be HTTPS or loopback HTTP /ipfs/ gateway base")
     return base + cid
+
+
+def source_curl_argv(url, size, output):
+    local_http = urlsplit(url).scheme == "http"
+    return ["curl", "-fsS", "--proto", "=http" if local_http else "=https",
+            *(["--noproxy", "*"] if local_http else []),
+            "--max-redirs", "0", "--connect-timeout", "5", "--max-time", "300",
+            "--max-filesize", str(size), "--output", str(output), url]
 
 
 def inventory_row(args, inventory=None):
@@ -122,9 +132,7 @@ def export(args, inventory=None, emit=True):
     with tempfile.TemporaryDirectory(prefix="yataverse-large-car-") as tmp:
         directory = Path(tmp)
         source = directory / "source.block"
-        run(["curl", "-fsS", "--proto", "=https", "--max-redirs", "0",
-             "--connect-timeout", "5", "--max-time", "300",
-             "--max-filesize", str(size), "--output", str(source), url], timeout=310)
+        run(source_curl_argv(url, size, source), timeout=310)
         actual_size, digest = digest_file(source, MAX_BLOCK)
         if actual_size != size or digest != _sha256_digest(original_cid):
             raise ExportError("source byte count or CID digest differs")
