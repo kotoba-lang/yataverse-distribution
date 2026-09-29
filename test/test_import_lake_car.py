@@ -21,6 +21,23 @@ CID_B = "QmNLhRArQBktFvoG2vgmoM3oMZC8vgWGhk9sM4Q4KkGUxh"
 
 
 class ImportLakeCarTests(unittest.TestCase):
+    def test_repository_identity_is_fast_and_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "config").write_text(json.dumps({"Identity": {"PeerID": "peer-a"}}))
+            (repo / "api").write_text("/ip4/127.0.0.1/tcp/5002\n")
+            with patch.object(module, "kubo", return_value="peer-a\n") as kubo:
+                env = module.verify_repo("/bin/ipfs", repo)
+            self.assertEqual(str(repo.resolve()), env["IPFS_PATH"])
+            kubo.assert_called_once_with("/bin/ipfs", env, "id", "-f", "<id>", timeout=10)
+
+            with patch.object(module, "kubo", return_value="peer-b\n"):
+                with self.assertRaisesRegex(module.ImportError, "different repository"):
+                    module.verify_repo("/bin/ipfs", repo)
+            (repo / "api").unlink()
+            with self.assertRaisesRegex(module.ImportError, "identity is unavailable"):
+                module.verify_repo("/bin/ipfs", repo)
+
     def test_root_must_preserve_every_exact_inventory_link(self):
         record = {"schema": 1, "inventory-sha256": "a" * 64,
                   "start-row": 0, "end-row": 2,
