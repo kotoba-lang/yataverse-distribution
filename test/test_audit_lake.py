@@ -2,6 +2,7 @@ import hashlib
 import base64
 import importlib.util
 import json
+import subprocess
 import tempfile
 import sys
 import unittest
@@ -68,6 +69,30 @@ class AuditTests(unittest.TestCase):
                 audit.subprocess, "run", side_effect=[SimpleNamespace(
                     returncode=0, stderr=b"", stdout=entry.encode()) for entry in outputs]):
             self.assertEqual({CID_A, CID_B}, audit.durable_pins("/bin/ipfs"))
+
+    def test_repository_check_uses_live_peer_identity_without_repo_walk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "config").write_text(json.dumps({"Identity": {"PeerID": "peer-a"}}))
+            (repo / "api").write_text("/ip4/127.0.0.1/tcp/5002\n")
+            response = SimpleNamespace(returncode=0, stdout=b"peer-a\n", stderr=b"")
+            with patch.object(audit.subprocess, "run", return_value=response) as run:
+                audit.verify_repo("/bin/ipfs", repo)
+            self.assertEqual(["/bin/ipfs", "id", "-f", "<id>"], run.call_args.args[0])
+            self.assertEqual(str(repo.resolve()), run.call_args.kwargs["env"]["IPFS_PATH"])
+            self.assertEqual(10, run.call_args.kwargs["timeout"])
+
+            with patch.object(audit.subprocess, "run", return_value=SimpleNamespace(
+                    returncode=0, stdout=b"peer-b\n", stderr=b"")):
+                with self.assertRaisesRegex(audit.AuditError, "different repository"):
+                    audit.verify_repo("/bin/ipfs", repo)
+            with patch.object(audit.subprocess, "run", side_effect=subprocess.TimeoutExpired(
+                    ["/bin/ipfs", "id"], 10)):
+                with self.assertRaisesRegex(audit.AuditError, "check failed"):
+                    audit.verify_repo("/bin/ipfs", repo)
+            (repo / "api").unlink()
+            with self.assertRaisesRegex(audit.AuditError, "identity is unavailable"):
+                audit.verify_repo("/bin/ipfs", repo)
 
     def test_cid_verified_raw_block_covers_only_its_inventory_row(self):
         data = b"\x0a\x03not-valid-dag-pb"
