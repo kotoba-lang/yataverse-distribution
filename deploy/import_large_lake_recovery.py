@@ -51,6 +51,13 @@ def run(ipfs, env, *args, stdout=None, timeout=900):
     return result.stdout.decode("utf-8", "replace") if stdout is None else ""
 
 
+def verify_daemon_identity(ipfs, env):
+    configured_id = run(ipfs, env, "config", "Identity.PeerID", timeout=30).strip()
+    daemon_id = run(ipfs, env, "id", "-f=<id>", timeout=30).strip()
+    if not configured_id or configured_id != daemon_id:
+        raise RecoveryError("Kubo daemon uses a different repository identity")
+
+
 def receipt_matches(args, inventory):
     with args.inventory.open("rb") as source:
         source.seek(inventory.offsets[args.row])
@@ -96,11 +103,10 @@ def recover(args):
         raise RecoveryError("physical disk reserve would be crossed")
     ipfs = str(args.ipfs_bin)
     env = dict(os.environ, IPFS_PATH=str(args.ipfs_path.resolve()))
-    stat = run(ipfs, env, "repo", "stat", timeout=30)
-    repo_path = next((line.split(":", 1)[1].strip() for line in stat.splitlines()
-                      if line.startswith("RepoPath:")), None)
-    if repo_path is None or Path(repo_path).resolve() != args.ipfs_path.resolve():
-        raise RecoveryError("Kubo daemon uses a different repository")
+    # repo stat walks the growing Jacob datastore and can exceed its timeout
+    # while concurrent CAR imports are active. The selected repository's
+    # configured peer ID must match the daemon reached through its API file.
+    verify_daemon_identity(ipfs, env)
     root = receipt["recovery_root"]
     try:
         root_pin = run(ipfs, env, "pin", "ls", "--type=recursive", root, timeout=60).strip()

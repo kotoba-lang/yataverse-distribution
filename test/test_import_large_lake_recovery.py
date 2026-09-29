@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 source = Path(__file__).resolve().parents[1] / "deploy" / "import_large_lake_recovery.py"
@@ -20,6 +21,14 @@ ROOT = "bafybeic4uk6d2ose5wyadez6df4vtfnj7ypghxgrrwo5f2eddashia4gma"
 
 
 class LargeRecoveryTests(unittest.TestCase):
+    def test_daemon_identity_must_match_selected_repository(self):
+        with patch.object(module, "run", side_effect=["peer-a\n", "peer-a\n"]) as run:
+            module.verify_daemon_identity("ipfs", {"IPFS_PATH": "/repo"})
+            self.assertEqual(run.call_count, 2)
+        with patch.object(module, "run", side_effect=["peer-a\n", "peer-b\n"]):
+            with self.assertRaisesRegex(module.RecoveryError, "different repository identity"):
+                module.verify_daemon_identity("ipfs", {"IPFS_PATH": "/repo"})
+
     def fixture(self, directory):
         folder = Path(directory)
         inventory = folder / "inventory.jsonl"
