@@ -447,14 +447,26 @@ and the disk reserve settings to that machine. An interval change does not
 establish full inventory custody; use `audit_lake.py` and leaf readback to
 measure that separately.
 
+`deploy/main2-lake-car-jacob-tail.plist` runs a second CAR lane from row
+318410 through the final row 821532. The start is the exact checkpoint of
+Jacob's native tail job after that job was disabled and booted out; all 93
+native tail receipts cover rows 300000–318409 without a gap. This lane uses a
+separate state directory and log files, so its checkpoint and lock cannot
+interfere with the first CAR lane. The two CAR row ranges are disjoint. Keep
+the native tail job disabled while this CAR lane owns rows 318410–821532.
+The declared tail inventory has no block over 8 MB or raw sidecar exception.
+The source exporter still verifies each block's size and CID, and Jacob
+receipts and recursive pins must be audited before claiming coverage.
+
 `deploy/mirror_lake_bitswap.py` is a Jacob-local path for a disjoint dated
 inventory range. It requires an explicit public IPv4 libp2p peer route to
 Xavier, downloads bounded blocks through Jacob's Kubo daemon, checks every
 block's inventory size and CID digest, and recursively pins one batch root
 before checkpointing. Its native receipts are included in the receipt audit;
 a later offline leaf readback remains necessary. The installed
-`deploy/jacob-lake-native-bitswap.plist` targets rows 300000–821532, away from
-the main-2 CAR shipper's current prefix. The state directory retains its
+`deploy/jacob-lake-native-bitswap.plist` was configured for rows
+300000–821532, but is disabled at checkpoint 318410 for the tail CAR handoff.
+The state directory retains its
 initial `native-300000-400000` name so existing receipts and checkpoint remain
 valid. The public peer check establishes a
 usable independent route; it does not prove which Bitswap peer supplied every
@@ -462,8 +474,9 @@ block, router failover, full inventory custody, or Filecoin storage.
 `deploy/jacob-lake-native-prefix.plist` is the fallback Jacob-local job for
 rows 100000–299999, using four workers and 100-block batches every two
 minutes when enabled. The audit plist includes its existing receipt directory.
-The main-2 CAR shipper covers rows before 300000, including oversized and raw
-sidecar exceptions in the early range. Neither scheduled job is a full-lake
+The first main-2 CAR shipper covers rows before 300000, including oversized
+and raw sidecar exceptions in the early range. The tail CAR lane begins after
+the completed native interval; neither scheduled job is a full-lake
 custody receipt.
 
 On 2026-09-26 the first three actual rows exported from Xavier :8443 and gad
