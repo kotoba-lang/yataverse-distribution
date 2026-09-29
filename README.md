@@ -316,6 +316,22 @@ is expected during transfer and is reported as `status: partial` with exit 0.
 The report remains a lower bound: it verifies current roots and receipts,
 not every leaf's bytes. Read individual blocks back for content checks.
 
+`deploy/verify_lake_leaves.py` closes that measurement gap incrementally. It
+validates the dated inventory, Jacob's repository identity, and the loopback
+RPC address before reading each block with `offline=true`. It checks each
+block's size and sha2-256 CID digest, then atomically checkpoints the verified
+prefix and a rolling scan hash. A missing block stops the default scan at that
+row so the next run can continue after replication reaches it; corrupted bytes
+refuse without advancing. `--scan-gaps` is for a diagnostic pass that counts
+missing rows, and requires a fresh pass after transfer completes.
+
+Jacob runs `deploy/jacob-lake-leaf-readback.plist` every five minutes against
+the dedicated HDD repo. The first live canary read 203 consecutive rows and
+49,902,505 bytes with zero missing rows. This is a point-in-time byte check,
+not a pin or Filecoin custody claim. Full inventory verification requires the
+readback cursor to reach all 821,533 rows with zero missing rows **and** a
+separate current root and receipt audit.
+
 `deploy/export_lake_car.cljk` writes one bounded range of the dated inventory
 to CARv1 with `io-ipld-car`'s streaming writer. It checks the complete
 inventory SHA-256 and row count, downloads original blocks through one node's
