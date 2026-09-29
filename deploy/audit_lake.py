@@ -100,7 +100,7 @@ def verify_repo(ipfs_bin, ipfs_path):
 
 
 def audit_receipts(inventory, car_dir, large_dir, ipfs_path, recursive, direct,
-                   raw_store, root_reader):
+                   raw_store, root_reader, native_dir=None):
     """Count CID-bound rows whose current durable roots still match receipts.
 
     This deliberately excludes unreceipted indirect pins and does not read
@@ -108,8 +108,8 @@ def audit_receipts(inventory, car_dir, large_dir, ipfs_path, recursive, direct,
     """
     count = len(inventory.offsets)
     covered = bytearray(count)
-    car_rows = large_rows = direct_rows = raw_rows = 0
-    unpinned_car_roots = unpinned_large_roots = 0
+    car_rows = native_rows = large_rows = direct_rows = raw_rows = 0
+    unpinned_car_roots = unpinned_native_roots = unpinned_large_roots = 0
     repository = str(Path(ipfs_path).resolve())
     for path in sorted(Path(car_dir).glob("row-*-import.json")):
         match = re.fullmatch(r"row-(\d+)-(\d+)-import\.json", path.name)
@@ -143,6 +143,39 @@ def audit_receipts(inventory, car_dir, large_dir, ipfs_path, recursive, direct,
         for row in range(start, end):
             covered[row] = 1
         car_rows += len(rows)
+    if native_dir is not None:
+        for path in sorted(Path(native_dir).glob("row-*-native.json")):
+            match = re.fullmatch(r"row-(\d+)-(\d+)-native\.json", path.name)
+            if not match:
+                raise AuditError("invalid native receipt name")
+            start, last = map(int, match.groups())
+            end = last + 1
+            if not 0 <= start < end <= count or end - start > 1000:
+                raise AuditError("native receipt range is invalid")
+            rows, actual_end = inventory.rows(start, end - start)
+            record = json.loads(path.read_text())
+            root = record.get("root")
+            if (actual_end != end or record.get("status") != "complete" or
+                    record.get("inventory_sha256") != inventory.sha256 or
+                    record.get("start_row") != start or record.get("end_row") != end or
+                    record.get("blocks") != len(rows) or
+                    record.get("bytes") != sum(row["size"] for row in rows) or
+                    record.get("repository") != repository or
+                    not isinstance(root, str) or not CID.fullmatch(root) or
+                    not isinstance(record.get("source_peer"), str) or
+                    not record["source_peer"]):
+                raise AuditError("native receipt differs from inventory: " + path.name)
+            if root not in recursive:
+                unpinned_native_roots += 1
+                continue
+            expected = {"schema": 1, "inventory-sha256": inventory.sha256,
+                        "start-row": start, "end-row": end,
+                        "links": [{"/": row["cid"]} for row in rows]}
+            if root_reader(root) != expected:
+                raise AuditError("pinned native root differs from inventory: " + root)
+            for row in range(start, end):
+                covered[row] = 1
+            native_rows += len(rows)
     for path in sorted(Path(large_dir).glob("row-*-jacob-import.json")):
         match = re.fullmatch(r"row-(\d+)-jacob-import\.json", path.name)
         if not match:
@@ -198,9 +231,11 @@ def audit_receipts(inventory, car_dir, large_dir, ipfs_path, recursive, direct,
             "covered_rows": rows, "covered_bytes": byte_count,
             "missing_rows": count - rows,
             "missing_bytes": inventory.total_bytes - byte_count,
-            "car_root_rows": car_rows, "large_receipt_rows": large_rows,
+            "car_root_rows": car_rows, "native_root_rows": native_rows,
+            "large_receipt_rows": large_rows,
             "direct_pin_rows": direct_rows, "raw_rows": raw_rows,
             "unpinned_car_roots": unpinned_car_roots,
+            "unpinned_native_roots": unpinned_native_roots,
             "unpinned_large_roots": unpinned_large_roots,
             "missing_sample": missing, "inventory_sha256": inventory.sha256,
             "scope": "receipt-and-current-root-pin-lower-bound-not-leaf-readback"}
@@ -264,16 +299,19 @@ def main():
     parser.add_argument("--raw-block-store", type=Path)
     parser.add_argument("--car-receipts", type=Path)
     parser.add_argument("--large-receipts", type=Path)
+    parser.add_argument("--native-receipts", type=Path)
     parser.add_argument("--ipfs-path", type=Path)
     parser.add_argument("--require-complete", action="store_true")
     args = parser.parse_args()
     try:
         raw = RawBlockStore(args.raw_block_store) if args.raw_block_store else None
-        if args.car_receipts or args.large_receipts or args.ipfs_path:
+        if args.car_receipts or args.large_receipts or args.native_receipts or args.ipfs_path:
             if not all((args.car_receipts, args.large_receipts, args.ipfs_path)):
                 raise AuditError("receipt audit requires both directories and Kubo repository")
             if not args.car_receipts.is_dir() or not args.large_receipts.is_dir():
                 raise AuditError("receipt directory is absent")
+            if args.native_receipts and not args.native_receipts.is_dir():
+                raise AuditError("native receipt directory is absent")
             os.environ["IPFS_PATH"] = str(args.ipfs_path.resolve())
             verify_repo(args.ipfs_bin, args.ipfs_path)
             inventory = Inventory(args.inventory, args.sha256, args.count)
@@ -281,7 +319,7 @@ def main():
                 inventory, args.car_receipts, args.large_receipts, args.ipfs_path,
                 pins_of_type(args.ipfs_bin, "recursive"),
                 pins_of_type(args.ipfs_bin, "direct"), raw,
-                lambda root: receipt_root(args.ipfs_bin, root))
+                lambda root: receipt_root(args.ipfs_bin, root), args.native_receipts)
         else:
             report = audit_inventory(args.inventory, args.sha256, args.count,
                                      durable_pins(args.ipfs_bin), raw)
