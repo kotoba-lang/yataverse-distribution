@@ -429,9 +429,14 @@ for the dated inventory and Jacob's dedicated HDD repository. Its 10-second
 interval replaces the earlier 30-second interval; launchd keeps one instance
 of the same job active at a time, and `ship_lake_car.py` takes an exclusive
 state lock. The checkpoint advances only after Jacob writes an import receipt.
-The installed `--stop-row 100000` confines this lane to the early inventory
-prefix. The final batch is shortened to end exactly there, and a checkpoint
-past the stop row refuses instead of silently claiming completion.
+The installed `--stop-row 300000` lets this lane continue from the early
+inventory into rows 100000–299999 after the first 100000 rows are complete.
+That middle range contains 200000 rows, 17541495955 bytes, and no blocks over
+8 MB or raw sidecar exceptions in the declared inventory. The final batch is
+shortened to end exactly at row 300000, and a checkpoint past the stop row
+refuses instead of silently claiming completion. Keep the Jacob native middle
+job disabled while the CAR lane owns that range; preserve its earlier receipts
+for the coverage audit.
 The LaunchAgent reads an installed copy of `ship_lake_car.py` and its dated
 raw-CID manifest from `~/.local/share/yataverse-car-jacob/bin/`; install
 those exact files before loading the plist. The state directory and existing
@@ -454,11 +459,12 @@ initial `native-300000-400000` name so existing receipts and checkpoint remain
 valid. The public peer check establishes a
 usable independent route; it does not prove which Bitswap peer supplied every
 block, router failover, full inventory custody, or Filecoin storage.
-`deploy/jacob-lake-native-prefix.plist` adds a slower second Jacob-local job
-for rows 100000–299999, using four workers and 100-block batches every two
-minutes. The audit plist includes both receipt directories. The main-2 CAR
-shipper covers rows before 100000, including oversized and raw
-sidecar exceptions. Neither scheduled job is a full-lake custody receipt.
+`deploy/jacob-lake-native-prefix.plist` is the fallback Jacob-local job for
+rows 100000–299999, using four workers and 100-block batches every two
+minutes when enabled. The audit plist includes its existing receipt directory.
+The main-2 CAR shipper covers rows before 300000, including oversized and raw
+sidecar exceptions in the early range. Neither scheduled job is a full-lake
+custody receipt.
 
 On 2026-09-26 the first three actual rows exported from Xavier :8443 and gad
 :8444 to byte-identical 786,733-byte CARs, SHA-256
