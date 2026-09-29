@@ -73,6 +73,27 @@ class CaptureLakeInventoryTests(unittest.TestCase):
                     capture.capture(args)
             self.assertEqual(0, json.loads(args.state.read_text())["rows"])
 
+    def test_cutoff_skips_newer_key_without_losing_cursor_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.setup_paths(directory)
+            args.cutoff_utc = "2026-09-28T00:00:00Z"
+            earlier = "Sun Sep 27 2026 00:00:00 GMT+0000 (Coordinated Universal Time)"
+            later = "Tue Sep 29 2026 00:00:00 GMT+0000 (Coordinated Universal Time)"
+            page1 = {"blocks": [{"cid": CID_A, "size": 3, "uploaded": earlier},
+                                {"cid": CID_B, "size": 4, "uploaded": later}],
+                     "cursor": "next", "truncated?": True}
+            page2 = {"blocks": [{"cid": CID_C, "size": 5, "uploaded": earlier}],
+                     "cursor": None, "truncated?": False}
+            with patch.object(capture, "fetch_listing", return_value=page1):
+                capture.capture(args)
+            state = json.loads(args.state.read_text())
+            self.assertEqual(CID_A, state["last_cid"])
+            self.assertEqual(CID_B, state["last_seen_cid"])
+            with patch.object(capture, "fetch_listing", return_value=page2):
+                self.assertEqual("complete", capture.capture(args)["status"])
+            self.assertEqual([CID_A, CID_C],
+                             [json.loads(line)["cid"] for line in args.output.read_text().splitlines()])
+
 
 if __name__ == "__main__":
     unittest.main()

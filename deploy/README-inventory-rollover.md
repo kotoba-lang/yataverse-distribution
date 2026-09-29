@@ -21,6 +21,13 @@ require the same row count, total bytes, and SHA-256 before a rollover. If
 they differ, retain both candidates and repeat after the writer settles.
 Even matching walks establish a bounded stable observation, not an atomic
 write cutover or proof that the canonical writer is independent of R2.
+For an actively written bucket, pass the same past
+`--cutoff-utc YYYY-MM-DDTHH:MM:SSZ` to both walks. Each page still advances across every
+CID, but the candidate contains only blocks whose R2 upload timestamp is no
+later than the cutoff. The checkpoint tracks the last seen CID separately
+from the last included CID so a newer key cannot make resume repeat or skip a
+page. A writer that backdates or rewrites objects still requires separate
+investigation; this is a bounded listing fence, not a database transaction.
 
 After both complete captures have the same digest, derive the new-CID-only
 inventory for a separate CAR lane. `diff_lake_inventory.py` rechecks both

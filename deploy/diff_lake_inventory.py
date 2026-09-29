@@ -72,6 +72,8 @@ def delta(args):
     for key in ("sha256", "rows", "bytes", "size"):
         if state_a[key] != state_b[key]:
             raise DeltaError("two complete walks differ: " + key)
+    if state_a.get("cutoff_utc") != state_b.get("cutoff_utc"):
+        raise DeltaError("two complete walks use different cutoffs")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     receipt.parent.mkdir(parents=True, exist_ok=True)
@@ -110,6 +112,7 @@ def delta(args):
                 new_count != old_count + delta_count or new_bytes != old_bytes + delta_bytes):
             raise DeltaError("candidate counts differ from completion receipt")
         record = {"schema": 1, "status": "complete", "old_sha256": old_sha,
+                  "cutoff_utc": state_a.get("cutoff_utc"),
                   "candidate_sha256": state_a["sha256"], "candidate_rows": new_count,
                   "candidate_bytes": new_bytes, "old_rows": old_count,
                   "old_bytes": old_bytes, "delta_rows": delta_count,
