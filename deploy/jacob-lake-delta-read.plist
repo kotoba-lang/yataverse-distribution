@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/junkawasaki</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>cloud.kotoba.jacob.lake-delta-read</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/python3</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/bin/serve_lake.py</string>
+		<string>--inventory</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/inventory/inventory-delta-fence-20260929.jsonl</string>
+		<string>--sha256</string>
+		<string>899e7e26087e98a9c6859db4cd697753f26745e5ac46dc3f3a071a05c585e7d1</string>
+		<string>--count</string>
+		<string>977</string>
+		<string>--ipfs-bin</string>
+		<string>/opt/homebrew/bin/ipfs</string>
+		<string>--ipfs-path</string>
+		<string>/Volumes/251220/kotoba-ipfs/repo</string>
+		<string>--host</string>
+		<string>127.0.0.1</string>
+		<string>--port</string>
+		<string>18093</string>
+		<string>--max-block-bytes</string>
+		<string>256000000</string>
+		<string>--car-receipts</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/delta-fence-20260929</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-delta-read.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-delta-read.out.log</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob</string>
+</dict>
+</plist>

@@ -59,6 +59,11 @@ uses a separate checkpoint directory and the operator-local R2 bootstrap
 bridge, whose allowlist is expanded only after two complete candidate walks
 agree. The existing full-inventory reader on port 8090 and its timer retain
 the 2026-09-26 identity until a separate full-snapshot rollover is verified.
+After the Jacob delta CAR and oversized recovery receipts pass a complete
+local audit, `jacob-lake-delta-read.plist` serves the same fenced delta from
+Jacob's 18 TiB HDD on loopback port 18093. Its separate label and port leave
+the dated full reader on port 18092 untouched. Check `/health`, one small CID,
+and one oversized original CID through the new reader before exposing it.
 
 `replicate_lake.py` normally refuses a checkpoint whose inventory digest differs
 from `--inventory-sha256`. A newer lake snapshot can put new CIDs before the
