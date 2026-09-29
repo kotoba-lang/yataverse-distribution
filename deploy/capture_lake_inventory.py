@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 import uuid
 
 from replicate_lake import ReplicationError, fetch_listing
@@ -117,6 +118,17 @@ def require_superset(old_path, new_path, old_sha256):
     return old_rows
 
 
+def fetch_page(api_url, cursor):
+    """Retry transport failures at the same cursor; never retry malformed data."""
+    for attempt in range(6):
+        try:
+            return fetch_listing(api_url, cursor)
+        except ReplicationError as exc:
+            if not str(exc).startswith("curl failed (") or attempt == 5:
+                raise
+            time.sleep(min(2 ** attempt, 16))
+
+
 def capture(args):
     cutoff = parse_cutoff(getattr(args, "cutoff_utc", None))
     output = args.output.resolve()
@@ -181,7 +193,7 @@ def capture(args):
 
     pages = 0
     while args.max_pages is None or pages < args.max_pages:
-        listing = fetch_listing(args.api_url, state["cursor"])
+        listing = fetch_page(args.api_url, state["cursor"])
         cursor = listing["cursor"]
         if listing["truncated?"] and cursor == state["cursor"]:
             raise CaptureError("listing cursor did not advance")
