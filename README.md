@@ -288,7 +288,8 @@ python3 deploy/audit_lake.py \
 ```
 
 For a CAR-fed node, supply both import receipt directories and `--ipfs-path`.
-This mode checks the current recursive roots, reads every receipted CAR root
+Add `--native-receipts` when the node also runs the public-peer native mirror.
+This mode checks the current recursive roots, reads every receipted CAR or native root
 offline to compare its exact inventory links, checks direct pins and verified
 raw sidecars, and reports a lower bound on retained rows. It avoids Kubo's
 costly complete indirect-pin listing. `--require-complete` still fails while
@@ -302,6 +303,7 @@ python3 deploy/audit_lake.py \
   --sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
   --count 821533 --ipfs-bin /path/to/ipfs --ipfs-path /path/to/kubo-repo \
   --car-receipts /path/to/lake-state --large-receipts /path/to/recovery \
+  --native-receipts /path/to/native-state \
   --raw-block-store /path/to/raw-blocks --require-complete
 ```
 
@@ -431,6 +433,17 @@ Before installing it on another Mac, adjust all absolute paths, the SSH hosts,
 and the disk reserve settings to that machine. An interval change does not
 establish full inventory custody; use `audit_lake.py` and leaf readback to
 measure that separately.
+
+`deploy/mirror_lake_bitswap.py` is a Jacob-local path for a disjoint dated
+inventory range. It requires an explicit public IPv4 libp2p peer route to
+Xavier, downloads bounded blocks through Jacob's Kubo daemon, checks every
+block's inventory size and CID digest, and recursively pins one batch root
+before checkpointing. Its native receipts are included in the receipt audit;
+a later offline leaf readback remains necessary. The installed
+`deploy/jacob-lake-native-bitswap.plist` targets rows 300000–399999, away from
+the main-2 CAR shipper's current prefix. The public peer check establishes a
+usable independent route; it does not prove which Bitswap peer supplied every
+block, router failover, full inventory custody, or Filecoin storage.
 
 On 2026-09-26 the first three actual rows exported from Xavier :8443 and gad
 :8444 to byte-identical 786,733-byte CARs, SHA-256
