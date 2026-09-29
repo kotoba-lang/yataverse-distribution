@@ -64,6 +64,9 @@ local audit, `jacob-lake-delta-read.plist` serves the same fenced delta from
 Jacob's 18 TiB HDD on loopback port 18093. Its separate label and port leave
 the dated full reader on port 18092 untouched. Check `/health`, one small CID,
 and one oversized original CID through the new reader before exposing it.
+The Jacob delta CAR receipts and oversized recovery receipts use separate
+directories for auditing. `row-<n>-jacob-import.json` also matches the broad
+`row-*-import.json` file glob, so mixing them makes the CAR reader fail closed.
 
 `replicate_lake.py` normally refuses a checkpoint whose inventory digest differs
 from `--inventory-sha256`. A newer lake snapshot can put new CIDs before the
