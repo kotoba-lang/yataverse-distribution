@@ -201,6 +201,11 @@ class ServingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             inventory = self.inventory(directory)
             inventory.sizes[CID_A] = serve.LARGE_BLOCK_THRESHOLD + 1
+            with self.assertRaisesRegex(serve.InventoryError, "large client timeout"):
+                serve.handler_for(inventory, SimpleNamespace(read=lambda _cid: b"abc"),
+                                  large_client_timeout=119)
+            serve.handler_for(inventory, SimpleNamespace(read=lambda _cid: b"abc"),
+                              large_client_timeout=1200)
             entered = threading.Event()
             release = threading.Event()
             first = {}
