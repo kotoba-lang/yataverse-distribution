@@ -51,6 +51,22 @@ def verified_root(output, expected):
         raise ImportError("Kubo batch root differs from inventory links")
 
 
+def verify_repo(binary, repo_path):
+    """Match the selected repository to its running daemon without a block walk."""
+    repo = repo_path.resolve()
+    try:
+        expected = json.loads((repo / "config").read_text())["Identity"]["PeerID"]
+        api_address = (repo / "api").read_text().strip()
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ImportError("Kubo repository identity is unavailable") from exc
+    if not isinstance(expected, str) or not expected or not api_address:
+        raise ImportError("Kubo repository identity is invalid")
+    env = dict(os.environ, IPFS_PATH=str(repo))
+    if kubo(binary, env, "id", "-f", "<id>", timeout=10).strip() != expected:
+        raise ImportError("Kubo daemon uses a different repository")
+    return env
+
+
 def import_batch(args):
     if not SHA256.fullmatch(args.sha256) or not SHA256.fullmatch(args.car_sha256):
         raise ImportError("invalid SHA-256 argument")
@@ -69,12 +85,7 @@ def import_batch(args):
         raise ImportError("CAR SHA-256 differs from export receipt")
     if shutil.disk_usage(args.ipfs_path).free - 2 * car_size < args.min_free_bytes:
         raise ImportError("physical disk reserve would be crossed")
-    env = dict(os.environ, IPFS_PATH=str(args.ipfs_path.resolve()))
-    repo = kubo(str(args.ipfs_bin), env, "repo", "stat", timeout=30)
-    repo_path = next((line.split(":", 1)[1].strip() for line in repo.splitlines()
-                      if line.startswith("RepoPath:")), None)
-    if repo_path is None or Path(repo_path).resolve() != args.ipfs_path.resolve():
-        raise ImportError("Kubo daemon uses a different repository")
+    env = verify_repo(str(args.ipfs_bin), args.ipfs_path)
 
     # Kubo's CAR roots use CIDv1. The dated inventory contains CIDv0 aliases,
     # so pin the original inventory links under one durable root instead.
