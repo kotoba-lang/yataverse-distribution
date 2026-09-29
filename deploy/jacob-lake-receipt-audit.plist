@@ -24,6 +24,8 @@
     <string>/Volumes/251220/kotoba-ipfs/recovery</string>
     <string>--native-receipts</string>
     <string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/native-300000-400000</string>
+    <string>--native-receipts</string>
+    <string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/native-100000-300000</string>
     <string>--raw-block-store</string>
     <string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/raw-blocks</string>
   </array>

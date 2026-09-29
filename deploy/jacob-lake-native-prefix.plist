@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>cloud.kotoba.jacob.lake-native-prefix</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/python3</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/bin/mirror_lake_bitswap.py</string>
+		<string>--inventory</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/inventory/inventory-20260926.jsonl</string>
+		<string>--sha256</string>
+		<string>f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188</string>
+		<string>--count</string>
+		<string>821533</string>
+		<string>--start-row</string>
+		<string>100000</string>
+		<string>--end-row</string>
+		<string>300000</string>
+		<string>--max-blocks</string>
+		<string>100</string>
+		<string>--max-bytes</string>
+		<string>100000000</string>
+		<string>--workers</string>
+		<string>4</string>
+		<string>--source-peer</string>
+		<string>/ip4/220.146.170.114/tcp/23407/p2p/12D3KooWH5CfezpDdMtYttLLMeib526f7f8QKCC6jCgiHDme4XSV</string>
+		<string>--ipfs-bin</string>
+		<string>/opt/homebrew/bin/ipfs</string>
+		<string>--ipfs-path</string>
+		<string>/Volumes/251220/kotoba-ipfs/repo</string>
+		<string>--state-dir</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/native-100000-300000</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>120</integer>
+	<key>StandardOutPath</key>
+	<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/logs/native-prefix.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/logs/native-prefix.stderr.log</string>
+</dict>
+</plist>

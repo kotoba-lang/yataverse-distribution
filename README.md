@@ -288,7 +288,7 @@ python3 deploy/audit_lake.py \
 ```
 
 For a CAR-fed node, supply both import receipt directories and `--ipfs-path`.
-Add `--native-receipts` when the node also runs the public-peer native mirror.
+Add one `--native-receipts` per state directory when the node also runs public-peer native mirrors.
 This mode checks the current recursive roots, reads every receipted CAR or native root
 offline to compare its exact inventory links, checks direct pins and verified
 raw sidecars, and reports a lower bound on retained rows. It avoids Kubo's
@@ -446,6 +446,11 @@ initial `native-300000-400000` name so existing receipts and checkpoint remain
 valid. The public peer check establishes a
 usable independent route; it does not prove which Bitswap peer supplied every
 block, router failover, full inventory custody, or Filecoin storage.
+`deploy/jacob-lake-native-prefix.plist` adds a slower second Jacob-local job
+for rows 100000–299999, using four workers and 100-block batches every two
+minutes. The audit plist includes both receipt directories. The main-2 CAR
+shipper continues to cover the earlier prefix, including oversized and raw
+sidecar exceptions. Neither scheduled job is a full-lake custody receipt.
 
 On 2026-09-26 the first three actual rows exported from Xavier :8443 and gad
 :8444 to byte-identical 786,733-byte CARs, SHA-256
