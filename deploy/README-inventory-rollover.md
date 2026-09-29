@@ -53,6 +53,13 @@ The old dated CAR jobs keep their original inventory and checkpoints while
 the delta is copied; changing their inventory in place would shift row
 positions underneath live cursors.
 
+For the 2026-09-29 fenced delta, `xavier-lake-delta-read.service` serves the
+977-row, SHA-256-pinned delta on Xavier loopback port 8091. Its replication
+uses a separate checkpoint directory and the operator-local R2 bootstrap
+bridge, whose allowlist is expanded only after two complete candidate walks
+agree. The existing full-inventory reader on port 8090 and its timer retain
+the 2026-09-26 identity until a separate full-snapshot rollover is verified.
+
 `replicate_lake.py` normally refuses a checkpoint whose inventory digest differs
 from `--inventory-sha256`. A newer lake snapshot can put new CIDs before the
 current numeric cursor, so changing the digest without rewinding would skip
