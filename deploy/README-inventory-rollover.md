@@ -22,6 +22,30 @@ they differ, retain both candidates and repeat after the writer settles.
 Even matching walks establish a bounded stable observation, not an atomic
 write cutover or proof that the canonical writer is independent of R2.
 
+After both complete captures have the same digest, derive the new-CID-only
+inventory for a separate CAR lane. `diff_lake_inventory.py` rechecks both
+completion receipts and file hashes, requires every old CID and size, and
+publishes a compact delta plus a receipt with block count, bytes, digest, and
+oversized-row count:
+
+```sh
+python3 deploy/diff_lake_inventory.py \
+  --old-inventory /path/to/inventory-20260926.jsonl \
+  --old-sha256 f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188 \
+  --candidate-a /path/to/inventory-candidate-a.jsonl \
+  --candidate-a-state /path/to/inventory-candidate-a.state.json \
+  --candidate-b /path/to/inventory-candidate-b.jsonl \
+  --candidate-b-state /path/to/inventory-candidate-b.state.json \
+  --output /path/to/inventory-delta.jsonl \
+  --receipt /path/to/inventory-delta.receipt.json
+```
+
+Do not start a delta CAR shipper until its source Kubo node actually has the
+new CIDs and any oversized rows have a separately verified recovery path.
+The old dated CAR jobs keep their original inventory and checkpoints while
+the delta is copied; changing their inventory in place would shift row
+positions underneath live cursors.
+
 `replicate_lake.py` normally refuses a checkpoint whose inventory digest differs
 from `--inventory-sha256`. A newer lake snapshot can put new CIDs before the
 current numeric cursor, so changing the digest without rewinding would skip
