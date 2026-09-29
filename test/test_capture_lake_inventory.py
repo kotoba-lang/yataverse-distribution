@@ -94,6 +94,26 @@ class CaptureLakeInventoryTests(unittest.TestCase):
             self.assertEqual([CID_A, CID_C],
                              [json.loads(line)["cid"] for line in args.output.read_text().splitlines()])
 
+    def test_transport_reset_retries_same_cursor(self):
+        page = {"blocks": [{"cid": CID_A, "size": 3}],
+                "cursor": "next", "truncated?": True}
+        error = capture.ReplicationError("curl failed (35): connection reset")
+        with patch.object(capture, "fetch_listing", side_effect=[error, page]) as fetch:
+            with patch.object(capture.time, "sleep") as sleep:
+                self.assertIs(page, capture.fetch_page("https://example.invalid", "saved"))
+        self.assertEqual(2, fetch.call_count)
+        self.assertEqual(["saved", "saved"], [call.args[1] for call in fetch.call_args_list])
+        sleep.assert_called_once_with(1)
+
+    def test_invalid_listing_is_not_retried(self):
+        error = capture.ReplicationError("lake listing contains an invalid CID")
+        with patch.object(capture, "fetch_listing", side_effect=error) as fetch:
+            with patch.object(capture.time, "sleep") as sleep:
+                with self.assertRaises(capture.ReplicationError):
+                    capture.fetch_page("https://example.invalid", "saved")
+        fetch.assert_called_once()
+        sleep.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
