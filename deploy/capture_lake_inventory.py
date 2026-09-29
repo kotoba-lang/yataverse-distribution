@@ -8,6 +8,7 @@ with a candidate by merely changing this script's output path.
 """
 
 import argparse
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -21,6 +22,25 @@ from replicate_lake import ReplicationError, fetch_listing
 
 class CaptureError(Exception):
     pass
+
+
+def parse_cutoff(value):
+    if value is None:
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise CaptureError("cutoff must be a UTC timestamp ending in Z") from exc
+    if parsed > datetime.now(timezone.utc):
+        raise CaptureError("cutoff must not be in the future")
+    return parsed
+
+
+def uploaded_utc(value):
+    try:
+        return datetime.strptime(value, "%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError) as exc:
+        raise CaptureError("listing uploaded time is not the expected UTC form") from exc
 
 
 def atomic_json(path, value):
@@ -98,6 +118,7 @@ def require_superset(old_path, new_path, old_sha256):
 
 
 def capture(args):
+    cutoff = parse_cutoff(getattr(args, "cutoff_utc", None))
     output = args.output.resolve()
     partial = output.with_name(output.name + ".partial")
     state_path = args.state.resolve()
@@ -112,6 +133,7 @@ def capture(args):
         state = json.loads(state_path.read_text())
         if (state.get("schema") != 1 or state.get("api_url") != args.api_url or
                 state.get("output") != str(output) or state.get("old_sha256") != old_sha or
+                state.get("cutoff_utc") != getattr(args, "cutoff_utc", None) or
                 state.get("size") != output.stat().st_size or
                 state.get("sha256") != digest_file(output)):
             raise CaptureError("completed output differs from checkpoint")
@@ -130,6 +152,7 @@ def capture(args):
         state = json.loads(state_path.read_text())
         if (state.get("schema") != 1 or state.get("api_url") != args.api_url or
                 state.get("output") != str(output) or state.get("old_sha256") != old_sha or
+                state.get("cutoff_utc") != getattr(args, "cutoff_utc", None) or
                 state.get("status") != "in-progress"):
             raise CaptureError("checkpoint identity differs")
         if not partial.is_file():
@@ -140,13 +163,17 @@ def capture(args):
         partial.parent.mkdir(parents=True, exist_ok=True)
         partial.touch(exist_ok=False)
         state = {"schema": 1, "api_url": args.api_url, "output": str(output),
+                 "cutoff_utc": getattr(args, "cutoff_utc", None),
                  "old_sha256": old_sha, "status": "in-progress", "cursor": None,
-                 "pages": 0, "size": 0, "rows": 0, "bytes": 0, "last_cid": "",
+                 "pages": 0, "size": 0, "rows": 0, "bytes": 0,
+                 "last_cid": "", "last_seen_cid": "",
                  "sha256": hashlib.sha256(b"").hexdigest()}
         atomic_json(state_path, state)
     scanned = scan_partial(partial, state["size"])
     if any(scanned[key] != state[key] for key in ("sha256", "rows", "bytes", "last_cid")):
         raise CaptureError("partial inventory differs from checkpoint")
+    if state.get("last_seen_cid", state["last_cid"]) < state["last_cid"]:
+        raise CaptureError("checkpoint seen CID precedes stored CID")
     running_digest = hashlib.sha256()
     with partial.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
@@ -158,7 +185,8 @@ def capture(args):
         cursor = listing["cursor"]
         if listing["truncated?"] and cursor == state["cursor"]:
             raise CaptureError("listing cursor did not advance")
-        previous = state["last_cid"]
+        previous = state.get("last_seen_cid", state["last_cid"])
+        last_included = state["last_cid"]
         lines = []
         page_bytes = 0
         for block in listing["blocks"]:
@@ -166,6 +194,9 @@ def capture(args):
             if cid <= previous:
                 raise CaptureError("listing order repeated or moved backward")
             previous = cid
+            if cutoff is not None and uploaded_utc(block.get("uploaded")) > cutoff:
+                continue
+            last_included = cid
             page_bytes += size
             lines.append(json.dumps({"cid": cid, "bytes": size}, separators=(",", ":")) + "\n")
         payload = "".join(lines).encode()
@@ -179,7 +210,8 @@ def capture(args):
                  "size": state["size"] + len(payload),
                  "rows": state["rows"] + len(lines),
                  "bytes": state["bytes"] + page_bytes,
-                 "last_cid": previous, "sha256": running_digest.hexdigest()}
+                 "last_cid": last_included, "last_seen_cid": previous,
+                 "sha256": running_digest.hexdigest()}
         atomic_json(state_path, state)
         pages += 1
         if not listing["truncated?"]:
@@ -206,6 +238,7 @@ def main():
     parser.add_argument("--state", required=True, type=Path)
     parser.add_argument("--old-inventory", required=True, type=Path)
     parser.add_argument("--old-sha256", required=True)
+    parser.add_argument("--cutoff-utc", help="Include only blocks uploaded by YYYY-MM-DDTHH:MM:SSZ")
     parser.add_argument("--max-pages", type=int)
     args = parser.parse_args()
     if args.max_pages is not None and args.max_pages < 1:
