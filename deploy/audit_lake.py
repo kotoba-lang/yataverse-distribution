@@ -72,17 +72,30 @@ def receipt_root(ipfs_bin, root):
 
 
 def verify_repo(ipfs_bin, ipfs_path):
+    """Check the selected repository's live daemon without walking its blocks.
+
+    `repo stat` enumerates the entire 18 TiB repository and can exceed the
+    audit's 30-second guard while the daemon is healthy. The repository's API
+    file selects its daemon; compare that daemon's ID with the configured ID.
+    """
+    repo = Path(ipfs_path).resolve()
     try:
-        result = subprocess.run([ipfs_bin, "repo", "stat"], capture_output=True,
-                                timeout=30, check=False, env=os.environ.copy())
+        expected = json.loads((repo / "config").read_text())["Identity"]["PeerID"]
+        api_address = (repo / "api").read_text().strip()
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise AuditError("Kubo repository identity is unavailable") from exc
+    if not isinstance(expected, str) or not expected or not api_address:
+        raise AuditError("Kubo repository identity is invalid")
+    env = os.environ.copy()
+    env["IPFS_PATH"] = str(repo)
+    try:
+        result = subprocess.run([ipfs_bin, "id", "-f", "<id>"], capture_output=True,
+                                timeout=10, check=False, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise AuditError("Kubo repository check failed") from exc
     if result.returncode:
         raise AuditError("Kubo repository is unavailable")
-    path = next((line.split(":", 1)[1].strip()
-                 for line in result.stdout.decode("utf-8", "replace").splitlines()
-                 if line.startswith("RepoPath:")), None)
-    if path is None or Path(path).resolve() != Path(ipfs_path).resolve():
+    if result.stdout.decode("utf-8", "replace").strip() != expected:
         raise AuditError("Kubo daemon uses a different repository")
 
 
