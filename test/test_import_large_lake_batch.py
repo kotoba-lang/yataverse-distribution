@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 source = Path(__file__).resolve().parents[1] / "deploy" / "import_large_lake_batch.py"
@@ -18,6 +19,16 @@ CID = "bafkreia25gfj7zq7tvyky74u6groieu4hsufrnucop4klxopa6lej5vute"
 
 
 class LargeBatchTests(unittest.TestCase):
+    def test_saved_original_requires_a_direct_pin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(module.subprocess, "run", return_value=SimpleNamespace(
+                    returncode=0, stdout=CID + " direct\n")) as run:
+                self.assertTrue(module.pinned(Path("/bin/ipfs"), Path(directory), CID))
+                self.assertEqual(run.call_args.args[0][2:4], ["ls", "--type=direct"])
+            with patch.object(module.subprocess, "run", return_value=SimpleNamespace(
+                    returncode=0, stdout=CID + " recursive\n")):
+                self.assertFalse(module.pinned(Path("/bin/ipfs"), Path(directory), CID))
+
     def fixture(self, directory):
         folder = Path(directory)
         inventory = folder / "inventory.jsonl"
