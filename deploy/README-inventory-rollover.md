@@ -67,6 +67,9 @@ and one oversized original CID through the new reader before exposing it.
 The Jacob delta CAR receipts and oversized recovery receipts use separate
 directories for auditing. `row-<n>-jacob-import.json` also matches the broad
 `row-*-import.json` file glob, so mixing them makes the CAR reader fail closed.
+The Jacob delta reader allows a 1200-second client transfer for one oversized
+block over Tor; the default remains 120 seconds on other readers. This only
+extends the socket transfer window after Kubo has returned CID-checked bytes.
 
 `replicate_lake.py` normally refuses a checkpoint whose inventory digest differs
 from `--inventory-sha256`. A newer lake snapshot can put new CIDs before the

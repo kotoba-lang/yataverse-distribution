@@ -31,6 +31,8 @@
 		<string>18093</string>
 		<string>--max-block-bytes</string>
 		<string>256000000</string>
+		<string>--large-client-timeout</string>
+		<string>1200</string>
 		<string>--car-receipts</string>
 		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/delta-fence-20260929/car-receipts</string>
 	</array>

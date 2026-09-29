@@ -203,9 +203,12 @@ class LocalBlocks:
         return block.stdout
 
 
-def handler_for(inventory, blocks, max_concurrent_requests=8):
+def handler_for(inventory, blocks, max_concurrent_requests=8,
+                large_client_timeout=120):
     if not 1 <= max_concurrent_requests <= 64:
         raise InventoryError("concurrent request limit must be within 1..64")
+    if not 120 <= large_client_timeout <= 1800:
+        raise InventoryError("large client timeout must be within 120..1800 seconds")
     request_slots = threading.BoundedSemaphore(max_concurrent_requests)
     large_block_slot = threading.BoundedSemaphore(1)
 
@@ -240,7 +243,7 @@ def handler_for(inventory, blocks, max_concurrent_requests=8):
                             self.send_error(503, "large block reader busy")
                             return
                         large_block_acquired = True
-                        self.connection.settimeout(120)
+                        self.connection.settimeout(large_client_timeout)
                     payload = blocks.read(cid)
                     content_type = "application/octet-stream"
                 else:
@@ -275,6 +278,7 @@ def main():
     parser.add_argument("--car-receipts", type=Path)
     parser.add_argument("--max-block-bytes", type=int, default=LARGE_BLOCK_THRESHOLD)
     parser.add_argument("--max-concurrent-requests", type=int, default=8)
+    parser.add_argument("--large-client-timeout", type=int, default=120)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
     args = parser.parse_args()
@@ -286,7 +290,8 @@ def main():
                          args.max_block_bytes, raw_store=raw_store,
                          car_receipts=car_receipts)
     ThreadingHTTPServer((args.host, args.port),
-                        handler_for(inventory, blocks, args.max_concurrent_requests)).serve_forever()
+                        handler_for(inventory, blocks, args.max_concurrent_requests,
+                                    args.large_client_timeout)).serve_forever()
 
 
 if __name__ == "__main__":
