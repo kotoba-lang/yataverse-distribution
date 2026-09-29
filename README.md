@@ -429,6 +429,9 @@ for the dated inventory and Jacob's dedicated HDD repository. Its 10-second
 interval replaces the earlier 30-second interval; launchd keeps one instance
 of the same job active at a time, and `ship_lake_car.py` takes an exclusive
 state lock. The checkpoint advances only after Jacob writes an import receipt.
+The installed `--stop-row 100000` confines this lane to the early inventory
+prefix. The final batch is shortened to end exactly there, and a checkpoint
+past the stop row refuses instead of silently claiming completion.
 Before installing it on another Mac, adjust all absolute paths, the SSH hosts,
 and the disk reserve settings to that machine. An interval change does not
 establish full inventory custody; use `audit_lake.py` and leaf readback to
@@ -449,7 +452,7 @@ block, router failover, full inventory custody, or Filecoin storage.
 `deploy/jacob-lake-native-prefix.plist` adds a slower second Jacob-local job
 for rows 100000–299999, using four workers and 100-block batches every two
 minutes. The audit plist includes both receipt directories. The main-2 CAR
-shipper continues to cover the earlier prefix, including oversized and raw
+shipper covers rows before 100000, including oversized and raw
 sidecar exceptions. Neither scheduled job is a full-lake custody receipt.
 
 On 2026-09-26 the first three actual rows exported from Xavier :8443 and gad
