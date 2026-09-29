@@ -96,13 +96,16 @@ class ServingTests(unittest.TestCase):
             with patch.object(serve.subprocess, "run", side_effect=[direct, body]) as invoke, \
                     patch.object(serve, "verify_cid"):
                 self.assertEqual(b"abc", blocks.read(CID_A))
+            self.assertIn("--type=direct", invoke.call_args_list[0].args[0])
             self.assertIn("--offline", invoke.call_args_list[1].args[0])
+            missing = SimpleNamespace(returncode=1, stdout=b"")
             indirect = SimpleNamespace(returncode=0, stdout=(CID_A + " indirect through " + CID_B + "\n").encode())
-            with patch.object(serve.subprocess, "run", side_effect=[indirect, body]), \
+            with patch.object(serve.subprocess, "run", side_effect=[missing, indirect, body]) as invoke, \
                     patch.object(serve, "verify_cid"):
                 self.assertEqual(b"abc", blocks.read(CID_A))
+            self.assertIn("--type=all", invoke.call_args_list[1].args[0])
             malformed = SimpleNamespace(returncode=0, stdout=(CID_A + " indirect\n").encode())
-            with patch.object(serve.subprocess, "run", return_value=malformed):
+            with patch.object(serve.subprocess, "run", side_effect=[missing, malformed]):
                 with self.assertRaisesRegex(serve.InventoryError, "not durably pinned"):
                     blocks.read(CID_A)
             with patch.object(serve.subprocess, "run", side_effect=[direct, SimpleNamespace(returncode=0, stdout=b"ab")]):
