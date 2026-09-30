@@ -1,0 +1,95 @@
+(ns yataverse.distribution.filecoin-archive
+  "Pure rules for archiving lake CARs to the Filecoin tier (filecoin-cas).
+
+  A CAR exported by deploy/export_lake_car.cljk is archived as one opaque
+  object keyed by the raw CIDv1 of its bytes. The exporter already reports the
+  CAR's sha-256, so the CID follows from that digest with no second read of a
+  file that can be half a gigabyte. Nothing here does I/O; the CLI is
+  deploy/filecoin_archive.cljk. Dependency-free on purpose: the CLI must run
+  under a plain `kbb --backend sci`, whose generated nbb.edn carries no
+  multiformats. kbb/nbb only (it uses js/parseInt).")
+
+(def sha256-pattern #"[0-9a-f]{64}")
+(def cid-pattern #"baf[a-z2-7]{20,200}")
+
+(defn sha256-hex? [s] (boolean (and (string? s) (re-matches sha256-pattern s))))
+(defn cid? [s] (boolean (and (string? s) (re-matches cid-pattern s))))
+
+(defn- hex->ints [hex]
+  (mapv #(js/parseInt (subs hex % (+ % 2)) 16) (range 0 (count hex) 2)))
+
+(def ^:private base32-alphabet "abcdefghijklmnopqrstuvwxyz234567")
+
+(defn- base32
+  "RFC 4648 base32, lower case, no padding, over a seq of ints 0..255."
+  [bytes]
+  (loop [bs (seq bytes) buffer 0 bits 0 out []]
+    (cond
+      (>= bits 5) (let [shift (- bits 5)]
+                    (recur bs (bit-and buffer (dec (bit-shift-left 1 shift))) shift
+                           (conj out (nth base32-alphabet (bit-shift-right buffer shift)))))
+      bs (recur (next bs) (bit-or (bit-shift-left buffer 8) (first bs)) (+ bits 8) out)
+      (pos? bits) (apply str (conj out (nth base32-alphabet (bit-shift-left buffer (- 5 bits)))))
+      :else (apply str out))))
+
+(defn car-cid
+  "Raw CIDv1 whose multihash is the sha-256 in `sha256-hex`: the same string
+  filecoin-cas computes when it verifies the uploaded bytes. Layout: version 1,
+  raw codec 0x55, multihash sha2-256 (0x12) of length 0x20, then the digest,
+  base32 with the multibase prefix `b`."
+  [sha256-hex]
+  (when-not (sha256-hex? sha256-hex)
+    (throw (ex-info "filecoin-archive: invalid sha256" {:reason :invalid-sha256})))
+  (str "b" (base32 (into [0x01 0x55 0x12 0x20] (hex->ints sha256-hex)))))
+
+(defn endpoint!
+  "https, or plain http on loopback only; no trailing slash. Throws otherwise:
+  CARs are not sent over an untrusted plaintext link."
+  [url]
+  (let [u (.replace (str url) #"/+$" "")]
+    (when-not (or (re-matches #"https://[A-Za-z0-9.-]+(:[0-9]{1,5})?" u)
+                  (re-matches #"http://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]{1,5})?" u))
+      (throw (ex-info "filecoin-archive: endpoint must be https or loopback http"
+                      {:reason :insecure-endpoint})))
+    u))
+
+(defn receipt-name
+  "Receipt file for an inventory range. The suffix differs from the importer's
+  row-<start>-<end>-import.json so serve_lake's receipt scan never sees it."
+  [start-row end-row]
+  (when-not (and (integer? start-row) (integer? end-row) (<= 0 start-row) (< start-row end-row))
+    (throw (ex-info "filecoin-archive: invalid row range" {:reason :invalid-range})))
+  (str "row-" start-row "-" end-row "-filecoin.json"))
+
+(defn parse-status
+  "State from filecoin-cas's /status EDN: {:state :queued|:stored :piece-cid s
+  :attempts n :error s}, all optional. Unparseable input yields {}."
+  [text]
+  (let [s (str text)
+        kw (fn [k] (some-> (re-find (re-pattern (str k " :([a-z-]+)")) s) second keyword))
+        str-of (fn [k] (some-> (re-find (re-pattern (str k " \"([^\"]*)\"")) s) second))
+        n (some-> (re-find #":attempts (\d+)" s) second js/parseInt)]
+    (cond-> {}
+      (kw ":state") (assoc :state (kw ":state"))
+      (str-of ":piece-cid") (assoc :piece-cid (str-of ":piece-cid"))
+      (some? n) (assoc :attempts n)
+      (str-of ":error") (assoc :error (str-of ":error")))))
+
+(defn receipt
+  "Archive receipt as a plain map (serialized as JSON by the CLI)."
+  [{:keys [car-cid sha256 bytes start-row end-row inventory-sha256 status
+           piece-cid archived-at]}]
+  (cond-> {:status status
+           :car-cid car-cid
+           :sha256 sha256
+           :bytes bytes
+           :start-row start-row
+           :end-row end-row
+           :archived-at archived-at}
+    inventory-sha256 (assoc :inventory-sha256 inventory-sha256)
+    piece-cid (assoc :piece-cid piece-cid)))
+
+(defn admissible-put-status?
+  "filecoin-cas answers a PUT 202 (queued) or 200 (already stored)."
+  [status]
+  (contains? #{200 202} status))

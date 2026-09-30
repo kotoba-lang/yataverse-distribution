@@ -1,0 +1,60 @@
+(ns yataverse.distribution.filecoin-archive-test
+  (:require ["node:crypto" :as crypto]
+            [kotoba.test :refer [deftest is testing]]
+            [multiformats.core :as mf]
+            [yataverse.distribution.filecoin-archive :as fa]))
+
+(defn- install-host-sha256! []
+  (when (= :portable (mf/sha256-provider))
+    (mf/install-sha256!
+      (fn [b] (js/Uint8Array. (.digest (.update (.createHash crypto "sha256") b)))))))
+
+(deftest car-cid-matches-the-cid-of-the-bytes
+  (install-host-sha256!)
+  (let [data (js/Uint8Array.from (clj->js (range 256)))
+        hex (.digest (.update (.createHash crypto "sha256") data) "hex")]
+    (is (= (mf/cidv1-raw data) (fa/car-cid hex))
+        "deriving from the exporter's sha256 equals hashing the bytes")))
+
+(deftest car-cid-rejects-malformed-digests
+  (doseq [bad [nil "" "abc" (apply str (repeat 63 "a")) (apply str (repeat 64 "G"))
+               (apply str (repeat 64 "A"))]]
+    (is (= :invalid-sha256
+           (try (fa/car-cid bad) (catch :default e (:reason (ex-data e)))))
+        (str "refused: " (pr-str bad)))))
+
+(deftest endpoint-is-https-or-loopback
+  (is (= "http://127.0.0.1:8788" (fa/endpoint! "http://127.0.0.1:8788/")))
+  (is (= "https://cas.example.org" (fa/endpoint! "https://cas.example.org/")))
+  (doseq [bad ["http://cas.example.org" "http://127.0.0.1.evil.example" "ftp://127.0.0.1" ""]]
+    (is (= :insecure-endpoint
+           (try (fa/endpoint! bad) (catch :default e (:reason (ex-data e)))))
+        (str "refused: " (pr-str bad)))))
+
+(deftest receipt-name-is-invisible-to-the-import-receipt-scan
+  (is (= "row-0-200-filecoin.json" (fa/receipt-name 0 200)))
+  (is (not (re-matches #"row-([0-9]+)-([0-9]+)-import\.json" (fa/receipt-name 0 200))))
+  (doseq [[a b] [[-1 5] [5 5] [6 5] [0.5 3]]]
+    (is (= :invalid-range
+           (try (fa/receipt-name a b) (catch :default e (:reason (ex-data e))))))))
+
+(deftest parse-status-reads-the-fields-that-matter
+  (is (= {:state :stored :piece-cid "bafkzcibabc" :attempts 0}
+         (fa/parse-status "{:cid \"bafkrei\", :state :stored, :piece-cid \"bafkzcibabc\", :attempts 0}")))
+  (is (= {:state :queued :attempts 2 :error "sp down"}
+         (fa/parse-status "{:state :queued, :attempts 2, :error \"sp down\"}")))
+  (is (= {} (fa/parse-status nil)))
+  (is (= {} (fa/parse-status "<html>502</html>"))))
+
+(deftest receipt-carries-optional-fields-only-when-present
+  (let [base {:status "queued" :car-cid "bafkrei" :sha256 "ab" :bytes 10
+              :start-row 0 :end-row 200 :archived-at "2026-09-29T00:00:00Z"}]
+    (is (= base (fa/receipt base)))
+    (is (= "bafkzcib" (:piece-cid (fa/receipt (assoc base :piece-cid "bafkzcib")))))
+    (is (= "ff" (:inventory-sha256 (fa/receipt (assoc base :inventory-sha256 "ff")))))))
+
+(deftest only-200-and-202-count-as-accepted
+  (is (fa/admissible-put-status? 200))
+  (is (fa/admissible-put-status? 202))
+  (doseq [s [0 400 401 413 422 500 502]]
+    (is (not (fa/admissible-put-status? s)))))

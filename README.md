@@ -644,6 +644,52 @@ not automatic failover or proof that every lake block is replicated.
 The document is a dated, read-only snapshot; changing the canonical
 `yataverse.com` origin and updating snapshots remain separate work.
 
+## Filecoin cold archive of lake CARs
+
+`deploy/filecoin_archive.cljk` archives a CAR that `deploy/export_lake_car.cljk`
+produced to the `filecoin-cas` service (`kotoba-lang/filecoin-cas`), and
+restores it. The service owns the Synapse SDK and the wallet key; this repo
+only speaks HTTP to it (https, or plain http on loopback).
+
+```sh
+# archive: --sha256 is the digest export_lake_car printed
+kbb --backend sci deploy/filecoin_archive.cljk archive \
+  --car row-0-200.car --sha256 <hex> --start-row 0 --end-row 200 \
+  --url http://127.0.0.1:8788 --receipt-dir <dir> [--token-file <f>] [--wait-seconds 600]
+
+# restore, later or on another node; then feed the file to import_lake_car.py
+kbb --backend sci deploy/filecoin_archive.cljk restore \
+  --car-cid <cid> --sha256 <hex> --output row-0-200.car --url http://127.0.0.1:8788
+```
+
+- The CAR is one opaque object keyed by the raw CIDv1 of its bytes, derived from
+  the exporter's sha-256 (`filecoin-archive/car-cid`), so a half-gigabyte file is
+  not hashed twice by the CLI. The file is checked against `--sha256` first and
+  streamed by curl, never held in memory here.
+- `archive` first claims `<receipt-dir>/row-S-E-filecoin.json` with a complete
+  `pending` receipt (temp file, fsync, then an exclusive hard link), uploads, and
+  replaces it with the outcome, `queued` or `stored` as the tier reports it with
+  its piece CID. The name is chosen so `serve_lake`'s `row-*-import.json` receipt
+  scan never sees it. A range cannot silently change CAR: two archives racing for
+  one range cannot both claim it (the loser is refused with `receipt-conflict`),
+  and re-archiving the same CAR is idempotent and never downgrades a `stored`
+  receipt. A run that fails after claiming leaves the `pending` receipt; the same
+  CAR can retry, a different one is refused until the receipt is dealt with.
+- `restore` verifies the sha-256, fsyncs the file, then publishes it with a hard
+  link, so it never replaces an existing file and leaves no `.partial` behind on
+  failure.
+- Start the service with `FILECOIN_CAS_MAX_OBJECT` above the largest CAR: the
+  exporter allows 512 MiB of block bytes plus CAR framing, and the service default
+  is exactly 512 MiB. Use a `filecoin-cas` with streaming (0bc2817 or later): before
+  it the service held each object in memory several times over and a 256 MiB CAR
+  peaked at 4.2 GiB.
+- Tests: `kbb -M:test` (pure rules). With `YATAVERSE_FILECOIN_E2E=memory` or
+  `calibration` the suite also drives the CLI against a real `filecoin-cas`
+  process in `../filecoin-cas`.
+
+This is a cold copy, not a custody claim: nothing here audits Filecoin storage
+proofs or performs provider retrieval on a schedule.
+
 ## Honest state (what this repo does NOT do yet)
 
 - The murakumo overlay adapter (QUIC delivery of gossip forwards and
@@ -652,3 +698,8 @@ The document is a dated, read-only snapshot; changing the canonical
   the plan — replication today is declared, not continuously audited.
 - Zone coordinates for geo ranking come from the caller; no zone→latlng
   registry is authoritative yet.
+- The Filecoin archive was verified against the Filecoin calibration testnet with
+  CARs of 64, 256 and 520 MiB (sha-256 identical after each round trip; the service
+  peaked at 370, 470 and 731 MiB RSS), and its e2e test runs on calibration with a
+  2 MiB CAR and on the in-memory network. It has not run on mainnet, and it is not
+  wired into the shipping or replication timers.
