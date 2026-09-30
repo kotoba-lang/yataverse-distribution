@@ -100,6 +100,16 @@
               (is (.existsSync fs (p "receipts" "row-0-200-filecoin.json")) "receipt written")
               (is (zero? (:code (archive))) "archiving the same CAR again is idempotent")
 
+              ;; Re-archive WITHOUT --wait-seconds: the tier already holds it, so the
+              ;; receipt must stay "stored" with its piece CID, not fall back to "queued".
+              (let [again (cli "archive" "--car" car "--sha256" sha "--start-row" "0"
+                               "--end-row" "200" "--url" url "--token-file" token-file
+                               "--receipt-dir" receipts)
+                    r (when (zero? (:code again)) (json (:out again)))]
+                (is (zero? (:code again)) (str "re-archive: " (:err again)))
+                (is (= "stored" (:status r)) "an existing stored receipt is never downgraded")
+                (is (= (:piece-cid rec) (:piece-cid r)) "and keeps its piece CID"))
+
               (let [bad (cli "archive" "--car" car "--sha256" (apply str (repeat 64 "0"))
                              "--start-row" "200" "--end-row" "400" "--url" url
                              "--receipt-dir" receipts)]
@@ -120,6 +130,26 @@
                                       "--end-row" "600" "--url" url "--token-file" bad-token
                                       "--receipt-dir" receipts)))
                   "a wrong token is refused")
+
+              ;; The failed run had already claimed its range with a complete "pending"
+              ;; receipt: the same CAR may retry, a different CAR may not take the range.
+              (let [claim-file (p "receipts" "row-400-600-filecoin.json")
+                    claim (when (.existsSync fs claim-file) (json (.readFileSync fs claim-file "utf8")))]
+                (is (= "pending" (:status claim)) "a failed archive leaves a pending claim")
+                (is (= cid (:car-cid claim)))
+                (let [retry (cli "archive" "--car" car "--sha256" sha "--start-row" "400"
+                                 "--end-row" "600" "--url" url "--token-file" token-file
+                                 "--receipt-dir" receipts)]
+                  (is (zero? (:code retry)) (str "retry of the same CAR: " (:err retry)))
+                  (is (contains? #{"queued" "stored"} (:status (json (.readFileSync fs claim-file "utf8"))))
+                      "the claim is replaced by the real outcome"))
+                (let [other (p "rival.car")
+                      odata (js/Buffer.from (.randomBytes crypto 2048))
+                      r (do (.writeFileSync fs other odata)
+                            (cli "archive" "--car" other "--sha256" (sha-of odata)
+                                 "--start-row" "400" "--end-row" "600" "--url" url
+                                 "--token-file" token-file "--receipt-dir" receipts))]
+                  (is (re-find #"receipt-conflict" (:err r)) "a rival CAR cannot take a claimed range")))
               (is (re-find #"insecure-endpoint"
                            (:err (cli "archive" "--car" car "--sha256" sha "--start-row" "0"
                                       "--end-row" "200" "--url" "http://cas.example.org"

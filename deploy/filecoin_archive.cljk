@@ -11,8 +11,11 @@
 
   `archive` takes the sha-256 that deploy/export_lake_car.cljk printed, checks the
   file against it, derives the CAR's raw CIDv1, and uploads the file (streamed by
-  curl, never held in memory here). It writes <receipt-dir>/row-S-E-filecoin.json;
-  with --wait-seconds it waits for the tier to report the object :stored.
+  curl, never held in memory here). It first claims <receipt-dir>/row-S-E-filecoin.json
+  (a complete `pending` receipt, published exclusively, so a range cannot be taken by
+  two different CARs), uploads, then replaces it with the outcome: `queued` or
+  `stored` as the tier reports, never downgrading a receipt that was already
+  `stored`. With --wait-seconds it waits for the tier to report :stored.
   `restore` downloads the object, verifies sha-256, and publishes the file without
   replacing an existing one. Feeding it to deploy/import_lake_car.py is a separate,
   deliberate step. The tier must run with FILECOIN_CAS_MAX_OBJECT above the CAR size."
@@ -98,11 +101,46 @@
   (let [fd (.openSync fs dir "r")]
     (try (.fsyncSync fs fd) (finally (.closeSync fs fd)))))
 
-(defn- write-json-atomic! [file value]
+(defn- fsync-file!
+  "Flush a file's data (not just its directory entry) to stable storage."
+  [file]
+  (let [fd (.openSync fs file "r+")]
+    (try (.fsyncSync fs fd) (finally (.closeSync fs fd)))))
+
+(defn- write-json-tmp!
+  "Write `value` as JSON to a fresh temp file beside `file`, fsynced, and return
+  its path. Publishing it (rename or link) is the caller's choice."
+  [file value]
   (let [tmp (str file "." (.randomUUID crypto) ".partial")]
-    (.writeFileSync fs tmp (str (.stringify js/JSON (clj->js value)) "\n") #js {:flag "wx" :mode 0600})
+    (.writeFileSync fs tmp (str (.stringify js/JSON (clj->js value)) "\n")
+                    #js {:flag "wx" :mode 0600})
+    (fsync-file! tmp)
+    tmp))
+
+(defn- replace-json! [file value]
+  (let [tmp (write-json-tmp! file value)]
     (.renameSync fs tmp file)
     (fsync-dir! (.dirname nodepath file))))
+
+(defn- claim-json!
+  "Publish `value` at `file` only if nothing is there: temp file, fsync, then a
+  hard link, which fails when `file` exists. Returns true when this call
+  created it; false when the file already existed. The published file is
+  always complete."
+  [file value]
+  (let [tmp (write-json-tmp! file value)]
+    (try
+      (.linkSync fs tmp file)
+      (fsync-dir! (.dirname nodepath file))
+      true
+      (catch :default e
+        (if (= "EEXIST" (.-code e)) false (throw e)))
+      (finally (try (.unlinkSync fs tmp) (catch :default _ nil))))))
+
+(defn- read-receipt [file]
+  (try (js->clj (.parse js/JSON (.readFileSync fs file "utf8")) :keywordize-keys true)
+       (catch :default _
+         (refuse "receipt-unreadable" {:receipt file}))))
 
 (defn- wait-stored
   "Poll /status until :stored or `seconds` elapse. Returns the last parsed status."
@@ -139,27 +177,40 @@
           cid (fa/car-cid sha)]
       (when-not (= sha actual) (refuse "car-sha256-mismatch" {:actual actual}))
       (when (zero? size) (refuse "empty-car" {}))
-      (when (.existsSync fs receipt-file)
-        (let [prior (js->clj (.parse js/JSON (.readFileSync fs receipt-file "utf8"))
-                             :keywordize-keys true)]
-          (when-not (= cid (:car-cid prior))
-            (refuse "receipt-conflict" {:existing (:car-cid prior)}))))
-      (let [put (curl! {:method "PUT" :url (str base "/obj/" cid) :token-file token-file
-                        :in-file car :max-time 3600})]
-        (when-not (fa/admissible-put-status? (:status put))
-          (refuse "tier-rejected" {:status (:status put) :error (:error put)}))
-        (let [st (if (pos? wait-s)
-                   (wait-stored base token-file cid wait-s)
-                   {})
-              status (if (= :stored (:state st)) "stored" "queued")
-              rec (fa/receipt {:status status :car-cid cid :sha256 sha :bytes size
+      ;; Claim the range before uploading anything. The claim is a complete
+      ;; receipt published atomically and exclusively, so two archives for one
+      ;; range cannot both pass this check: whoever loses reads the winner's CID.
+      (let [claim (fa/receipt {:status "pending" :car-cid cid :sha256 sha :bytes size
                                :start-row start :end-row end
                                :inventory-sha256 (get m "--inventory-sha256")
-                               :piece-cid (:piece-cid st)
-                               :archived-at (.toISOString (js/Date.))})]
-          (when (.existsSync fs receipt-file) (.unlinkSync fs receipt-file))
-          (write-json-atomic! receipt-file rec)
-          (println (.stringify js/JSON (clj->js (assoc rec :receipt receipt-file)))))))))
+                               :archived-at (.toISOString (js/Date.))})
+            claimed? (claim-json! receipt-file claim)
+            prior (when-not claimed? (read-receipt receipt-file))]
+        (when (and prior (not= cid (:car-cid prior)))
+          (refuse "receipt-conflict" {:existing (:car-cid prior)}))
+        (let [put (curl! {:method "PUT" :url (str base "/obj/" cid) :token-file token-file
+                          :in-file car :max-time 3600})]
+          (when-not (fa/admissible-put-status? (:status put))
+            (refuse "tier-rejected" {:status (:status put) :error (:error put)}))
+          ;; What the tier says now, not what we guess: a 200 means it already
+          ;; held the object, and the piece CID is only in /status.
+          (let [status-of (fn []
+                            (let [r (curl! {:method "GET" :url (str base "/status/" cid)
+                                            :token-file token-file})]
+                              (if (= 200 (:status r)) (fa/parse-status (:body r)) {})))
+                st (let [st0 (status-of)]
+                     (if (and (pos? wait-s) (not= :stored (:state st0)))
+                       (wait-stored base token-file cid wait-s)
+                       st0))
+                stored? (or (= :stored (:state st)) (= "stored" (:status prior)))
+                rec (fa/receipt {:status (if stored? "stored" "queued")
+                                 :car-cid cid :sha256 sha :bytes size
+                                 :start-row start :end-row end
+                                 :inventory-sha256 (get m "--inventory-sha256")
+                                 :piece-cid (or (:piece-cid st) (:piece-cid prior))
+                                 :archived-at (.toISOString (js/Date.))})]
+            (replace-json! receipt-file rec)
+            (println (.stringify js/JSON (clj->js (assoc rec :receipt receipt-file))))))))))
 
 (defn restore! [args]
   (let [m (-> (parse-opts args #{"--car-cid" "--sha256" "--output" "--url" "--token-file"})
@@ -181,6 +232,8 @@
             (refuse "tier-unavailable" {:status (:status r) :error (:error r)}))
           (let [{actual :sha256 size :bytes} (sha256-file temp)]
             (when-not (= sha actual) (refuse "restored-sha256-mismatch" {:actual actual}))
+            ;; Reading the file for the hash does not make its data durable.
+            (fsync-file! temp)
             ;; A hard link publishes without replacing a concurrent output.
             (.linkSync fs temp output)
             (.unlinkSync fs temp)

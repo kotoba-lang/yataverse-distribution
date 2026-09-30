@@ -666,15 +666,23 @@ kbb --backend sci deploy/filecoin_archive.cljk restore \
   the exporter's sha-256 (`filecoin-archive/car-cid`), so a half-gigabyte file is
   not hashed twice by the CLI. The file is checked against `--sha256` first and
   streamed by curl, never held in memory here.
-- `archive` writes `<receipt-dir>/row-S-E-filecoin.json`. The name is chosen so
-  `serve_lake`'s `row-*-import.json` receipt scan never sees it. A range cannot
-  silently change CAR: re-archiving the same CAR is idempotent, a different one
-  is refused (`receipt-conflict`).
-- `restore` verifies the sha-256, then publishes with a hard link, so it never
-  replaces an existing file and leaves no `.partial` behind on failure.
+- `archive` first claims `<receipt-dir>/row-S-E-filecoin.json` with a complete
+  `pending` receipt (temp file, fsync, then an exclusive hard link), uploads, and
+  replaces it with the outcome, `queued` or `stored` as the tier reports it with
+  its piece CID. The name is chosen so `serve_lake`'s `row-*-import.json` receipt
+  scan never sees it. A range cannot silently change CAR: two archives racing for
+  one range cannot both claim it (the loser is refused with `receipt-conflict`),
+  and re-archiving the same CAR is idempotent and never downgrades a `stored`
+  receipt. A run that fails after claiming leaves the `pending` receipt; the same
+  CAR can retry, a different one is refused until the receipt is dealt with.
+- `restore` verifies the sha-256, fsyncs the file, then publishes it with a hard
+  link, so it never replaces an existing file and leaves no `.partial` behind on
+  failure.
 - Start the service with `FILECOIN_CAS_MAX_OBJECT` above the largest CAR: the
   exporter allows 512 MiB of block bytes plus CAR framing, and the service default
-  is exactly 512 MiB.
+  is exactly 512 MiB. Use a `filecoin-cas` with streaming (0bc2817 or later): before
+  it the service held each object in memory several times over and a 256 MiB CAR
+  peaked at 4.2 GiB.
 - Tests: `kbb -M:test` (pure rules). With `YATAVERSE_FILECOIN_E2E=memory` or
   `calibration` the suite also drives the CLI against a real `filecoin-cas`
   process in `../filecoin-cas`.
@@ -690,7 +698,8 @@ proofs or performs provider retrieval on a schedule.
   the plan — replication today is declared, not continuously audited.
 - Zone coordinates for geo ranking come from the caller; no zone→latlng
   registry is authoritative yet.
-- The Filecoin archive was verified against the Filecoin calibration testnet
-  with a 2 MiB CAR, and against the in-memory network with a 200 MiB CAR. It
-  has not run on mainnet, nor with a production-sized CAR on real Filecoin, and
-  it is not wired into the shipping or replication timers.
+- The Filecoin archive was verified against the Filecoin calibration testnet with
+  CARs of 64, 256 and 520 MiB (sha-256 identical after each round trip; the service
+  peaked at 370, 470 and 731 MiB RSS), and its e2e test runs on calibration with a
+  2 MiB CAR and on the in-memory network. It has not run on mainnet, and it is not
+  wired into the shipping or replication timers.
