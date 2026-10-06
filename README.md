@@ -728,6 +728,7 @@ proofs or performs provider retrieval on a schedule.
 |---|---|---|---|---|
 | 0 | `bafkreibefx2ys75aug5qa7rhrxz7hk5g27vpwdu5zr6xu4zb7ikw3urdvy` | `bafybeicgcsswotqjrts3awqegzark4fqygvtqa7k35aewqdp6xkaskndnu` (sha256 `f6169628…`) | 821,533 | 88,410,406,176 |
 | 1 | `bafkreid66nxu3aa5qmpfaxuylex6xm2ufftjvdk4bg72vrkmirmxr5x7by` (`prev` = seq 0) | `bafkreiejtz7cmcd6tcu4nbm5wtgws52t6jtulznmi3od6oqhdic4lbph2e` (the 977-row delta fence) | 977 | 1,482,355,570 |
+| 2 | `bafkreiaw7abt7odmintqolfto4uplb27lkt4ibac7z2qhsv7fdmhw6m4vy` (`prev` = seq 1) | `bafkreigvzf5xeka5e2ekayrziougranb2nwf4kskwjsn33cz456kdng6p4` (sha256 `d5c97b72…`, the delta at cutoff 2026-10-06T12:00Z) | 2,700 | 1,502,215,498 |
 
 **`deploy/lake_head.cljk`** runs from a score-witness release and has three commands:
 
@@ -871,3 +872,38 @@ On the real 977-row delta, `manifest` rebuilt the committed `epoch-1.json` byte 
 7. Run `lake_epoch.py manifest`, then `ipfs add` the manifest on both custodians; the CIDs must match.
 8. Run `lake_head.cljk submit <ledger> N <manifest-cid>`.
 9. Run `lake_head.cljk bundle`, then update the directory's `lake_log`. The xavier publisher publishes network-aware.
+
+## Epoch 2 (2026-10-07): the log catches up with the R2 listing
+
+**What was committed.** `deploy/lake-manifests/epoch-2.json` (`bafkreiaw7abt7odmintqolfto4uplb27lkt4ibac7z2qhsv7fdmhw6m4vy`) is the head of `yataverse/lake` at seq 2. `lake_head.cljk verify` reports VERIFIED by all 7 witnesses.
+
+**How the delta was made.** The sequence above for epoch N, run end to end:
+
+1. Two listing walks were taken at cutoff 2026-10-06T12:00:00Z. They matched: 825,210 rows, sha256 `6a379361…`.
+2. The diff against epoch 0, minus what epoch 1 already holds (`lake_epoch.py delta`), left 2,700 rows and 1,502,215,498 bytes.
+
+**Custody on two WANs.**
+
+- **xavier (220.146.170.114):** replicated, then a full leaf readback, 2,700 of 2,700.
+- **jacob (219.104.136.140):**
+  - CAR ship: 2,692 blocks.
+  - Large-block recovery lane: 8 blocks of 143 to 203 MB. Each was exported on xavier with `export_large_lake_block.py` against its loopback gateway, relayed with `scp -3`, and imported with `import_large_lake_recovery.py`.
+  - `audit_lake.py --require-complete`: complete, 2,700 rows, 0 missing.
+  - Full offline leaf readback: 2,700 of 2,700, each matching its CID digest.
+- The inventory, manifest and proof bundle (`bafkreiaiyrpq5um5rstqmgoqgfipo3wjxjeop4embm2hj3cepd3f4pjevm`) have the same CIDs on both custodians.
+
+**Result.** `lake_head.cljk resolve` against jacob's Kubo returned:
+
+- 3 epochs;
+- 825,210 rows and 91,394,977,244 bytes;
+- sha256 `58a7d64f…`.
+
+As a set, that is **equal to the R2 listing** at the cutoff: 0 rows only in the log, 0 only in the listing.
+
+**Reader.** jacob's `lake-log-read` (`deploy/jacob-lake-log-read.plist`, onion port 82) now serves all three epochs. `/health` reports `58a7d64f…` and 825,210 rows. Six small and two large epoch-2 blocks read back through it with matching digests.
+
+**Still open.**
+
+- Epochs are still cut by an operator.
+- The Cloudflare `/api/v1/lake/blocks` still lists R2.
+- Any block uploaded after the cutoff is outside the log until epoch 3.
