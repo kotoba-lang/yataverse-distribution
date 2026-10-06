@@ -334,6 +334,20 @@ not a pin or Filecoin custody claim. Full inventory verification requires the
 readback cursor to reach all 821,533 rows with zero missing rows **and** a
 separate current root and receipt audit.
 
+Both conditions held on 2026-10-06: the leaf readback reached cursor 821,533
+(88,410,406,176 bytes, zero missing, scan hash `e95a5747…9e77`) and the
+receipt audit reported zero missing rows over the same inventory.
+
+`serve_lake.py --native-receipts DIR` (repeatable) makes the reader accept the
+`row-*-native.json` receipts that `audit_lake.py` already counts as coverage.
+Without it, those rows fell through to `ipfs pin ls --type=all`, which walks
+every recursive pin; on Jacob's repo that took over 120 s against a 15 s
+budget, so the onion reader answered 503 for blocks the audit called held.
+`deploy/jacob-lake-read.plist` is the deployed unit (port 18092, both native
+receipt directories). After the change, onion-only probes from main-2
+(seeds 20261006 and 61006) read 90 of 90 sampled blocks, including six over
+2 MiB, with matching size and sha2-256 CID digest.
+
 `deploy/export_lake_car.cljk` writes one bounded range of the dated inventory
 to CARv1 with `io-ipld-car`'s streaming writer. It checks the complete
 inventory SHA-256 and row count, downloads original blocks through one node's
