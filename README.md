@@ -952,6 +952,8 @@ An immediate second run printed `UNCHANGED` for all four. Twelve unit tests cove
 
 **Schedule.** `deploy/main2-graph-head-mirror.plist` runs the mirror on main-2 every 10 minutes. main-2 holds the read-only R2 access, and its B2 remote can list `heads/yataverse/`.
 
+The plist uses `ProcessType` `Standard`. With `Background`, while main-2 was under heavy load (load average around 120), every `rclone cat` timed out after 300 s. The same reads take 2 s interactively. Under `Standard`, the first launchd run mirrored the active graph to seq 1 (R2 sequence 3552 → 3565), with `prev` set to the seq 0 document.
+
 **Not covered.**
 
 - Graphs whose head exists only in R2 and was never mirrored to B2 are not listed, because R2 cannot be listed without an API token. The legacy unprefixed `ipns/` heads, such as the production public-read graph, are out of scope.

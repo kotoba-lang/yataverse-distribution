@@ -12,7 +12,7 @@
 	<key>Label</key>
 	<string>cloud.yataverse.main2-graph-head-mirror</string>
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Standard</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/opt/homebrew/bin/python3</string>
