@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- jacob (WAN 219.104.136.140) as fallback custodian of four IPNS names whose
+     primary signer is xavier. Re-puts each current record; re-signs the SAME
+     value with sequence+1 only when it has under 48 h left. deploy/ipns_fallback.py. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>cloud.kotoba.jacob.ipns-fallback</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-directory/ipns_fallback.py</string>
+		<string>--ipfs-bin</string><string>/opt/homebrew/bin/ipfs</string>
+		<string>--ipfs-path</string><string>/Volumes/251220/kotoba-ipfs/repo</string>
+		<string>--name</string><string>k51qzi5uqu5dka7ydlst4i6fsavfb4g5t3fji95agn17yq5gw8yvm3rlh67n0q=kotoba-directory-v2</string>
+		<string>--name</string><string>k51qzi5uqu5dlrtqhevrfpyrdr2c1thxug3iqys76xxbi7bgzm16mjti2bwrf2=yataverse-apex</string>
+		<string>--name</string><string>k51qzi5uqu5dl3iz1hkh4bqvrea7l08obkohh45bn9pulqf5q5j5fuo4dk2pt6=isekai-static</string>
+		<string>--name</string><string>k51qzi5uqu5dgbd0a8zlo49u11rkmhksg465sgmzstwvz0bz4aswwix3j7yvns=itonami-static</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>21600</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/junkawasaki/.local/share/kotoba-directory/ipns-fallback.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/junkawasaki/.local/share/kotoba-directory/ipns-fallback.err.log</string>
+</dict>
+</plist>
