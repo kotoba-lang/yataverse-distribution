@@ -58,9 +58,16 @@ class Drill:
         self.daemon = subprocess.Popen([self.ipfs_bin, "daemon", "--enable-gc=false"],
                                        env={"IPFS_PATH": self.repo, "PATH": "/usr/bin:/bin"},
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Poll for the daemon's api file, not with `ipfs` itself. Before that file
+        # exists, every `ipfs` command opens the repo offline and briefly takes
+        # repo.lock. If the daemon starts during that moment, it exits 1. On
+        # 2026-10-07 two drills failed that way, as "connected 0/2 peers".
         # `ipfs id` answers without a daemon; `swarm peers` needs the online one.
+        api = os.path.join(self.repo, "api")
         for _ in range(90):
-            if self.ipfs("swarm", "peers").returncode == 0:
+            if self.daemon.poll() is not None:
+                return self.step("peer", False, f"daemon exited {self.daemon.returncode} before coming online")
+            if os.path.exists(api) and self.ipfs("swarm", "peers").returncode == 0:
                 break
             time.sleep(1)
         connected = [p for p in self.peers if self.ipfs("swarm", "connect", p, timeout=60).returncode == 0]
