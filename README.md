@@ -736,7 +736,7 @@ proofs or performs provider retrieval on a schedule.
 - **`submit <ledger> <seq> <cid>`** resubmits until the head is verified. On 2026-10-06 one submission was accepted and then never committed, so `submitted: true` is not treated as an outcome. If another CID already holds the seq, it refuses and names that CID.
 - **`resolve <ledger> --rpc=… --out=FILE`** verifies the head, walks `prev` back to epoch 0 through a local Kubo node, and checks each inventory against its manifest's sha256 and row count.
 
-Exit codes are 0, 1 (`REFUSE` with a reason) and 3 (`UNMEASURED`).
+Exit codes are 0, 1 (`REFUSE` with a reason) and 3 (`UNMEASURED`). `verify` also exits 4 (`ABSENT`) when a quorum of reachable witnesses hold no record for the ref. That is not proof of absence; it only tells a new ref to start at seq 0, and `submit` still refuses a conflicting holder. `--ref=yataverse/graph/<cid>` selects a graph-head mirror ref (below). Any other ref is refused.
 
 **Measured on 2026-10-06.**
 
@@ -907,3 +907,55 @@ As a set, that is **equal to the R2 listing** at the cutoff: 0 rows only in the 
 - Epochs are still cut by an operator.
 - The Cloudflare `/api/v1/lake/blocks` still lists R2.
 - Any block uploaded after the cutoff is outside the log until epoch 3.
+
+## Graph heads on inga (2026-10-07, ADR-2610062000 P4, shadow)
+
+**What it does.** `deploy/graph_head_mirror.py` mirrors each yataverse graph head into the inga ref `yataverse/graph/<graph>`. The source is R2's `heads/yataverse/ipns/<graph>.json`, a record signed by the namespace head signer.
+
+**Why the mirror keeps its own sequence.** The R2 record has no `prev`, so inga cannot be backfilled from seq 0 using R2 sequence numbers (ADR-2608048000). Instead, mirror seq N names the CID of a canonical JSON document:
+
+```
+{"schema":"yataverse-graph-head-mirror/v1","graph":…,"seq":N,"prev":<seq N-1 doc CID|null>,"head":<signed R2 record>}
+```
+
+The document carries the signed head, so anyone can check offline that the head signer produced that `(value, sequence)`. `prev` makes the history a chain of CIDs that does not depend on R2.
+
+**Each run, per graph:**
+
+1. Read the head from B2 (`rclone`) and from R2 (`wrangler r2 object get`, read-only). The two must be identical.
+2. Verify the Ed25519 signature over the canonical dag-cbor payload, and refuse a signer that is not pinned with `--signer`.
+3. Ask the witnesses for the ref's head (`lake_head.cljk verify --ref=…`).
+4. If the head is unchanged, print `UNCHANGED`.
+5. If the R2 sequence is lower, refuse it as a rollback.
+6. Otherwise write the next document, pin it on jacob and xavier (the CIDs must agree), and submit it. The submit resubmits until 5 of 7 witnesses prove it.
+
+Exit codes: 0, 1 (`REFUSE`) and 3 (`UNMEASURED`).
+
+**First run (2026-10-07).** All four graphs under `heads/yataverse/` were signed by `did:key:…LagvhtVuQp`, and B2 and R2 were identical. All four were mirrored at seq 0:
+
+| R2 sequence | mirror doc |
+|---|---|
+| 61 | `bafkreiasr45…` |
+| 362 | `bafkreihu4ir…` |
+| 0 | `bafkreibp4us…` |
+| 3552 | `bafkreieuzip…` |
+
+An immediate second run printed `UNCHANGED` for all four. Twelve unit tests cover:
+
+- an altered field;
+- an unpinned signer;
+- a head for another graph;
+- a rollback;
+- an unreadable or foreign previous document;
+- dag-cbor key order;
+- the raw CID.
+
+**Schedule.** `deploy/main2-graph-head-mirror.plist` runs the mirror on main-2 every 10 minutes. main-2 holds the read-only R2 access, and its B2 remote can list `heads/yataverse/`.
+
+The plist uses `ProcessType` `Standard`. With `Background`, while main-2 was under heavy load (load average around 120), every `rclone cat` timed out after 300 s. The same reads take 2 s interactively. Under `Standard`, the first launchd run mirrored the active graph to seq 1 (R2 sequence 3552 → 3565), with `prev` set to the seq 0 document.
+
+**Not covered.**
+
+- Graphs whose head exists only in R2 and was never mirrored to B2 are not listed, because R2 cannot be listed without an API token. The legacy unprefixed `ipns/` heads, such as the production public-read graph, are out of scope.
+- The mirror follows R2 at 10-minute resolution. An R2 head that moves several times between runs appears in inga as one step.
+- R2 is still the authority. Cutting over to inga is P5.

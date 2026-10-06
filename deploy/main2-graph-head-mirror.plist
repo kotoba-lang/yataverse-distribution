@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/junkawasaki</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>Label</key>
+	<string>cloud.yataverse.main2-graph-head-mirror</string>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/python3</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-graph-mirror/bin/graph_head_mirror.py</string>
+		<string>--graph</string>
+		<string>bafyreicdx5lzw5bqgxgek4gqtoh3tuivdjglmqax6tqjo734wpx3lfo3sq</string>
+		<string>--graph</string>
+		<string>bafyreidnpq2mwo6ood7xdvu2nztpz6azag233kateilpboddthp4ybpyh4</string>
+		<string>--graph</string>
+		<string>bafyreig6tog2dqujgwgmmzu2gycl2m4nhetgwsbp3thlxk6lteqj5bdjr4</string>
+		<string>--graph</string>
+		<string>bafyreiha3q2g6ghjzjtydkvsudnixlbpbf6dlw6b7etd2l3ch4mbruv54e</string>
+		<string>--source-cmd</string>
+		<string>/opt/homebrew/bin/rclone cat b2-master:kotobase-cf-wasm-production/heads/yataverse/ipns/{graph}.json</string>
+		<string>--check-cmd</string>
+		<string>/opt/homebrew/bin/wrangler r2 object get kotobase-graph-database-production/heads/yataverse/ipns/{graph}.json --remote --pipe</string>
+		<string>--signer</string>
+		<string>did:key:z6Mko2hmPxwvKwMPa5oj61JqXnQYSPjo5n6NhKLagvhtVuQp</string>
+		<string>--verifier</string>
+		<string>/opt/homebrew/bin/node /Users/junkawasaki/.local/share/isekai-score-v5/release/engine/cli.js --classpath /Users/junkawasaki/.local/share/isekai-score-v5/release/inga/src:/Users/junkawasaki/.local/share/isekai-score-v5/release/inga-node/src:/Users/junkawasaki/.local/share/isekai-score-v5/release/storage/src:/Users/junkawasaki/.local/share/isekai-score-v5/release/text/src:/Users/junkawasaki/.local/share/isekai-score-v5/release/edn/src:/Users/junkawasaki/.local/share/isekai-score-v5/release/bytes/src /Users/junkawasaki/.local/share/yataverse-graph-mirror/bin/lake_head.cljk</string>
+		<string>--ledger</string>
+		<string>/Users/junkawasaki/.local/share/isekai-score-v5/bin/score-witness-v5.edn</string>
+		<string>--pin-cmd</string>
+		<string>/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=15 xavier@xavier IPFS_PATH=/mnt/nvme/ipfs-xavier/repo /mnt/nvme/ipfs-xavier/bin/ipfs add -Q --cid-version=1 --raw-leaves</string>
+		<string>--pin-cmd</string>
+		<string>/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=15 junkawasaki@100.117.208.83 IPFS_PATH=/Volumes/251220/kotoba-ipfs/repo /opt/homebrew/bin/ipfs add -Q --cid-version=1 --raw-leaves</string>
+		<string>--cat-cmd</string>
+		<string>/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=15 junkawasaki@100.117.208.83 IPFS_PATH=/Volumes/251220/kotoba-ipfs/repo /opt/homebrew/bin/ipfs cat {cid}</string>
+		<string>--out-dir</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-graph-mirror/docs</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/junkawasaki/.local/share/yataverse-graph-mirror/logs/mirror.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/junkawasaki/.local/share/yataverse-graph-mirror/logs/mirror.out.log</string>
+	<key>StartInterval</key>
+	<integer>600</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/junkawasaki/.local/share/yataverse-graph-mirror</string>
+</dict>
+</plist>
