@@ -771,3 +771,43 @@ Exit codes are 0, 1 (`REFUSE` with a reason) and 3 (`UNMEASURED`).
 - 16 of 16 sampled blocks verified, 8 from each epoch, checked for size and against the sha2-256 digest in the CID.
 
 **Caution: hand-edited Tor config.** The yataverse section of jacob's torrc (ports 80, 81 and 82) is maintained by hand. com-junkawasaki/root `scripts/third-site-onion/prepare.py` generates only port-80 entries from `sites.json`, and `sites.json` has no yataverse site. Rerunning `prepare.py` would drop these ports.
+
+## IPNS fallback custodian (2026-10-06)
+
+**Why.** gad was a co-signer for the site IPNS names and the only signer for the public directory name. It went offline on 2026-10-02, and the directory name stopped resolving. Holding the keys on a second WAN is not enough by itself: two signers that each publish what they believe is current let a stale value win with a higher sequence number.
+
+**How `deploy/ipns_fallback.py` handles it.** jacob (WAN 219.104.136.140) runs it every 6 h through `deploy/jacob-ipns-fallback.plist`. For each name it:
+
+1. re-puts the current signed record unchanged, with no key involved;
+2. re-signs the **same** value at sequence + 1, but only when fewer than 24 h of validity remain;
+3. refuses a name it cannot fetch rather than inventing a value for it.
+
+**Names covered.**
+
+| Key | Name |
+|---|---|
+| `kotoba-directory-v2` | `k51…h67n0q` |
+| `yataverse-apex` | `k51…bwrf2` |
+| `isekai-static` | `k51…dk2pt6` |
+| `itonami-static` | `k51…j7yvns` |
+
+The keys were copied from xavier and appear under identical names on both hosts.
+
+**Primary signers must publish network-aware.** Kubo takes a publish's sequence number from its local datastore. After a fallback re-sign, a primary publishing at its stale local sequence is silently ignored. Primaries therefore use `--publish VALUE`, which reads the network sequence and publishes at +1. xavier's directory unit already does this.
+
+The site refreshers below do **not** yet:
+
+- `deploy/refresh-ipns.sh` here
+- network-isekai `deploy/refresh-ipns.sh`
+- itonami `renew_static_ipns.py`
+
+Until they are converted, a fallback re-sign during a long xavier outage would freeze those sites' content updates after xavier returns. Their records would still resolve.
+
+**Measured on 2026-10-06.**
+
+| Test | Result |
+|---|---|
+| Fallback run, all four names | `KEPT` (161–167 h left; itonami 59 h) |
+| Forced re-sign of the directory name | seq 0→1, same value, still resolved on xavier |
+| xavier `--publish` | Published at seq 2, then seq 3 from the unit, one above the network each time |
+| Unit tests | 7 tests, including the threshold boundary and a negative control that flips `>` to `>=` |
