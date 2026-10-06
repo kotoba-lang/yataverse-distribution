@@ -231,7 +231,19 @@ def mirror_one(args, graph):
         return
     code, out, _ = run(shlex.split(args.verifier) + ["submit", args.ledger, str(seq), cid, "--ref=" + ref], timeout=600)
     last = (out.decode(errors="replace").strip().splitlines() or [""])[-1]
-    if code == 0:
+    if code == 0 and args.writer_check:
+        # The same (seq, cid) can be committed by another submitter: the
+        # document is deterministic, so an unsigned run would produce it too.
+        # Verified 2026-10-07: an unsigned scheduled run won seq 2 while a
+        # signed manual run reported MIRRORED for it. Re-verify under a
+        # policy naming this mirror's own key.
+        wcode, wout, _ = run(shlex.split(args.verifier) + ["verify", args.ledger, "--ref=" + ref,
+                                                          "--writer-policy=" + args.writer_check], timeout=180)
+        if wcode != 0:
+            wlast = (wout.decode(errors="replace").strip().splitlines() or [""])[-1]
+            raise Refused(f"seq {seq} cid {cid} is committed, but not as this mirror's signed record: {wlast[:160]}")
+        print(f"MIRRORED-SIGNED {ref} seq {seq} cid {cid} r2-sequence {head['sequence']}", flush=True)
+    elif code == 0:
         print(f"MIRRORED {ref} seq {seq} cid {cid} r2-sequence {head['sequence']}", flush=True)
     elif code == 1:
         raise Refused(last[:200])
@@ -251,6 +263,7 @@ def main(argv=None):
     p.add_argument("--cat-cmd", help="prints a mirror document by CID; {cid}")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--writer-check", help="after a submit, require the head to pass this writer policy (EDN)")
     args = p.parse_args(argv)
     if len(args.pin_cmd) < 2 and not args.dry_run:
         p.error("pin each document on at least two custodians (--pin-cmd twice)")

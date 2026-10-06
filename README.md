@@ -959,3 +959,30 @@ The plist uses `ProcessType` `Standard`. With `Background`, while main-2 was und
 - Graphs whose head exists only in R2 and was never mirrored to B2 are not listed, because R2 cannot be listed without an API token. The legacy unprefixed `ipns/` heads, such as the production public-read graph, are out of scope.
 - The mirror follows R2 at 10-minute resolution. An R2 head that moves several times between runs appears in inga as one step.
 - R2 is still the authority. Cutting over to inga is P5.
+
+## Writer signatures on inga refs (2026-10-07, opt-in)
+
+**The gap.** inga commits any record that reaches a witness's `/submit`. Nothing checks who wrote it (ADR-2610062000, "P5・P6 の前提"). kotoba-lang/inga#22 and kotoba-lang/inga-node#9 add a writer policy to inga itself.
+
+**What this repository does meanwhile.** `lake_head.cljk` carries a local copy of the same rule, because score-witness releases do not include #22 yet.
+
+| Flag or command | Effect |
+|---|---|
+| `--writer-seed=FILE` | Signs each submitted record. `writer` is the seed's did:key; `sig` is the base64 Ed25519 signature over `inga/ref-record/v1\nref\nseq\ncid\nprev`. FILE holds 32 bytes of hex and never leaves the host. |
+| `--writer-policy=FILE` | `verify`, `bundle` and `verify-bundle` refuse a head whose writer the EDN policy `{ref-or-prefix/ #{did:key}}` does not allow. |
+| `writer-did` | Prints the seed's did:key. |
+
+**Compatibility.** Records carry no `prev`. `inga.commitment` normalises a record to ref/seq/cid/prev/height, and today's readers select only ref/seq/cid, so a `prev` would stop them verifying it. `writer` and `sig` are extra fields, which commitment ignores.
+
+**Graph mirror.** `graph_head_mirror.py --writer-check FILE` re-verifies the head after each submit, under a policy naming the mirror's own key. If the committed record is not its own signed one, it reports `REFUSE` instead of `MIRRORED`. The mirror document is deterministic, so an unsigned run produces the same `(seq, cid)`. That happened on 2026-10-07: an unsigned scheduled run won seq 2 while a signed manual run reported it as mirrored.
+
+**Measured 2026-10-07.**
+
+- The scheduled mirror on main-2 runs with its own key, `did:key:z6MkmFL7Swhx6Nj3VZWHQoMBbynsMTCqrgkR6CRPwFkbAtmq`.
+- Its first signed commit was `yataverse/graph/bafyreiha3q2…` seq 3, printed as `MIRRORED-SIGNED`.
+- On the witness's copy, an independent Python Ed25519 check verified the signature and rejected the same signature over an altered CID.
+- Under a policy naming another key, all 7 witnesses' heads were refused as `writer-not-allowed`.
+- Under a lake policy, the unsigned lake head was refused as `unsigned` by all 7. Without the flag it verified as before.
+- `writer-did` agrees with an independent Python did:key derivation.
+
+**Still unsigned.** Graph seqs 0–2 and every lake seq. The lake operator key is not yet in use. No witness runs `INGA_WRITER_POLICY` yet.
