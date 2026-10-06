@@ -247,6 +247,78 @@ class LocalBlocks:
         return block.stdout
 
 
+class EpochInventory:
+    """The lake as its log describes it: epoch inventories in order.
+
+    Each epoch keeps its own Inventory, receipts and LocalBlocks, because every
+    receipt is bound to the sha256 of the inventory it was made against; one
+    concatenated file would make each of them look foreign. The composite's
+    sha256 is that of the concatenated epochs, which is what
+    `lake_head.cljk resolve` writes from the inga log, so a reader can show the
+    same digest the consensus log resolves to (ADR-2610062000 P3)."""
+
+    def __init__(self, parts, expected_sha256, expected_count):
+        if not parts:
+            raise InventoryError("an epoch list needs at least one inventory")
+        digest = hashlib.sha256()
+        for part in parts:
+            with part.path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1 << 20), b""):
+                    digest.update(chunk)
+        total = sum(len(part.offsets) for part in parts)
+        if digest.hexdigest() != expected_sha256 or total != expected_count:
+            raise InventoryError("epoch inventories differ from the declared lake log")
+        self.parts = parts
+        self.starts = []
+        start = 0
+        for part in parts:
+            self.starts.append(start)
+            start += len(part.offsets)
+        self.sizes = {}
+        self.owner = {}
+        for index, part in enumerate(parts):
+            for cid, size in part.sizes.items():
+                if cid in self.sizes:
+                    raise InventoryError("CID appears in two epochs: " + cid)
+                self.sizes[cid] = size
+                self.owner[cid] = index
+        self.offsets = range(total)
+        self.sha256 = expected_sha256
+        self.total_bytes = sum(part.total_bytes for part in parts)
+
+    def rows(self, offset, limit):
+        if offset < 0 or offset >= len(self.offsets):
+            raise InventoryError("cursor outside inventory")
+        if not 1 <= limit <= 1000:
+            raise InventoryError("inventory row limit must be within 1..1000")
+        index = bisect.bisect_right(self.starts, offset) - 1
+        local = offset - self.starts[index]
+        rows, end = self.parts[index].rows(local, limit)
+        return rows, self.starts[index] + end
+
+    def page(self, offset):
+        rows, end = self.rows(offset, PAGE_SIZE)
+        return {"ok": True, "inventory-sha256": self.sha256, "blocks": rows,
+                "cursor": str(end) if end < len(self.offsets) else None,
+                "truncated?": end < len(self.offsets)}
+
+
+class EpochBlocks:
+    """Read a block through the epoch that lists it."""
+
+    def __init__(self, inventory, epoch_blocks):
+        if len(epoch_blocks) != len(inventory.parts):
+            raise InventoryError("one block reader per epoch")
+        self.inventory = inventory
+        self.epoch_blocks = epoch_blocks
+
+    def read(self, cid):
+        index = self.inventory.owner.get(cid)
+        if index is None:
+            raise InventoryError("CID absent from inventory")
+        return self.epoch_blocks[index].read(cid)
+
+
 def handler_for(inventory, blocks, max_concurrent_requests=8,
                 large_client_timeout=120):
     if not 1 <= max_concurrent_requests <= 64:
@@ -313,7 +385,7 @@ def handler_for(inventory, blocks, max_concurrent_requests=8,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--inventory", required=True)
+    parser.add_argument("--inventory")
     parser.add_argument("--sha256", required=True)
     parser.add_argument("--count", required=True, type=int)
     parser.add_argument("--ipfs-bin", required=True)
@@ -326,7 +398,31 @@ def main():
     parser.add_argument("--large-client-timeout", type=int, default=120)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
+    parser.add_argument("--epoch", action="append", default=[],
+                        help="INVENTORY:SHA256:COUNT[:CAR_RECEIPTS[:NATIVE_RECEIPTS...]] in log order; "
+                             "with --epoch, --inventory/--sha256/--count describe the whole log")
     args = parser.parse_args()
+    if args.epoch:
+        parts, readers = [], []
+        for spec in args.epoch:
+            fields = spec.split(":")
+            if len(fields) < 3:
+                raise SystemExit("--epoch needs INVENTORY:SHA256:COUNT")
+            part = Inventory(fields[0], fields[1], int(fields[2]))
+            car = Path(fields[3]) if len(fields) > 3 and fields[3] else None
+            natives = [Path(f) for f in fields[4:] if f]
+            receipts = (CarReceipts(car, part, args.ipfs_path, native_directories=natives)
+                        if car or natives else None)
+            parts.append(part)
+            readers.append(LocalBlocks(args.ipfs_bin, args.ipfs_path, part, args.max_block_bytes,
+                                       raw_store=RawBlockStore(args.raw_block_store) if args.raw_block_store else None,
+                                       car_receipts=receipts))
+        inventory = EpochInventory(parts, args.sha256, args.count)
+        blocks = EpochBlocks(inventory, readers)
+        ThreadingHTTPServer((args.host, args.port),
+                            handler_for(inventory, blocks, args.max_concurrent_requests,
+                                        args.large_client_timeout)).serve_forever()
+        return
     inventory = Inventory(args.inventory, args.sha256, args.count)
     raw_store = RawBlockStore(args.raw_block_store) if args.raw_block_store else None
     car_receipts = (CarReceipts(args.car_receipts, inventory, args.ipfs_path,

@@ -750,3 +750,24 @@ Exit codes are 0, 1 (`REFUSE` with a reason) and 3 (`UNMEASURED`).
 - `/api/v1/lake/blocks` still lists R2.
 - New blocks reach the log only when an operator commits a new epoch.
 - Custody of epoch 0 is proven by jacob's receipt audit and leaf readback against inventory `f6169628`. Custody of epoch 1 rests on the 2026-09-29 pin record; nothing has yet audited it against the log.
+
+## Tier-2 lake listing from the log (2026-10-06, ADR-2610062000 P3 on the independent path)
+
+**What it is.** `serve_lake.py --epoch INVENTORY:SHA256:COUNT[:CAR_RECEIPTS[:NATIVE...]]` serves the lake as its inga log describes it. Pass `--epoch` once per epoch, in log order, and set `--sha256`/`--count` to the values for the whole log.
+
+**Why each epoch stays separate.** Every epoch keeps its own inventory, receipts and block reader. Each receipt is bound to the sha256 of the inventory it was made against, so concatenating the epochs into one file would make every receipt look foreign.
+
+**Checks the composite enforces.**
+- Its digest must equal the sha256 of the concatenated epochs. That is the value `lake_head.cljk resolve` writes from the log.
+- A CID listed in two epochs is refused.
+- Each read is served by the epoch that lists the CID.
+
+**Deployed on jacob.**
+- Agent: `deploy/jacob-lake-log-read.plist` (`cloud.kotoba.jacob.lake-log-read`), listening on 127.0.0.1:18096. Port 18094 was already taken.
+- Tor: `HiddenServicePort 82 127.0.0.1:18096` on the yataverse onion `rywlb…uoad.onion`. Ports 80 (the dated 2026-09-26 reader) and 81 (the delta reader) are unchanged.
+
+**Measured on 2026-10-06, over Tor from main-2.**
+- `/health` on port 82 reported the log digest `f095a4e2…`: 822,510 rows, 89,892,761,746 bytes.
+- 16 of 16 sampled blocks verified, 8 from each epoch, checked for size and against the sha2-256 digest in the CID.
+
+**Caution: hand-edited Tor config.** The yataverse section of jacob's torrc (ports 80, 81 and 82) is maintained by hand. com-junkawasaki/root `scripts/third-site-onion/prepare.py` generates only port-80 entries from `sites.json`, and `sites.json` has no yataverse site. Rerunning `prepare.py` would drop these ports.

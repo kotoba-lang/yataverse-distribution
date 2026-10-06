@@ -188,6 +188,42 @@ class ServingTests(unittest.TestCase):
             with self.assertRaisesRegex(serve.InventoryError, "no receipt directory given"):
                 serve.CarReceipts(None, inventory, root)
 
+    def test_epoch_log_lists_across_epochs_and_reads_through_the_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def inv(name, rows):
+                payload = b"".join((json.dumps({"cid": c, "bytes": n}) + "\n").encode() for c, n in rows)
+                (root / name).write_bytes(payload)
+                return payload, serve.Inventory(root / name, hashlib.sha256(payload).hexdigest(), len(rows))
+            p0, e0 = inv("e0.jsonl", [(CID_A, 3)])
+            p1, e1 = inv("e1.jsonl", [(CID_B, 4)])
+            log_sha = hashlib.sha256(p0 + p1).hexdigest()
+            composite = serve.EpochInventory([e0, e1], log_sha, 2)
+            self.assertEqual(log_sha, composite.sha256)
+            self.assertEqual(7, composite.total_bytes)
+            first = composite.page(0)
+            self.assertEqual([CID_A], [r["cid"] for r in first["blocks"]])
+            self.assertEqual("1", first["cursor"], "the page stops at the epoch boundary and continues")
+            second = composite.page(1)
+            self.assertEqual([CID_B], [r["cid"] for r in second["blocks"]])
+            self.assertIsNone(second["cursor"])
+            with self.assertRaisesRegex(serve.InventoryError, "differ from the declared lake log"):
+                serve.EpochInventory([e0, e1], hashlib.sha256(p1 + p0).hexdigest(), 2)
+            _, dup = inv("dup.jsonl", [(CID_A, 3)])
+            dup_sha = hashlib.sha256(p0 + (root / "dup.jsonl").read_bytes()).hexdigest()
+            with self.assertRaisesRegex(serve.InventoryError, "CID appears in two epochs"):
+                serve.EpochInventory([e0, dup], dup_sha, 2)
+            reads = []
+            class Fake:
+                def __init__(self, tag): self.tag = tag
+                def read(self, cid): reads.append((self.tag, cid)); return b"x"
+            blocks = serve.EpochBlocks(composite, [Fake("e0"), Fake("e1")])
+            blocks.read(CID_B)
+            blocks.read(CID_A)
+            self.assertEqual([("e1", CID_B), ("e0", CID_A)], reads)
+            with self.assertRaisesRegex(serve.InventoryError, "absent from inventory"):
+                blocks.read("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
+
     def test_http_serves_snapshot_and_refuses_bad_cursor(self):
         with tempfile.TemporaryDirectory() as directory:
             inventory = self.inventory(directory)
