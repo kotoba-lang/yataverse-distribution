@@ -1037,3 +1037,21 @@ The state file in `--work` makes an interrupted run continue from the step where
 - **Finished means** `check` passed, or `delta` found 0 rows.
 - **Install.** The tools go in `~/.local/share/yataverse-lake-cycle/bin`. The cycle resolves its sibling tools from its own directory.
 - **Still reviewed by hand.** The printed follow-ups: the manifest commit, jacob's reader, and the directory pointer. Until they are done, the directory and the onion reader lag the log by at most the epochs cut since. The log and the witnesses do not lag.
+
+## Lake listing from the log: `deploy/project_lake_log.py` (2026-10-07, opt-in)
+
+**What it writes.** The `lake-log/` layout that cloud-kotoba/kotobase-ipfs#71 reads when `KOTOBASE_LAKE_LISTING=log`:
+
+- `head.json`, naming the epochs;
+- per-epoch pages of 200 rows, content-named by each inventory's sha256.
+
+**Checks.** Each inventory is checked against its manifest's sha256 and row count. Epochs must be given in log order, and the head's seq must match them. `head.json` is written last.
+
+**Where it writes.** `--out DIR` writes locally. `--put-cmd` writes per object, for example with `wrangler r2 object put … --remote`. Writing to the production bucket is an owner decision, so nothing has been put.
+
+**Measured on the real log (seq 3).** The projection is 4,129 objects (81 MB). Rebuilt from the pages, it equals the resolved log row for row and in order: 825,258 rows. Four unit tests cover:
+
+- order, and head-last;
+- a foreign inventory, or a wrong row count;
+- epochs out of order, or a head mismatch;
+- determinism.
