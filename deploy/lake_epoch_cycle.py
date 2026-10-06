@@ -23,8 +23,12 @@ Steps, each refusing to continue unless its check passes:
   bundle    the proof bundle, pinned on both
   check     the log now resolves to exactly the union of the walk and the log
 
-Publishing the directory and adding the epoch to jacob's reader are printed as
-follow-ups. They change public, signed pointers and stay reviewed steps.
+  reader    jacob's lake-log reader (onion port 82) gains the epoch; its
+            /health must then report exactly the log's sha256 and rows
+
+Publishing the directory is printed as a follow-up. It changes a public,
+signed pointer and stays a reviewed step. The reader serves only what the
+log already proves, so it follows the log without review.
 
 Exit codes: 0 epoch committed, or nothing to commit; 1 a check refused;
 3 a step could not run.
@@ -43,7 +47,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STEPS = ["head", "capture", "diff", "resolve", "delta", "xavier", "jacob",
-         "cids", "manifest", "submit", "bundle", "check"]
+         "cids", "manifest", "submit", "bundle", "check", "reader"]
 
 
 class Refused(Exception):
@@ -382,6 +386,34 @@ class Cycle:
                          "beyond_listing": len(log - listing)}
         self.say(f"log {len(log)} rows covers the listing at {self.s['cutoff']} ({len(log - listing)} rows only in the log)")
 
+    def step_reader(self):
+        j, e, inv = self.c["jacob"], self.s["epoch"], self.s["inv"]
+        label = j["reader_label"]
+        plist = f"~/Library/LaunchAgents/{label}.plist"
+        spec = f"{j['bulk']}/inventory/inventory-epoch{e}.jsonl:{inv['sha256']}:{inv['rows']}:{j['bulk']}/lake-state/epoch{e}"
+        pb = "/usr/libexec/PlistBuddy"
+        args = ssh(j["host"], f"{pb} -c 'Print :ProgramArguments' {plist}")
+        lines = [l.strip() for l in args.strip().splitlines()[1:-1]]
+        if spec not in lines:
+            # Insert the new --epoch pair after the last one, set the totals.
+            last = max(i for i, l in enumerate(lines) if l == "--epoch") + 1
+            ssh(j["host"], f"cp {plist} {j['bulk']}/lake-state/{label}.plist.pre-epoch{e} && "
+                           f"{pb} -c 'Set :ProgramArguments:{lines.index('--sha256') + 1} {self.s['log']['sha256']}' "
+                           f"-c 'Set :ProgramArguments:{lines.index('--count') + 1} {self.s['log']['rows']}' "
+                           f"-c 'Add :ProgramArguments:{last + 1} string --epoch' "
+                           f"-c 'Add :ProgramArguments:{last + 2} string {spec}' {plist} && plutil -lint {plist} >/dev/null && "
+                           f"launchctl bootout gui/$(id -u)/{label}; sleep 2; launchctl bootstrap gui/$(id -u) {plist}")
+        health = None
+        for _ in range(30):
+            time.sleep(5)
+            health = last_json(ssh(j["host"], f"curl -s -m 30 http://127.0.0.1:{j['reader_port']}/health", check=False))
+            if health and health.get("ok"):
+                break
+        if not (health and health.get("inventory-sha256") == self.s["log"]["sha256"]
+                and health.get("rows") == self.s["log"]["rows"]):
+            raise Refused(f"reader does not serve the log: {health}")
+        self.say(f"reader serves {health['rows']} rows ({health['inventory-sha256'][:8]})")
+
     def run(self, until=None):
         for name in STEPS:
             if name in self.s["done"]:
@@ -397,8 +429,8 @@ class Cycle:
                 return 0
         e = self.s["epoch"]
         self.say(f"COMMITTED epoch {e} manifest {self.s['manifest_cid']} bundle {self.s['bundle_cid']}")
-        self.say("follow-ups (reviewed): commit deploy/lake-manifests/epoch-%d.json; add the epoch to "
-                 "jacob-lake-log-read.plist (sha256 %s, rows %d); point the directory lake_log at bundle %s"
+        self.say("follow-ups (reviewed): commit deploy/lake-manifests/epoch-%d.json and the reader plist "
+                 "(sha256 %s, rows %d); point the directory lake_log at bundle %s"
                  % (e, self.s["log"]["sha256"], self.s["log"]["rows"], self.s["bundle_cid"]))
         return 0
 
@@ -409,7 +441,7 @@ def finished(work):
     except (OSError, ValueError):
         return False
     done = s.get("done", [])
-    return "check" in done or ("delta" in done and s.get("inv", {}).get("rows") == 0)
+    return "reader" in done or ("delta" in done and s.get("inv", {}).get("rows") == 0)
 
 
 def pick_work(root):

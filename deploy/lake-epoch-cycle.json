@@ -32,6 +32,8 @@
     "ipfs_bin": "/opt/homebrew/bin/ipfs",
     "ipfs_path": "/Volumes/251220/kotoba-ipfs/repo",
     "kubo_api_port": 5002,
-    "rpc_tunnel_port": 15092
+    "rpc_tunnel_port": 15092,
+    "reader_label": "cloud.kotoba.jacob.lake-log-read",
+    "reader_port": 18096
   }
 }
