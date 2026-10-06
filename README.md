@@ -850,3 +850,24 @@ Two bugs this run caught in the drill itself:
 
 - `ipfs id` answers without a daemon, so readiness now waits on `swarm peers`.
 - The verifier must be run under its real filename.
+
+## Next epoch: `deploy/lake_epoch.py` (2026-10-06)
+
+Two of the pipeline's steps are pure and live in this tool:
+
+- **`delta`** keeps the rows of a capture diff that the log does not already hold. It refuses a size conflict or a duplicate.
+- **`manifest`** writes the canonical manifest. It computes rows, bytes and sha256 from the inventory itself. It refuses an empty epoch, and it refuses custody that does not name at least two nodes on at least two WANs.
+
+On the real 977-row delta, `manifest` rebuilt the committed `epoch-1.json` byte for byte.
+
+**The full sequence for epoch N:**
+
+1. Run two `capture_lake_inventory.py` walks with the same `--cutoff-utc`.
+2. Run `diff_lake_inventory.py` against the epoch-0 base.
+3. Run `lake_head.cljk resolve` to get the current log membership.
+4. Run `lake_epoch.py delta`.
+5. Replicate the delta to two custodians on different WANs, and audit custody on both.
+6. `ipfs add` the delta inventory on both custodians; the CIDs must match.
+7. Run `lake_epoch.py manifest`, then `ipfs add` the manifest on both custodians; the CIDs must match.
+8. Run `lake_head.cljk submit <ledger> N <manifest-cid>`.
+9. Run `lake_head.cljk bundle`, then update the directory's `lake_log`. The xavier publisher publishes network-aware.
