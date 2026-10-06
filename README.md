@@ -1066,3 +1066,11 @@ The state file in `--work` makes an interrupted run continue from the step where
 The directory pointer and the manifest commit remain reviewed.
 
 Measured on epoch 3: the resumed run passed `reader` without changing the plist (825,258 rows, `98240a1d…`). A copy of the run with a falsified log digest was refused (exit 1).
+
+**Writer record v2 (2026-10-07).** `lake_head.cljk` follows kotoba-lang/inga#22 after review.
+
+- The signed text is `inga/ref-record/v2`. It binds the chain id and every field a record may carry: ref, seq, cid, prev, v and height. Any other field is refused.
+- Verification must return literally true.
+- A policy value may be `{"writers" #{...} "from_seq" n}`, which grandfathers history from before the policy.
+- The local copy of the signing text is byte-identical to `inga.writer/signing-text`, checked by base64 comparison: 114 bytes both.
+- Records signed with v1 (graph mirror seqs 3 and up before this change, and lake seq 3) do not verify as v2. Enable a policy with `from_seq` at or above the first v2 seq for each ref.
