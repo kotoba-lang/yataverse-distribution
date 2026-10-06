@@ -27,7 +27,17 @@
             [inga-node.seams :as seams]))
 
 (def fs (js/require "node:fs"))
-(def ref-name "yataverse/lake")
+;; `--ref=` selects the inga ref. Default is the lake log; P4 graph-head mirrors
+;; use yataverse/graph/<graph-cid> (graph_head_mirror.py). Anything else is
+;; refused so a typo cannot open a new ref by accident.
+(def ref-name
+  (let [r (or (some #(when (str/starts-with? % "--ref=") (subs % 6))
+                    (array-seq (aget js/process "argv")))
+              "yataverse/lake")]
+    (if (re-matches #"yataverse/(lake|graph/baf[a-z2-7]{50,})" r)
+      r
+      (do (println "REFUSE --ref must be yataverse/lake or yataverse/graph/<cid>:" r)
+          (js/process.exit 1)))))
 
 (defn- out [& xs] (println (str/join " " xs)))
 (defn- exit! [code] (js/process.exit code))
@@ -87,6 +97,12 @@
       (and members (>= (count members) min-agree))
       {:status :verified :seq seq :cid cid :witnesses (sort (map :id members))}
       (> (count groups) 1) {:status :split :groups (into {} (map (fn [[k v]] [k (map :id v)]) groups))}
+      ;; Reachable witnesses that hold no record for the ref. Only a quorum of
+      ;; them counts, and it is not proof of absence (a lagging witness also
+      ;; answers :no-head); it only tells a new ref to start at seq 0, where a
+      ;; conflicting holder is still refused by submit.
+      (and (empty? ok) (>= (count (filter #(= :no-head (:refused %)) results)) min-agree))
+      {:status :absent}
       :else {:status :unmeasured :verified (count ok)})))
 
 (defn verify! [l min-agree]
@@ -99,6 +115,7 @@
     (case (:status v)
       :verified (out "VERIFIED" ref-name "seq" (:seq v) "cid" (:cid v) "by" (count (:witnesses v)) "witnesses" detail)
       :split (out "REFUSE witnesses disagree" (pr-str (:groups v)) detail)
+      :absent (out "ABSENT" ref-name "no witness holds a record" detail)
       (out "UNMEASURED only" (:verified v) "witnesses proved a head" detail))
     v))
 
@@ -250,7 +267,7 @@
   (case cmd
     "verify" (-> (verify! (ledger ledger-path) min-agree)
                  (.then report)
-                 (.then (fn [v] (exit! (case (:status v) :verified 0 :split 1 3)))))
+                 (.then (fn [v] (exit! (case (:status v) :verified 0 :split 1 :absent 4 3)))))
     "bundle" (let [sflag (fn [k] (some #(when (str/starts-with? % (str k "=")) (subs % (inc (count k)))) args))]
                (bundle! (ledger ledger-path) min-agree
                         (or (sflag "--out") (do (out "REFUSE bundle needs --out=FILE") (exit! 1)))))
@@ -263,4 +280,4 @@
                (when-not (and (nat-int? seq') (string? b) (re-matches #"baf[a-z2-7]{50,}" b))
                  (out "REFUSE usage: submit <ledger> <seq> <manifest-cid>") (exit! 1))
                (submit! (ledger ledger-path) seq' b min-agree))
-    (do (out "REFUSE usage: verify <ledger> | submit <ledger> <seq> <cid>") (exit! 1))))
+    (do (out "REFUSE usage: verify <ledger> | submit <ledger> <seq> <cid>  [--ref=yataverse/graph/<cid>]") (exit! 1))))
