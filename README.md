@@ -1030,3 +1030,10 @@ The state file in `--work` makes an interrupted run continue from the step where
 - The independent read drill passes at seq 3 with `dns: none` and `cloudflare: none`.
 
 **One fix found by the run.** `check` re-resolves after the commit, when the log has N+1 epochs. The first version expected N and stopped after the commit had succeeded. A rerun resumed at `check` alone.
+
+**Schedule (2026-10-07).** `deploy/main2-lake-epoch-cycle.plist` runs the cycle daily at 04:30 on main-2 with `--work-root`.
+
+- **Resume rule.** If the newest run under the root has not finished, it is resumed. Otherwise a new dated run starts. A run that stopped after `submit` has already committed its epoch, and a fresh run would cut the next one from a head it never bundled or checked.
+- **Finished means** `check` passed, or `delta` found 0 rows.
+- **Install.** The tools go in `~/.local/share/yataverse-lake-cycle/bin`. The cycle resolves its sibling tools from its own directory.
+- **Still reviewed by hand.** The printed follow-ups: the manifest commit, jacob's reader, and the directory pointer. Until they are done, the directory and the onion reader lag the log by at most the epochs cut since. The log and the witnesses do not lag.
