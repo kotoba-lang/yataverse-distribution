@@ -145,6 +145,49 @@ class ServingTests(unittest.TestCase):
             with self.assertRaisesRegex(serve.InventoryError, "receipt differs"):
                 serve.CarReceipts(receipts, inventory, root)
 
+    def test_native_receipt_serves_without_recursive_pin_walk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            blobs = [b"abc", b"defg"]
+            cids = ["b" + base64.b32encode(b"\x01\x55\x12\x20" + hashlib.sha256(data).digest())
+                    .decode().lower().rstrip("=") for data in blobs]
+            inventory_path = root / "inventory.jsonl"
+            payload = b"".join((json.dumps({"cid": cid, "bytes": len(data)}) + "\n").encode()
+                               for cid, data in zip(cids, blobs))
+            inventory_path.write_bytes(payload)
+            inventory = serve.Inventory(inventory_path, hashlib.sha256(payload).hexdigest(), 2)
+            native = root / "native-0-2"
+            native.mkdir()
+            record = {"status": "complete", "inventory_sha256": inventory.sha256,
+                      "start_row": 0, "end_row": 2, "blocks": 2, "bytes": 7,
+                      "root": CID_A, "source_peer": "12D3KooWsource",
+                      "repository": str(root.resolve())}
+            receipt = native / "row-0-1-native.json"
+            receipt.write_text(json.dumps(record))
+            ok = SimpleNamespace(returncode=0, stdout=blobs[1])
+            # Without the native receipt the reader must still fall through to
+            # the live pin query: proves the test exercises the changed path.
+            plain = serve.LocalBlocks("/fake/ipfs", str(root), inventory, 100)
+            with patch.object(serve.subprocess, "run", return_value=ok) as invoke:
+                with self.assertRaisesRegex(serve.InventoryError, "not durably pinned"):
+                    plain.read(cids[1])
+            self.assertIn("pin", invoke.call_args_list[0].args[0])
+            receipts = serve.CarReceipts(None, inventory, root, native_directories=[native])
+            blocks = serve.LocalBlocks("/fake/ipfs", str(root), inventory, 100,
+                                       car_receipts=receipts)
+            with patch.object(serve.subprocess, "run", return_value=ok) as invoke:
+                self.assertEqual(blobs[1], blocks.read(cids[1]))
+            self.assertEqual(1, invoke.call_count)
+            self.assertIn("--offline", invoke.call_args.args[0])
+            for field, value in (("bytes", 8), ("source_peer", ""), ("blocks", 1),
+                                 ("repository", "/elsewhere")):
+                receipt.write_text(json.dumps({**record, field: value}))
+                with self.assertRaisesRegex(serve.InventoryError,
+                                            "native receipt differs from inventory or repository"):
+                    serve.CarReceipts(None, inventory, root, native_directories=[native])
+            with self.assertRaisesRegex(serve.InventoryError, "no receipt directory given"):
+                serve.CarReceipts(None, inventory, root)
+
     def test_http_serves_snapshot_and_refuses_bad_cursor(self):
         with tempfile.TemporaryDirectory() as directory:
             inventory = self.inventory(directory)

@@ -85,10 +85,20 @@ class Inventory:
 
 
 class CarReceipts:
-    """Exact inventory ranges proven by completed CAR import receipts."""
+    """Exact inventory ranges proven by completed CAR or native import receipts.
 
-    def __init__(self, directory, inventory, ipfs_path):
-        self.directory = Path(directory)
+    Native receipts (row-*-native.json) are the rows audit_lake.py counts as
+    covered through a bitswap-mirrored root. Without them every such row fell
+    through to `ipfs pin ls --type=all`, which walks all recursive pins and
+    outlives the 15 s budget on a large repository — so the reader answered
+    503 for blocks the audit reported as held.
+    """
+
+    def __init__(self, directory, inventory, ipfs_path, native_directories=()):
+        self.directory = None if directory is None else Path(directory)
+        self.native_directories = [Path(item) for item in native_directories]
+        if self.directory is None and not self.native_directories:
+            raise InventoryError("no receipt directory given")
         self.inventory = inventory
         self.ipfs_path = Path(ipfs_path).resolve()
         self.lock = threading.RLock()
@@ -97,14 +107,48 @@ class CarReceipts:
         self.ranges = []
         self.refresh()
 
+    def _native_range(self, path):
+        match = re.fullmatch(r"row-([0-9]+)-([0-9]+)-native\.json", path.name)
+        if not match:
+            raise InventoryError("invalid native receipt name")
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            raise InventoryError("native receipt unreadable") from exc
+        if not isinstance(record, dict):
+            raise InventoryError("native receipt must be an object")
+        start, last = map(int, match.groups())
+        end = last + 1
+        if not 0 <= start < end <= len(self.inventory.offsets) or end - start > 1000:
+            raise InventoryError("native receipt range is invalid")
+        rows, actual_end = self.inventory.rows(start, end - start)
+        root = record.get("root")
+        if (actual_end != end or record.get("status") != "complete" or
+                record.get("inventory_sha256") != self.inventory.sha256 or
+                record.get("start_row") != start or record.get("end_row") != end or
+                record.get("blocks") != len(rows) or
+                record.get("bytes") != sum(row["size"] for row in rows) or
+                record.get("repository") != str(self.ipfs_path) or
+                not isinstance(root, str) or not CID.fullmatch(root) or
+                not isinstance(record.get("source_peer"), str) or
+                not record["source_peer"]):
+            raise InventoryError("native receipt differs from inventory or repository: " + path.name)
+        return start, end
+
     def refresh(self):
-        if not self.directory.is_dir():
-            raise InventoryError("CAR receipt directory is absent")
-        mtime = self.directory.stat().st_mtime_ns
+        directories = ([] if self.directory is None else [self.directory]) + self.native_directories
+        for directory in directories:
+            if not directory.is_dir():
+                raise InventoryError("receipt directory is absent: " + str(directory))
+        mtime = tuple(directory.stat().st_mtime_ns for directory in directories)
         if mtime == self.mtime_ns:
             return
         ranges = []
-        for path in self.directory.glob("row-*-import.json"):
+        for directory in self.native_directories:
+            for path in directory.glob("row-*-native.json"):
+                ranges.append(self._native_range(path))
+        car_paths = [] if self.directory is None else self.directory.glob("row-*-import.json")
+        for path in car_paths:
             match = re.fullmatch(r"row-([0-9]+)-([0-9]+)-import\.json", path.name)
             if not match:
                 raise InventoryError("invalid CAR receipt name")
@@ -276,6 +320,7 @@ def main():
     parser.add_argument("--ipfs-path", required=True)
     parser.add_argument("--raw-block-store", type=Path)
     parser.add_argument("--car-receipts", type=Path)
+    parser.add_argument("--native-receipts", type=Path, action="append", default=[])
     parser.add_argument("--max-block-bytes", type=int, default=LARGE_BLOCK_THRESHOLD)
     parser.add_argument("--max-concurrent-requests", type=int, default=8)
     parser.add_argument("--large-client-timeout", type=int, default=120)
@@ -284,8 +329,9 @@ def main():
     args = parser.parse_args()
     inventory = Inventory(args.inventory, args.sha256, args.count)
     raw_store = RawBlockStore(args.raw_block_store) if args.raw_block_store else None
-    car_receipts = (CarReceipts(args.car_receipts, inventory, args.ipfs_path)
-                    if args.car_receipts else None)
+    car_receipts = (CarReceipts(args.car_receipts, inventory, args.ipfs_path,
+                                native_directories=args.native_receipts)
+                    if args.car_receipts or args.native_receipts else None)
     blocks = LocalBlocks(args.ipfs_bin, args.ipfs_path, inventory,
                          args.max_block_bytes, raw_store=raw_store,
                          car_receipts=car_receipts)
