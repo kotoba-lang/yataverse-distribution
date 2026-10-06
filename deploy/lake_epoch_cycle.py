@@ -403,13 +403,40 @@ class Cycle:
         return 0
 
 
+def finished(work):
+    try:
+        s = json.load(open(os.path.join(work, "cycle-state.json")))
+    except (OSError, ValueError):
+        return False
+    done = s.get("done", [])
+    return "check" in done or ("delta" in done and s.get("inv", {}).get("rows") == 0)
+
+
+def pick_work(root):
+    """The newest run under root that has not finished, else a new one.
+    Resuming rather than restarting matters: a run stopped after `submit`
+    has already committed its epoch, and a fresh run would cut the next one
+    from a log head it never bundled or checked."""
+    os.makedirs(root, exist_ok=True)
+    runs = sorted(d for d in os.listdir(root) if d.startswith("run-"))
+    if runs and not finished(os.path.join(root, runs[-1])):
+        return os.path.join(root, runs[-1])
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%MZ")
+    return os.path.join(root, "run-" + stamp)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", required=True)
-    ap.add_argument("--work", required=True, help="state directory for this epoch's run")
+    where = ap.add_mutually_exclusive_group(required=True)
+    where.add_argument("--work", help="state directory for this epoch's run")
+    where.add_argument("--work-root", help="for a schedule: resume the newest unfinished run "
+                                          "under this directory, or start a new dated one")
     ap.add_argument("--until", choices=STEPS, help="stop after this step")
     a = ap.parse_args(argv)
-    cyc = Cycle(json.load(open(a.config)), a.work)
+    work = a.work or pick_work(a.work_root)
+    print("work", work, flush=True)
+    cyc = Cycle(json.load(open(a.config)), work)
     try:
         return cyc.run(a.until)
     except Refused as e:

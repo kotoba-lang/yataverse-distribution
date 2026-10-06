@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/junkawasaki</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>Label</key>
+	<string>cloud.yataverse.main2-lake-epoch-cycle</string>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/python3</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-lake-cycle/bin/lake_epoch_cycle.py</string>
+		<string>--config</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-lake-cycle/bin/lake-epoch-cycle.json</string>
+		<string>--work-root</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-lake-cycle/runs</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/junkawasaki/.local/share/yataverse-lake-cycle/logs/cycle.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/junkawasaki/.local/share/yataverse-lake-cycle/logs/cycle.out.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>4</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/Users/junkawasaki/.local/share/yataverse-lake-cycle</string>
+</dict>
+</plist>
