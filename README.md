@@ -1055,3 +1055,14 @@ The state file in `--work` makes an interrupted run continue from the step where
 - a foreign inventory, or a wrong row count;
 - epochs out of order, or a head mismatch;
 - determinism.
+
+**Reader step (2026-10-07).** The cycle now ends with `reader`.
+
+- It adds the new epoch to jacob's lake-log reader (onion port 82) and restarts it.
+- It refuses unless `/health` then reports exactly the log's sha256 and row count.
+- An epoch that is already present is not added twice.
+- This is not a reviewed step. The reader serves only what the log already proves.
+
+The directory pointer and the manifest commit remain reviewed.
+
+Measured on epoch 3: the resumed run passed `reader` without changing the plist (825,258 rows, `98240a1d…`). A copy of the run with a falsified log digest was refused (exit 1).
