@@ -50,7 +50,7 @@ class EpochTests(unittest.TestCase):
         # manifests must already be in that form. (Rebuilding epoch-1 from the
         # real 977-row delta reproduced it byte for byte on 2026-10-06; that
         # inventory is not in the repository, so it is not repeated here.)
-        for name in ("epoch-0.json", "epoch-1.json", "epoch-2.json"):
+        for name in ("epoch-0.json", "epoch-1.json", "epoch-2.json", "epoch-3.json"):
             committed = (REPO / "deploy" / "lake-manifests" / name).read_text()
             self.assertEqual(committed, json.dumps(json.loads(committed), sort_keys=True, separators=(",", ":")))
 
