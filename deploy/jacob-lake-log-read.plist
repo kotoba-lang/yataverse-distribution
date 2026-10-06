@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>cloud.kotoba.jacob.lake-log-read</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/bin/serve_lake_epoch.py</string>
+		<string>--sha256</string><string>f095a4e21f3f1db97460bd9f3eb6b0e49b724280514ca43711b8b17ea3872ab8</string>
+		<string>--count</string><string>822510</string>
+		<string>--epoch</string><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/inventory/inventory-20260926.jsonl:f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188:821533:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/native-100000-300000:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/native-300000-400000</string>
+		<string>--epoch</string><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/inventory/inventory-delta-fence-20260929.jsonl:899e7e26087e98a9c6859db4cd697753f26745e5ac46dc3f3a071a05c585e7d1:977:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/delta-fence-20260929/car-receipts</string>
+		<string>--ipfs-bin</string><string>/opt/homebrew/bin/ipfs</string>
+		<string>--ipfs-path</string><string>/Volumes/251220/kotoba-ipfs/repo</string>
+		<string>--raw-block-store</string><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/raw-blocks</string>
+		<string>--max-block-bytes</string><string>256000000</string>
+		<string>--large-client-timeout</string><string>1200</string>
+		<string>--host</string><string>127.0.0.1</string>
+		<string>--port</string><string>18096</string>
+	</array>
+	<key>WorkingDirectory</key><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/bin</string>
+	<key>RunAtLoad</key><true/>
+	<key>KeepAlive</key><true/>
+	<key>StandardOutPath</key><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/logs/lake-log-read.out.log</string>
+	<key>StandardErrorPath</key><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/logs/lake-log-read.err.log</string>
+</dict>
+</plist>
