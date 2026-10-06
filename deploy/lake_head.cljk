@@ -81,10 +81,14 @@
 (defn- pkcs8 [seed] (.createPrivateKey nc #js {:key (js/Buffer.concat #js [(js/Buffer.from #js [0x30 0x2e 0x02 0x01 0x00 0x30 0x05 0x06 0x03 0x2b 0x65 0x70 0x04 0x22 0x04 0x20]) seed])
                                                :format "der" :type "pkcs8"}))
 
+(def writer-signed-fields ["ref" "seq" "cid" "prev" "v" "height"])
+
 (defn writer-signing-text
-  "Byte-identical to inga.writer/signing-text."
-  [r]
-  (str "inga/ref-record/v1\n" (get r "ref") "\n" (get r "seq") "\n" (get r "cid") "\n" (or (get r "prev") "")))
+  "Byte-identical to inga.writer/signing-text (inga#22, record v2): the
+  chain id, then every field a record may carry, absent as empty."
+  [chain-id r]
+  (apply str "inga/ref-record/v2\n" "chain=" chain-id "\n"
+         (for [f writer-signed-fields] (str f "=" (let [v (get r f)] (if (nil? v) "" v)) "\n"))))
 
 (defn did-key->pub [did]
   (when (and (string? did) (str/starts-with? did "did:key:z"))
@@ -100,22 +104,31 @@
      :sign (fn [text] (.toString (.sign nc nil (js/Buffer.from text "utf8") sk) "base64"))}))
 
 (defn writer-refusal
-  "Same rule as inga.writer/refusal, with Ed25519 did:key verification."
-  [policy r]
-  (let [allowed (or (get policy (get r "ref"))
-                    (some->> (keys policy)
-                             (filter #(and (str/ends-with? % "/") (str/starts-with? (get r "ref") %)))
-                             (sort-by count >) first (get policy)))]
-    (when allowed
-      (let [w (get r "writer") sig (get r "sig")]
-        (cond
-          (not (and (string? w) (string? sig))) :unsigned
-          (not (contains? allowed w)) :writer-not-allowed
-          (not (try (when-let [pub (did-key->pub w)]
-                      (.verify nc nil (js/Buffer.from (writer-signing-text r) "utf8") (spki pub) (js/Buffer.from sig "base64")))
-                    (catch :default _ false)))
-          :bad-signature
-          :else nil)))))
+  "Same rule as inga.writer/refusal (v2): from_seq grandfathers history,
+  every field is signed and no other field is allowed, the signature is
+  bound to the chain, and the verifier result must be literally true."
+  [policy chain-id r]
+  (let [ref-name (get r "ref")]
+    (if-not (string? ref-name)
+      :malformed
+      (when-let [e (or (get policy ref-name)
+                       (some->> (keys policy)
+                                (filter #(and (str/ends-with? % "/") (str/starts-with? ref-name %)))
+                                (sort-by count >) first (get policy)))]
+        (let [writers (if (set? e) e (get e "writers"))
+              from-seq (if (set? e) 0 (or (get e "from_seq") 0))
+              sq (get r "seq") w (get r "writer") sig (get r "sig")]
+          (cond
+            (not (integer? sq)) :malformed
+            (< sq from-seq) nil
+            (not (every? (set (concat writer-signed-fields ["writer" "sig"])) (keys r))) :unexpected-field
+            (not (and (string? w) (string? sig))) :unsigned
+            (not (contains? writers w)) :writer-not-allowed
+            (not (true? (try (when-let [pub (did-key->pub w)]
+                               (.verify nc nil (js/Buffer.from (writer-signing-text chain-id r) "utf8") (spki pub) (js/Buffer.from sig "base64")))
+                             (catch :default _ false))))
+            :bad-signature
+            :else nil))))))
 
 (def writer
   (when-let [f (argv-flag "--writer-seed")]
@@ -124,7 +137,8 @@
 (def writer-policy
   (when-let [f (argv-flag "--writer-policy")]
     (let [p (edn/read-string (.readFileSync fs f "utf8"))]
-      (if (and (map? p) (every? string? (keys p)) (every? #(and (set? %) (every? string? %)) (vals p)))
+      (if (and (map? p) (every? string? (keys p))
+               (every? #(let [ws (if (set? %) % (get % "writers"))] (and (set? ws) (every? string? ws))) (vals p)))
         p
         (do (println "REFUSE --writer-policy is not {string #{did:key}}:" f) (js/process.exit 1))))))
 ;; `--ref=` selects the inga ref. Default is the lake log; P4 graph-head mirrors
@@ -182,7 +196,7 @@
              (let [record (select-keys head ["ref" "seq" "cid"])
                    reason (commitment/verify-commitment
                            {:record record :block (:block proof) :qc (:qc proof)} ctx)]
-               (if-let [why (or reason (when writer-policy (writer-refusal writer-policy head)))]
+               (if-let [why (or reason (when writer-policy (writer-refusal writer-policy (:chain-id ctx) head)))]
                  {:id (:id w) :refused why}
                  {:id (:id w) :seq (get head "seq") :cid (get head "cid")
                   :head (select-keys head ["ref" "seq" "cid" "writer" "sig"])
@@ -227,7 +241,7 @@
                  :body (js/JSON.stringify
                         (clj->js {:record (let [r {"ref" ref-name "seq" seq' "cid" cid}]
                                             (if writer
-                                              (assoc r "writer" (:did writer) "sig" ((:sign writer) (writer-signing-text r)))
+                                              (assoc r "writer" (:did writer) "sig" ((:sign writer) (writer-signing-text (:chain-id l) r)))
                                               r))}))})))
 
 (defn submit!
@@ -298,8 +312,8 @@
     (cond
       (not (and (= ref-name (get head "ref")) (= (:chain-id l) (get b "chain-id"))))
       (do (out "REFUSE bundle is for" (get head "ref") "on" (get b "chain-id")) (exit! 1))
-      (and writer-policy (writer-refusal writer-policy head))
-      (do (out "REFUSE bundle head writer:" (name (writer-refusal writer-policy head))) (exit! 1))
+      (and writer-policy (writer-refusal writer-policy (:chain-id l) head))
+      (do (out "REFUSE bundle head writer:" (name (writer-refusal writer-policy (:chain-id l) head))) (exit! 1))
       (>= ok min-agree)
       (do (out "VERIFIED-BUNDLE" ref-name "seq" (get head "seq") "cid" (get head "cid")
                "proofs-ok" ok "(committed by quorum; not a proof that no higher seq exists)" detail)
