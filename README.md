@@ -811,3 +811,42 @@ Until they are converted, a fallback re-sign during a long xavier outage would f
 | Forced re-sign of the directory name | seq 0→1, same value, still resolved on xavier |
 | xavier `--publish` | Published at seq 2, then seq 3 from the unit, one above the network each time |
 | Unit tests | 7 tests, including the threshold boundary and a negative control that flips `>` to `>=` |
+
+## Independent read drill (2026-10-06)
+
+**What it tests.** `deploy/independent_read_drill.py` starts from only two things: the public directory's IPNS name, and the witness-ledger CID pinned in this repository. It reads yataverse with no DNS and no Cloudflare. The client is an ephemeral Kubo with:
+
+- no bootstrap list;
+- `AutoConf` off, because it fetches its config by DNS name;
+- DHT-only routing, with no delegated HTTP routers;
+- only the peers given as raw IP multiaddrs (`/dns*` addresses are refused).
+
+**What it checks, in order.**
+
+1. Resolve the directory over the DHT.
+2. Read the `lake_log` entry.
+3. Check that the directory's ledger CID equals the pinned one.
+4. Verify the proof bundle offline with `lake_head.cljk verify-bundle`.
+5. Walk the manifests from the head to epoch 0, checking each inventory's sha256 and row count.
+6. Fetch sample lake blocks over bitswap and check them against digests recomputed from the CID text.
+
+**Exit codes.** 0 when every step passes; 1 when a step is refused; 3 when the drill cannot run.
+
+**Run on 2026-10-06 from main-2.** The only peer was jacob, through a public circuit relay addressed by raw IP. Every step passed:
+
+| Step | Result |
+|---|---|
+| Resolve directory | → `bafkreih357e…` |
+| Directory `lake_log` | Names bundle `bafkreiab2cx…` |
+| Ledger check | Matches the pinned CID |
+| `verify-bundle` | 7 of 7 proofs verify |
+| Epoch 1 | 977 rows |
+| Epoch 0 | 821,533 rows |
+| Blocks | 6 of 6 match |
+
+**Open gap: peer discovery.** jacob has no inbound address of its own (its IPv6 inbound is blocked at the home router), so it is reached through third-party circuit relays. Those rotate. The two relays that worked in the morning no longer carried jacob in the evening. The drill therefore needs jacob's *current* relay address, which the operator read over the tailnet. A cold client has no CF-free, DNS-free way to learn it. A fixed public address for a custodian (an open inbound port, or a host on a third network) would close this gap.
+
+Two bugs this run caught in the drill itself:
+
+- `ipfs id` answers without a daemon, so readiness now waits on `swarm peers`.
+- The verifier must be run under its real filename.
