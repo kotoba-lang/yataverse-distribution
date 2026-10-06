@@ -729,6 +729,7 @@ proofs or performs provider retrieval on a schedule.
 | 0 | `bafkreibefx2ys75aug5qa7rhrxz7hk5g27vpwdu5zr6xu4zb7ikw3urdvy` | `bafybeicgcsswotqjrts3awqegzark4fqygvtqa7k35aewqdp6xkaskndnu` (sha256 `f6169628…`) | 821,533 | 88,410,406,176 |
 | 1 | `bafkreid66nxu3aa5qmpfaxuylex6xm2ufftjvdk4bg72vrkmirmxr5x7by` (`prev` = seq 0) | `bafkreiejtz7cmcd6tcu4nbm5wtgws52t6jtulznmi3od6oqhdic4lbph2e` (the 977-row delta fence) | 977 | 1,482,355,570 |
 | 2 | `bafkreiaw7abt7odmintqolfto4uplb27lkt4ibac7z2qhsv7fdmhw6m4vy` (`prev` = seq 1) | `bafkreigvzf5xeka5e2ekayrziougranb2nwf4kskwjsn33cz456kdng6p4` (sha256 `d5c97b72…`, the delta at cutoff 2026-10-06T12:00Z) | 2,700 | 1,502,215,498 |
+| 3 | `bafkreiawwzepdexaml7izyboyyq72ejfmibgarsnbdtq7qrixdyacokxny` (`prev` = seq 2, signed by the lake operator key) | `bafkreigee73ngsuzj2fqlnzygqhz3mmvgk6xopsf4icyvdqvngrmdwycvq` (the delta at cutoff 2026-10-06T16:00Z) | 48 | 29,040 |
 
 **`deploy/lake_head.cljk`** runs from a score-witness release and has three commands:
 
@@ -986,3 +987,46 @@ The plist uses `ProcessType` `Standard`. With `Background`, while main-2 was und
 - `writer-did` agrees with an independent Python did:key derivation.
 
 **Still unsigned.** Graph seqs 0–2 and every lake seq. The lake operator key is not yet in use. No witness runs `INGA_WRITER_POLICY` yet.
+
+## Epochs without an operator: `deploy/lake_epoch_cycle.py` (2026-10-07)
+
+**What it is.** One resumable run of the full sequence for epoch N. The hosts and paths are in `deploy/lake-epoch-cycle.json`.
+
+**Steps.** Each step refuses to continue unless its check passes.
+
+| Step | Check |
+|---|---|
+| `head` | The verified head is seq N-1. |
+| `capture` | Two listing walks at one cutoff (the hour before now). Both complete. |
+| `diff` | The walks agree. |
+| `resolve` | The log's membership comes from the witnesses and jacob's Kubo. |
+| `delta` | 0 rows ends the run with `NOTHING`. |
+| `xavier` | Replicated through a temporary local reader, then a full leaf readback. |
+| `jacob` | The large-block recovery lane, the CAR ship, `audit_lake --require-complete`, and a full offline readback. |
+| `cids` | The inventory CID is equal on both custodians. |
+| `manifest` | Built, and pinned on both with equal CIDs. |
+| `submit` | `lake_head submit` signed with the lake operator key, then verified 5 of 7. |
+| `bundle` | Built, verified and pinned on both. |
+| `check` | The log now resolves to a superset of the listing. |
+
+The state file in `--work` makes an interrupted run continue from the step where it stopped. Three follow-ups are printed rather than done, because they change public, signed pointers:
+
+- commit the manifest;
+- add the epoch to jacob's reader;
+- point the directory at the new bundle.
+
+**Epoch 3 was the first epoch cut by this run, with no hand steps.**
+
+- Cutoff 2026-10-06T16:00Z. Both walks: 825,258 rows. Delta: 48 rows, 29,040 bytes, none large.
+- xavier: readback 48 of 48. jacob: audit complete and readback 48 of 48.
+- The inventory CID was equal on both custodians.
+- Head `yataverse/lake` seq 3 was VERIFIED by 7 of 7 witnesses. The witnesses' copy carries `writer did:key:z6MkhgmDq3z25d4LdRBrjWeoT33bpQFUrkpWjdxrQtN8WDk6`.
+- `check`: the log resolves to 825,258 rows, equal to the listing at the cutoff.
+
+**Follow-ups, done.**
+
+- jacob's reader serves 4 epochs (`/health` reports `98240a1d…`, 825,258 rows).
+- The directory points at bundle `bafkreidz6x26n…` (IPNS seq 6, HTTPS updated).
+- The independent read drill passes at seq 3 with `dns: none` and `cloudflare: none`.
+
+**One fix found by the run.** `check` re-resolves after the commit, when the log has N+1 epochs. The first version expected N and stopped after the commit had succeeded. A rerun resumed at `check` alone.

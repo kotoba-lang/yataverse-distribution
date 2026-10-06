@@ -1,0 +1,37 @@
+{
+  "ledger": "/Users/junkawasaki/.local/share/isekai-score-v5/bin/score-witness-v5.edn",
+  "lake_head": {
+    "runner": "/opt/homebrew/bin/node /Users/junkawasaki/.local/share/isekai-score-v5/release/engine/cli.js --classpath /Users/junkawasaki/.local/share/isekai-score-v5/release/inga/src:/Users/junkawasaki/.local/share/isekai-score-v5/release/inga-node/src:/Users/junkawasaki/.local/share/isekai-score-v5/release/storage/src:/Users/junkawasaki/.local/share/isekai-score-v5/release/text/src:/Users/junkawasaki/.local/share/isekai-score-v5/release/edn/src:/Users/junkawasaki/.local/share/isekai-score-v5/release/bytes/src",
+    "extra": ["--writer-seed=/Users/junkawasaki/.local/share/yataverse/lake-writer.seed"]
+  },
+  "authority": "inga ref yataverse/lake on chain isekai-score-20261006-v5 (ADR-2610062000 P2, shadow), signed by did:key:z6MkhgmDq3z25d4LdRBrjWeoT33bpQFUrkpWjdxrQtN8WDk6",
+  "epoch0": {
+    "inventory": "/Users/junkawasaki/.local/share/yataverse/inventory-20260926.jsonl",
+    "sha256": "f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188"
+  },
+  "large_bytes": 8000000,
+  "ship_bin": "/Users/junkawasaki/.local/share/yataverse-car-jacob/bin/ship_lake_car.py",
+  "wan": {"jacob": "219.104.136.140", "xavier": "220.146.170.114"},
+  "xavier": {
+    "host": "xavier@xavier",
+    "state": "/mnt/nvme/ipfs-xavier/lake-state",
+    "tools": "/home/xavier/.local/share/yataverse-epoch-tools",
+    "ipfs_bin": "/mnt/nvme/ipfs-xavier/bin/ipfs",
+    "ipfs_path": "/mnt/nvme/ipfs-xavier/repo",
+    "reader_bin": "/home/xavier/.local/bin/yataverse-lake-read",
+    "replicate_bin": "/home/xavier/.local/bin/yataverse-lake-replicate",
+    "car_exporter": "/mnt/nvme/ipfs-xavier/lake-state/bin/export_lake_car_from_kubo.py",
+    "block_url_base": "https://ipfs.yataverse.com/ipfs/",
+    "temp_reader_port": 18121
+  },
+  "jacob": {
+    "host": "junkawasaki@100.117.208.83",
+    "bulk": "/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob",
+    "archive_root": "/Volumes/251220/kotoba-ipfs/recovery",
+    "car_root": "/Volumes/251220/kotoba-ipfs/staging",
+    "ipfs_bin": "/opt/homebrew/bin/ipfs",
+    "ipfs_path": "/Volumes/251220/kotoba-ipfs/repo",
+    "kubo_api_port": 5002,
+    "rpc_tunnel_port": 15092
+  }
+}
