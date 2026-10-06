@@ -27,6 +27,106 @@
             [inga-node.seams :as seams]))
 
 (def fs (js/require "node:fs"))
+(def nc (js/require "node:crypto"))
+
+;; ── writer signatures (opt-in; kotoba-lang/inga#22 inga.writer) ─────────────
+;;
+;; `--writer-seed=FILE` signs each submitted record: FILE holds a 32-byte
+;; Ed25519 seed as hex and never leaves the host. `--writer-policy=FILE` makes
+;; verify, bundle and verify-bundle refuse a head whose writer the policy does
+;; not allow, the way an inga-node running INGA_WRITER_POLICY refuses it.
+;; Without either flag nothing changes.
+;;
+;; These are local copies of inga.writer/signing-text and refusal, because a
+;; score-witness release does not carry inga#22 yet. A record also carries no
+;; "prev" (signed as empty): inga.commitment normalises a record to
+;; ref/seq/cid/prev/height, and today's readers select only ref/seq/cid, so a
+;; prev in the record would stop them verifying it. writer and sig are extra
+;; fields, which commitment ignores.
+
+(defn- argv-flag [k]
+  (some #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(def ^:private b58 "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+(defn- b58-encode [buf]
+  (let [bytes (vec (array-seq buf))
+        digits (reduce (fn [ds byte]
+                         (loop [i 0 carry byte out []]
+                           (if (< i (count ds))
+                             (let [x (+ (* (nth ds i) 256) carry)]
+                               (recur (inc i) (quot x 58) (conj out (rem x 58))))
+                             (loop [carry carry out out]
+                               (if (pos? carry) (recur (quot carry 58) (conj out (rem carry 58))) out)))))
+                       [] bytes)]
+    (str (apply str (repeat (count (take-while zero? bytes)) "1"))
+         (apply str (map #(nth b58 %) (reverse digits))))))
+
+(defn- b58-decode [text]
+  (let [idx (map #(.indexOf b58 %) text)]
+    (when (every? #(>= % 0) idx)
+      (let [bytes (reduce (fn [bs d]
+                            (loop [i 0 carry d out []]
+                              (if (< i (count bs))
+                                (let [x (+ (* (nth bs i) 58) carry)]
+                                  (recur (inc i) (quot x 256) (conj out (rem x 256))))
+                                (loop [carry carry out out]
+                                  (if (pos? carry) (recur (quot carry 256) (conj out (rem carry 256))) out)))))
+                          [] idx)]
+        (js/Buffer.from (clj->js (concat (repeat (count (take-while #(= % 0) idx)) 0) (reverse bytes))))))))
+
+(defn- spki [pub] (.createPublicKey nc #js {:key (js/Buffer.concat #js [(js/Buffer.from #js [0x30 0x2a 0x30 0x05 0x06 0x03 0x2b 0x65 0x70 0x03 0x21 0x00]) pub])
+                                            :format "der" :type "spki"}))
+(defn- pkcs8 [seed] (.createPrivateKey nc #js {:key (js/Buffer.concat #js [(js/Buffer.from #js [0x30 0x2e 0x02 0x01 0x00 0x30 0x05 0x06 0x03 0x2b 0x65 0x70 0x04 0x22 0x04 0x20]) seed])
+                                               :format "der" :type "pkcs8"}))
+
+(defn writer-signing-text
+  "Byte-identical to inga.writer/signing-text."
+  [r]
+  (str "inga/ref-record/v1\n" (get r "ref") "\n" (get r "seq") "\n" (get r "cid") "\n" (or (get r "prev") "")))
+
+(defn did-key->pub [did]
+  (when (and (string? did) (str/starts-with? did "did:key:z"))
+    (when-let [raw (b58-decode (subs did 9))]
+      (when (and (= 34 (.-length raw)) (= 0xed (aget raw 0)) (= 1 (aget raw 1))) (.subarray raw 2)))))
+
+(defn writer-of-seed
+  "-> {:did :sign}. The seed stays in this process."
+  [seed-hex]
+  (let [sk (pkcs8 (js/Buffer.from seed-hex "hex"))
+        pub (-> (.createPublicKey nc sk) (.export #js {:format "der" :type "spki"}) (.subarray 12))]
+    {:did (str "did:key:z" (b58-encode (js/Buffer.concat #js [(js/Buffer.from #js [0xed 0x01]) pub])))
+     :sign (fn [text] (.toString (.sign nc nil (js/Buffer.from text "utf8") sk) "base64"))}))
+
+(defn writer-refusal
+  "Same rule as inga.writer/refusal, with Ed25519 did:key verification."
+  [policy r]
+  (let [allowed (or (get policy (get r "ref"))
+                    (some->> (keys policy)
+                             (filter #(and (str/ends-with? % "/") (str/starts-with? (get r "ref") %)))
+                             (sort-by count >) first (get policy)))]
+    (when allowed
+      (let [w (get r "writer") sig (get r "sig")]
+        (cond
+          (not (and (string? w) (string? sig))) :unsigned
+          (not (contains? allowed w)) :writer-not-allowed
+          (not (try (when-let [pub (did-key->pub w)]
+                      (.verify nc nil (js/Buffer.from (writer-signing-text r) "utf8") (spki pub) (js/Buffer.from sig "base64")))
+                    (catch :default _ false)))
+          :bad-signature
+          :else nil)))))
+
+(def writer
+  (when-let [f (argv-flag "--writer-seed")]
+    (writer-of-seed (str/trim (.readFileSync fs f "utf8")))))
+
+(def writer-policy
+  (when-let [f (argv-flag "--writer-policy")]
+    (let [p (edn/read-string (.readFileSync fs f "utf8"))]
+      (if (and (map? p) (every? string? (keys p)) (every? #(and (set? %) (every? string? %)) (vals p)))
+        p
+        (do (println "REFUSE --writer-policy is not {string #{did:key}}:" f) (js/process.exit 1))))))
 ;; `--ref=` selects the inga ref. Default is the lake log; P4 graph-head mirrors
 ;; use yataverse/graph/<graph-cid> (graph_head_mirror.py). Anything else is
 ;; refused so a typo cannot open a new ref by accident.
@@ -82,9 +182,10 @@
              (let [record (select-keys head ["ref" "seq" "cid"])
                    reason (commitment/verify-commitment
                            {:record record :block (:block proof) :qc (:qc proof)} ctx)]
-               (if reason
-                 {:id (:id w) :refused reason}
+               (if-let [why (or reason (when writer-policy (writer-refusal writer-policy head)))]
+                 {:id (:id w) :refused why}
                  {:id (:id w) :seq (get head "seq") :cid (get head "cid")
+                  :head (select-keys head ["ref" "seq" "cid" "writer" "sig"])
                   :proof-text (aget body "proof")}))))))))
 
 (defn verdict
@@ -123,7 +224,11 @@
   (let [w (nth (:witnesses l) (mod i (count (:witnesses l))))]
     (fetch-json (str (witness-url w) "/submit")
                 {:method "POST" :headers {"content-type" "application/json"}
-                 :body (js/JSON.stringify (clj->js {:record {"ref" ref-name "seq" seq' "cid" cid}}))})))
+                 :body (js/JSON.stringify
+                        (clj->js {:record (let [r {"ref" ref-name "seq" seq' "cid" cid}]
+                                            (if writer
+                                              (assoc r "writer" (:did writer) "sig" ((:sign writer) (writer-signing-text r)))
+                                              r))}))})))
 
 (defn submit!
   "Submit and keep resubmitting (rotating witnesses) until the head at `seq'`
@@ -166,7 +271,10 @@
          (let [members (filter #(and (= (:seq v) (:seq %)) (= (:cid v) (:cid %))) rs)
                b {"schema" "yataverse-lake-proof-bundle/v1"
                   "ref" ref-name "chain-id" (:chain-id l)
-                  "head" {"ref" ref-name "seq" (:seq v) "cid" (:cid v)}
+                  ;; writer/sig ride along when the head was signed, so a
+                  ;; reader with --writer-policy can check the bundle offline.
+                  "head" (merge {"ref" ref-name "seq" (:seq v) "cid" (:cid v)}
+                                (select-keys (:head (first members)) ["writer" "sig"]))
                   "proofs" (vec (for [m members] {"witness" (:id m) "proof" (:proof-text m)}))}]
            (.writeFileSync fs out-path (js/JSON.stringify (clj->js b)))
            (out "BUNDLED" ref-name "seq" (:seq v) "cid" (:cid v) "proofs" (count members) "out" out-path)
@@ -190,6 +298,8 @@
     (cond
       (not (and (= ref-name (get head "ref")) (= (:chain-id l) (get b "chain-id"))))
       (do (out "REFUSE bundle is for" (get head "ref") "on" (get b "chain-id")) (exit! 1))
+      (and writer-policy (writer-refusal writer-policy head))
+      (do (out "REFUSE bundle head writer:" (name (writer-refusal writer-policy head))) (exit! 1))
       (>= ok min-agree)
       (do (out "VERIFIED-BUNDLE" ref-name "seq" (get head "seq") "cid" (get head "cid")
                "proofs-ok" ok "(committed by quorum; not a proof that no higher seq exists)" detail)
@@ -280,4 +390,5 @@
                (when-not (and (nat-int? seq') (string? b) (re-matches #"baf[a-z2-7]{50,}" b))
                  (out "REFUSE usage: submit <ledger> <seq> <manifest-cid>") (exit! 1))
                (submit! (ledger ledger-path) seq' b min-agree))
-    (do (out "REFUSE usage: verify <ledger> | submit <ledger> <seq> <cid>  [--ref=yataverse/graph/<cid>]") (exit! 1))))
+    "writer-did" (if writer (do (out (:did writer)) (exit! 0)) (do (out "REFUSE writer-did needs --writer-seed=FILE") (exit! 1)))
+    (do (out "REFUSE usage: verify <ledger> | submit <ledger> <seq> <cid>  [--ref=yataverse/graph/<cid>] [--writer-seed=FILE] [--writer-policy=FILE]") (exit! 1))))
