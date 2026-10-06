@@ -1,0 +1,214 @@
+;; deploy/lake_head.cljk — the yataverse lake log on inga (ADR-2610062000 P2).
+;;
+;; Lake membership is a chain of CID-addressed manifests. The head is the inga
+;; ref `yataverse/lake`; each seq names one manifest CID. This file reads that
+;; head the only way that does not trust the host it is read from: every
+;; witness's answer is checked with inga.commitment (the record is in the
+;; block, the block hash is the one the certificate names, and the certificate
+;; carries a quorum of signatures from the PINNED public keys), and a head is
+;; believed only when `--min` witnesses prove the same (seq, cid).
+;;
+;; Run from a score-witness release (it carries inga, inga-node and their
+;; pinned deps):
+;;   node <release>/engine/cli.js \
+;;     --classpath "<release>/inga/src:<release>/inga-node/src:<release>/storage/src:<release>/text/src:<release>/edn/src:<release>/bytes/src" \
+;;     deploy/lake_head.cljk verify <score-witness-v5.edn> [--min=5]
+;;   ... deploy/lake_head.cljk submit <score-witness-v5.edn> <seq> <manifest-cid> [--min=5]
+;;
+;; Exit: 0 verified / submitted-and-verified; 1 refused (REFUSE line names the
+;; reason, e.g. a different CID already holds that seq); 3 could not reach a
+;; verdict (too few witnesses answered with a valid proof).
+
+(ns lake-head
+  (:require [clojure.string :as str]
+            [kotoba.lang.edn :as edn]
+            [inga.consensus :as c]
+            [inga.commitment :as commitment]
+            [inga-node.seams :as seams]))
+
+(def fs (js/require "node:fs"))
+(def ref-name "yataverse/lake")
+
+(defn- out [& xs] (println (str/join " " xs)))
+(defn- exit! [code] (js/process.exit code))
+
+(defn ledger [path]
+  (let [l (edn/read-string (.readFileSync fs path "utf8"))
+        ids (mapv :id (:witnesses l))]
+    (when-not (and (= 7 (count ids)) (= (set ids) (set (keys (:pubkeys l)))))
+      (out "REFUSE ledger lacks a full pinned key set:" path)
+      (exit! 1))
+    l))
+
+(defn context [l]
+  (let [ids (mapv :id (:witnesses l))]
+    {:chain-id (:chain-id l)
+     :hash-fn seams/hash-fn
+     :quorum (c/quorum-size (count ids))
+     :verify-fn (seams/verify-fn (:pubkeys l))
+     :admitted? (set ids)
+     :decode-proposal (fn [s] (try (js->clj (js/JSON.parse s)) (catch :default _ nil)))}))
+
+(defn- fetch-json [url opts]
+  (-> (js/fetch url (clj->js (merge {:signal (js/AbortSignal.timeout 8000)} opts)))
+      (.then (fn [r] (if (.-ok r) (.json r) nil)))
+      (.catch (fn [_] nil))))
+
+(defn- witness-url [w] (str "http://" (:ip w) ":" (:port w)))
+
+(defn- check-one
+  "One witness's head, verified, as {:id :seq :cid} — or {:id :refused reason}."
+  [ctx w]
+  (-> (fetch-json (str (witness-url w) "/committed?ref=" (js/encodeURIComponent ref-name)) {})
+      (.then
+       (fn [body]
+         (let [head (some-> body (aget "head") js->clj)
+               proof (some-> body (aget "proof") edn/read-string)]
+           (cond
+             (nil? body) {:id (:id w) :refused :unreachable}
+             (nil? head) {:id (:id w) :refused :no-head}
+             (not (and (map? proof) (:block proof) (:qc proof))) {:id (:id w) :refused :no-proof}
+             :else
+             (let [record (select-keys head ["ref" "seq" "cid"])
+                   reason (commitment/verify-commitment
+                           {:record record :block (:block proof) :qc (:qc proof)} ctx)]
+               (if reason
+                 {:id (:id w) :refused reason}
+                 {:id (:id w) :seq (get head "seq") :cid (get head "cid")}))))))))
+
+(defn verdict
+  "Pure. results from check-one. -> {:status :verified|:split|:unmeasured ...}"
+  [results min-agree]
+  (let [ok (remove :refused results)
+        groups (group-by (juxt :seq :cid) ok)
+        [[seq cid] members] (last (sort-by (comp count val) groups))]
+    (cond
+      (and members (>= (count members) min-agree))
+      {:status :verified :seq seq :cid cid :witnesses (sort (map :id members))}
+      (> (count groups) 1) {:status :split :groups (into {} (map (fn [[k v]] [k (map :id v)]) groups))}
+      :else {:status :unmeasured :verified (count ok)})))
+
+(defn verify! [l min-agree]
+  (let [ctx (context l)]
+    (-> (js/Promise.all (clj->js (map #(check-one ctx %) (:witnesses l))))
+        (.then (fn [rs] (let [rs (vec (array-seq rs))] [rs (verdict rs min-agree)]))))))
+
+(defn- report [[rs v]]
+  (let [detail (str/join "," (map #(str (:id %) "=" (or (some-> (:refused %) name) (str (:seq %) ":" (subs (:cid %) 0 14)))) rs))]
+    (case (:status v)
+      :verified (out "VERIFIED" ref-name "seq" (:seq v) "cid" (:cid v) "by" (count (:witnesses v)) "witnesses" detail)
+      :split (out "REFUSE witnesses disagree" (pr-str (:groups v)) detail)
+      (out "UNMEASURED only" (:verified v) "witnesses proved a head" detail))
+    v))
+
+(defn- submit-once [l seq' cid i]
+  (let [w (nth (:witnesses l) (mod i (count (:witnesses l))))]
+    (fetch-json (str (witness-url w) "/submit")
+                {:method "POST" :headers {"content-type" "application/json"}
+                 :body (js/JSON.stringify (clj->js {:record {"ref" ref-name "seq" seq' "cid" cid}}))})))
+
+(defn submit!
+  "Submit and keep resubmitting (rotating witnesses) until the head at `seq'`
+  is verified. A submission can be accepted into a mempool and still never be
+  committed (observed 2026-10-06: the first epoch-0 submit vanished), so
+  `submitted: true` is not an outcome."
+  [l seq' cid min-agree]
+  (letfn [(attempt [i]
+            (if (> i 12)
+              (do (out "UNMEASURED gave up after" i "submissions") (exit! 3))
+              (-> (submit-once l seq' cid i)
+                  (.then (fn [_] (js/Promise. (fn [res] (js/setTimeout res 20000)))))
+                  (.then (fn [_] (verify! l min-agree)))
+                  (.then (fn [[rs v]]
+                           (cond
+                             (and (= :verified (:status v)) (= seq' (:seq v)) (= cid (:cid v)))
+                             (do (report [rs v]) (exit! 0))
+                             (and (= :verified (:status v)) (>= (:seq v) seq') (not= cid (:cid v))
+                                  (= seq' (:seq v)))
+                             (do (out "REFUSE seq" seq' "is held by" (:cid v)) (exit! 1))
+                             (and (= :verified (:status v)) (> (:seq v) seq'))
+                             (do (out "REFUSE head already at seq" (:seq v)) (exit! 1))
+                             :else (attempt (inc i))))))))]
+    (attempt 0)))
+
+;; ── resolve: membership from the log, not from a dated file ────────────────
+
+(def crypto (js/require "node:crypto"))
+
+(defn- ipfs-cat [rpc cid]
+  ;; Kubo RPC is POST-only. A local node verifies blocks against their CIDs as
+  ;; it reads them; the sha256 below is the manifest's own claim, checked too.
+  (-> (js/fetch (str rpc "/api/v0/cat?arg=" cid)
+                #js {:method "POST" :signal (js/AbortSignal.timeout 120000)})
+      (.then (fn [r] (if (.-ok r) (.arrayBuffer r)
+                         (throw (js/Error. (str "ipfs cat " cid " HTTP " (.-status r)))))))
+      (.then (fn [ab] (js/Buffer.from ab)))))
+
+(defn- sha256-hex [buf] (-> (.createHash crypto "sha256") (.update buf) (.digest "hex")))
+
+(defn resolve!
+  "Verify the head, then walk prev links to epoch 0. Every manifest must
+  carry epoch == its seq and the prev CID the walk arrived from; every
+  inventory must match its manifest's sha256 and row count. Writes the
+  inventories concatenated in epoch order to `out`."
+  [l min-agree rpc out-path]
+  (-> (verify! l min-agree)
+      (.then
+       (fn [[rs v]]
+         (when-not (= :verified (:status v)) (report [rs v]) (exit! 3))
+         (letfn [(walk [seq' cid acc]
+                   (-> (ipfs-cat rpc cid)
+                       (.then
+                        (fn [buf]
+                          (let [m (js->clj (js/JSON.parse (.toString buf "utf8")))
+                                inv (get m "inventory")]
+                            (when-not (and (= "yataverse-lake-manifest/v1" (get m "schema"))
+                                           (= seq' (get m "epoch")))
+                              (out "REFUSE manifest" cid "is not epoch" seq') (exit! 1))
+                            (when (and (pos? seq') (nil? (get m "prev")))
+                              (out "REFUSE manifest" cid "has no prev at epoch" seq') (exit! 1))
+                            (-> (ipfs-cat rpc (get inv "cid"))
+                                (.then
+                                 (fn [ibuf]
+                                   (let [rows (count (filter seq (str/split (.toString ibuf "utf8") #"\n")))]
+                                     (when-not (and (= (get inv "sha256") (sha256-hex ibuf))
+                                                    (= (get inv "rows") rows))
+                                       (out "REFUSE inventory" (get inv "cid") "differs from manifest" cid)
+                                       (exit! 1))
+                                     (let [acc (conj acc {:epoch seq' :buf ibuf :rows rows :bytes (get inv "bytes")})]
+                                       (if (zero? seq')
+                                         acc
+                                         (walk (dec seq') (get m "prev") acc))))))))))))]
+           (walk (:seq v) (:cid v) []))))
+      (.then
+       (fn [acc]
+         (let [ordered (sort-by :epoch acc)
+               joined (js/Buffer.concat (clj->js (map :buf ordered)))]
+           (.writeFileSync fs out-path joined)
+           (out "RESOLVED" ref-name "epochs" (count ordered)
+                "rows" (reduce + (map :rows ordered))
+                "bytes" (reduce + (map :bytes ordered))
+                "sha256" (sha256-hex joined) "out" out-path)
+           (exit! 0))))
+      (.catch (fn [e] (out "UNMEASURED" (.-message e)) (exit! 3)))))
+
+(let [argv (vec (array-seq (aget js/process "argv")))
+      args (vec (rest (drop-while #(not (str/ends-with? % "lake_head.cljk")) argv)))
+      flag (fn [k d] (or (some #(when (str/starts-with? % (str k "="))
+                                  (js/parseInt (subs % (inc (count k))) 10)) args) d))
+      pos (vec (remove #(str/starts-with? % "--") args))
+      [cmd ledger-path a b] pos
+      min-agree (flag "--min" 5)]
+  (case cmd
+    "verify" (-> (verify! (ledger ledger-path) min-agree)
+                 (.then report)
+                 (.then (fn [v] (exit! (case (:status v) :verified 0 :split 1 3)))))
+    "resolve" (let [sflag (fn [k] (some #(when (str/starts-with? % (str k "=")) (subs % (inc (count k)))) args))]
+                (resolve! (ledger ledger-path) min-agree
+                          (or (sflag "--rpc") "http://127.0.0.1:5001")
+                          (or (sflag "--out") (do (out "REFUSE resolve needs --out=FILE") (exit! 1)))))
+    "submit" (let [seq' (js/parseInt a 10)]
+               (when-not (and (nat-int? seq') (string? b) (re-matches #"baf[a-z2-7]{50,}" b))
+                 (out "REFUSE usage: submit <ledger> <seq> <manifest-cid>") (exit! 1))
+               (submit! (ledger ledger-path) seq' b min-agree))
+    (do (out "REFUSE usage: verify <ledger> | submit <ledger> <seq> <cid>") (exit! 1))))

@@ -717,3 +717,36 @@ proofs or performs provider retrieval on a schedule.
   peaked at 370, 470 and 731 MiB RSS), and its e2e test runs on calibration with a
   2 MiB CAR and on the in-memory network. It has not run on mainnet, and it is not
   wired into the shipping or replication timers.
+
+## Lake log on inga (2026-10-06, ADR-2610062000 P2, shadow)
+
+**Purpose.** Lake membership no longer has to be "whatever R2's `ipld/` listing says". It is now a chain of CID-addressed manifests, and the head is the inga ref `yataverse/lake` on the v5 witness chain `isekai-score-20261006-v5`. That chain's public keys are pinned in network-awai/network-isekai `deploy/score-witness-v5.edn`.
+
+**Committed epochs.** Both manifests are in `deploy/lake-manifests/`. Each was added to IPFS on jacob (WAN 219.104.x) and xavier (WAN 220.146.x) independently, and both produced the same CID.
+
+| Seq | Manifest | Inventory | Rows | Bytes |
+|---|---|---|---|---|
+| 0 | `bafkreibefx2ys75aug5qa7rhrxz7hk5g27vpwdu5zr6xu4zb7ikw3urdvy` | `bafybeicgcsswotqjrts3awqegzark4fqygvtqa7k35aewqdp6xkaskndnu` (sha256 `f6169628…`) | 821,533 | 88,410,406,176 |
+| 1 | `bafkreid66nxu3aa5qmpfaxuylex6xm2ufftjvdk4bg72vrkmirmxr5x7by` (`prev` = seq 0) | `bafkreiejtz7cmcd6tcu4nbm5wtgws52t6jtulznmi3od6oqhdic4lbph2e` (the 977-row delta fence) | 977 | 1,482,355,570 |
+
+**`deploy/lake_head.cljk`** runs from a score-witness release and has three commands:
+
+- **`verify <ledger>`** reads `/committed?ref=yataverse/lake` from every witness. It checks each proof with `inga.commitment/verify-commitment`: the record is in the block, the certificate names that block, and the signatures come from the pinned keys. The head is believed only when at least 5 witnesses prove the same `(seq, cid)`.
+- **`submit <ledger> <seq> <cid>`** resubmits until the head is verified. On 2026-10-06 one submission was accepted and then never committed, so `submitted: true` is not treated as an outcome. If another CID already holds the seq, it refuses and names that CID.
+- **`resolve <ledger> --rpc=… --out=FILE`** verifies the head, walks `prev` back to epoch 0 through a local Kubo node, and checks each inventory against its manifest's sha256 and row count.
+
+Exit codes are 0, 1 (`REFUSE` with a reason) and 3 (`UNMEASURED`).
+
+**Measured on 2026-10-06.**
+
+- `verify` returned VERIFIED by all 7 witnesses.
+- With `--min=8`, `verify` exited 3.
+- With one pinned key corrupted, that witness's proof was refused as `bad-signature` and the other 6 still verified. With every key corrupted, no proof verified and it exited 3.
+- A conflicting `submit` at seq 1 was refused, naming the holder.
+- `resolve` on jacob, against its own Kubo, returned 2 epochs, 822,510 rows and sha256 `f095a4e2…`. That is byte-identical to `inventory-20260926.jsonl` and `inventory-delta-fence-20260929.jsonl` concatenated.
+
+**Still shadow.**
+
+- `/api/v1/lake/blocks` still lists R2.
+- New blocks reach the log only when an operator commits a new epoch.
+- Custody of epoch 0 is proven by jacob's receipt audit and leaf readback against inventory `f6169628`. Custody of epoch 1 rests on the 2026-09-29 pin record; nothing has yet audited it against the log.
