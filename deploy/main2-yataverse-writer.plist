@@ -37,6 +37,8 @@
 		<string>/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=15 junkawasaki@100.117.208.83 IPFS_PATH=/Volumes/251220/kotoba-ipfs/repo /opt/homebrew/bin/ipfs cat {cid}</string>
 		<string>--out-dir</string>
 		<string>/Users/junkawasaki/.local/share/yataverse-graph-mirror/docs</string>
+		<string>--sync-pins</string>
+		<string>1</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

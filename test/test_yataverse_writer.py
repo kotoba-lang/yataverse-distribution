@@ -62,3 +62,46 @@ class Decide(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StaleCache(unittest.TestCase):
+    def _writer(self, fresh, outcomes):
+        w = yw.Writer.__new__(yw.Writer)
+        w.locks, w.guard, w.cache = {}, yw.threading.Lock(), {}
+        w.a = type("A", (), {"signer": []})()
+        calls = []
+        w.current = lambda graph: fresh
+
+        def fake_write(graph, expected, head, cur):
+            calls.append(cur)
+            r = outcomes.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        w._write = fake_write
+        return w, calls
+
+    def test_a_stale_cache_is_re_read_once_before_answering_conflict(self):
+        stale, fresh = (4, "c4", {}), (5, "c5", {})
+        w, calls = self._writer(fresh, [yw.Conflict(None), {"seq": 6}])
+        w.cache[G] = stale
+        orig = gm.verify_head
+        gm.verify_head = lambda *a: None
+        try:
+            self.assertEqual(w.write(G, {"sequence": 11}, {"sequence": 12}), {"seq": 6})
+        finally:
+            gm.verify_head = orig
+        self.assertEqual(calls, [stale, fresh], "decided on the cache, then on a fresh read")
+
+    def test_a_real_conflict_is_still_a_conflict(self):
+        cur = (5, "c5", {})
+        w, calls = self._writer(cur, [yw.Conflict({"sequence": 11, "value": "v"})])
+        w.cache[G] = cur
+        orig = gm.verify_head
+        gm.verify_head = lambda *a: None
+        try:
+            with self.assertRaises(yw.Conflict):
+                w.write(G, {"sequence": 9}, {"sequence": 12})
+        finally:
+            gm.verify_head = orig
+        self.assertEqual(calls, [cur], "a fresh read equal to the cache is not retried")
