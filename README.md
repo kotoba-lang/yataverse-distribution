@@ -1159,3 +1159,15 @@ The entrance is rate-limited at 2 r/s per address with a burst of 10, takes bodi
 **Worker side.** cloud-kotoba/kotobase-control-plane#775 adds `KOTOBASE_HEAD_INGA=writer`. It is off until the yataverse env sets it and is deployed; that is the cutover.
 
 **Follower.** `deploy/main2-r2-head-follower.plist` runs `r2_head_follower.py` in check mode every 10 minutes. The first run reported three graphs `AGREE` and one `R2-AHEAD` by one sequence, which is normal while R2 is still the authority.
+
+**Write latency down to about 5 s (2026-10-07).** Measured on real writes. The first write ran with a cold cache.
+
+| Change | Before | After |
+|---|---|---|
+| jacob is pinned in the background after the commit, with retries; xavier stays synchronous (`--sync-pins 1`) | pins 16.8 s | 0.4 s |
+| Submissions go to all 7 witnesses at once | — | — |
+| `--landed=1`: the writer answers when one witness of the fleet reports the committed head, instead of waiting for five proof sidecars | submit 12–43 s | 4.6 s |
+| The head cache is kept warm by the follower's reads | cold read on each write | warm |
+| End to end | 18–55 s | 5.1 s |
+
+The commit itself landed 2.9 s after submission. Readers still verify the 5-of-7 proofs independently. The lake cycle keeps using verified submits.

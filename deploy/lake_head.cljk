@@ -228,6 +228,24 @@
       {:status :absent}
       :else {:status :unmeasured :verified (count ok)})))
 
+(defn landed!
+  "Like verify!, but believes the committed head N witnesses report WITHOUT
+  checking their proofs. For the yataverse-writer's answer only
+  (ADR-2610062000 P5): the witnesses are one operator's fleet (CFT, D6), a
+  witness writes a committed record only after its own 3-chain commit, and
+  every reader still verifies proofs independently. Waiting for five proof
+  sidecars, which appear only once the next certificate is visible, added
+  about 12 s to every write (measured 2026-10-07)."
+  [l n]
+  (-> (js/Promise.all
+       (clj->js (for [w (:witnesses l)]
+                  (-> (fetch-json (str (witness-url w) "/committed?ref=" (js/encodeURIComponent ref-name)) {})
+                      (.then (fn [body]
+                               (let [h (some-> body (aget "head") js->clj)]
+                                 (if h {:id (:id w) :seq (get h "seq") :cid (get h "cid")}
+                                     {:id (:id w) :refused (if body :no-head :unreachable)}))))))))
+      (.then (fn [rs] (let [rs (vec (array-seq rs))] [rs (verdict rs n)])))))
+
 (defn verify! [l min-agree]
   (let [ctx (context l)]
     (-> (js/Promise.all (clj->js (map #(check-one ctx %) (:witnesses l))))
@@ -257,32 +275,41 @@
   is verified. A submission can be accepted into a mempool and still never be
   committed (observed 2026-10-06: the first epoch-0 submit vanished), so
   `submitted: true` is not an outcome."
-  [l seq' cid min-agree]
+  [l seq' cid min-agree landed]
   ;; Each submission is followed by up to ten verifies two seconds apart, not
   ;; one verify after twenty. A healthy chain commits in a few seconds, and the
   ;; yataverse-writer (ADR-2610062000 P5) answers a Worker's write only after
   ;; this returns, so the wait is write latency. The overall bound (13
   ;; submissions, about 20 s each) is unchanged.
+  (let [t0 (js/Date.now)]
   (letfn [(sleep [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
+          (stamp [what i] (.write js/process.stderr (str "SUBMIT " what " attempt " i " t+" (- (js/Date.now) t0) "ms\n")))
+          (check [l] (if landed (landed! l landed) (verify! l min-agree)))
           (settle [[rs v] i poll]
             (cond
               (and (= :verified (:status v)) (= seq' (:seq v)) (= cid (:cid v)))
-              (do (report [rs v]) (exit! 0))
+              (do (stamp "committed" i) (report [rs v]) (exit! 0))
               (and (= :verified (:status v)) (not= cid (:cid v)) (= seq' (:seq v)))
               (do (out "REFUSE seq" seq' "is held by" (:cid v)) (exit! 1))
               (and (= :verified (:status v)) (> (:seq v) seq'))
               (do (out "REFUSE head already at seq" (:seq v)) (exit! 1))
-              (< poll 9) (-> (sleep 2000) (.then (fn [_] (verify! l min-agree)))
+              (< poll 39) (-> (sleep 500) (.then (fn [_] (check l)))
                              (.then #(settle % i (inc poll))))
               :else (attempt (inc i))))
           (attempt [i]
             (if (> i 12)
               (do (out "UNMEASURED gave up after" i "submissions") (exit! 3))
-              (-> (submit-once l seq' cid i)
-                  (.then (fn [_] (sleep 2000)))
-                  (.then (fn [_] (verify! l min-agree)))
+              ;; To every witness at once. A record waits in the mempool of the
+              ;; witness it reached until THAT witness leads a block, which
+              ;; with seven rotating leaders is up to a full rotation (~12 s
+              ;; measured on v5) before the commit itself. Sent to all, it rides
+              ;; the next block whoever leads it. Duplicates are harmless: the
+              ;; ref's first-wins sequence ignores an identical later record.
+              (-> (js/Promise.all (clj->js (map #(submit-once l seq' cid %) (range (count (:witnesses l))))))
+                  (.then (fn [_] (stamp "submitted" i) (sleep 500)))
+                  (.then (fn [_] (check l)))
                   (.then #(settle % i 0)))))]
-    (attempt 0)))
+    (attempt 0))))
 
 ;; ── bundle: a proof anyone can check without the tailnet ────────────────────
 ;;
@@ -419,6 +446,6 @@
     "submit" (let [seq' (js/parseInt a 10)]
                (when-not (and (nat-int? seq') (string? b) (re-matches #"baf[a-z2-7]{50,}" b))
                  (out "REFUSE usage: submit <ledger> <seq> <manifest-cid>") (exit! 1))
-               (submit! (ledger ledger-path) seq' b min-agree))
+               (submit! (ledger ledger-path) seq' b min-agree (flag "--landed" nil)))
     "writer-did" (if writer (do (out (:did writer)) (exit! 0)) (do (out "REFUSE writer-did needs --writer-seed=FILE") (exit! 1)))
     (do (out "REFUSE usage: verify <ledger> | submit <ledger> <seq> <cid>  [--ref=yataverse/graph/<cid>] [--writer-seed=FILE] [--writer-policy=FILE]") (exit! 1))))

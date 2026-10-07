@@ -33,6 +33,8 @@ import os
 import shlex
 import sys
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -83,6 +85,11 @@ class Writer:
         self.a = args
         self.locks = {}
         self.guard = threading.Lock()
+        # The head this writer last committed or read, per graph. A write
+        # starts from it instead of asking the witnesses again (a cold node
+        # start plus a quorum check). A stale entry is safe: inga refuses a
+        # submit whose sequence is already held, and that refusal re-reads.
+        self.cache = {}
         os.makedirs(args.out_dir, exist_ok=True)
 
     def lock(self, graph):
@@ -105,30 +112,75 @@ class Writer:
     def write(self, graph, expected, head):
         gm.verify_head(head, graph, set(self.a.signer))
         with self.lock(graph):
-            cur = self.current(graph)
-            action, step = decide(graph, expected, head, cur[2] if cur else None)
-            if action == "commit":
-                return {"seq": cur[0], "cid": cur[1], "sequence": head["sequence"], "value": head["value"]}
-            seq, prev = step[0], (cur[1] if cur else None)
-            data = gm.mirror_doc(graph, seq, prev, head)
-            cid = gm.raw_cid(data)
-            with open(os.path.join(self.a.out_dir, cid + ".json"), "wb") as f:
-                f.write(data)
-            for pin in self.a.pin_cmd:
-                code, out, err = gm.run(shlex.split(pin), data=data)
-                if code != 0 or out.decode().strip() != cid:
-                    raise gm.Unmeasured(f"pin via {pin.split()[0]} did not return {cid}")
-            ref = "yataverse/graph/" + graph
-            code, out, _ = gm.run(shlex.split(self.a.verifier) + ["submit", self.a.ledger, str(seq), cid, "--ref=" + ref],
-                                  timeout=600)
-            last = (out.decode(errors="replace").strip().splitlines() or [""])[-1]
-            if code == 1:
-                # Another writer took the sequence. Report what is there now.
-                now = self.current(graph)
-                raise Conflict({"sequence": now[2]["head"]["sequence"], "value": now[2]["head"]["value"]} if now else None)
-            if code != 0:
-                raise gm.Unmeasured(last[:200])
-            return {"seq": seq, "cid": cid, "sequence": head["sequence"], "value": head["value"]}
+            cur = self.cache.get(graph) or self.current(graph)
+            try:
+                return self._write(graph, expected, head, cur)
+            except Conflict:
+                # The cache may have been the stale party. Decide again on a
+                # fresh read before answering 409.
+                fresh = self.current(graph)
+                if fresh != cur:
+                    self.cache.pop(graph, None)
+                    return self._write(graph, expected, head, fresh)
+                raise
+
+    def _late_pin(self, pin, data, cid):
+        for attempt in range(6):
+            code, out, _ = gm.run(shlex.split(pin), data=data, timeout=600)
+            if code == 0 and out.decode().strip() == cid:
+                sys.stderr.write(f"LATE-PIN {cid} via {pin.split()[0]} ok (attempt {attempt + 1})\n")
+                return
+            time.sleep(30 * (attempt + 1))
+        sys.stderr.write(f"LATE-PIN {cid} via {pin.split()[0]} FAILED\n")
+
+    def _write(self, graph, expected, head, cur):
+        t0 = time.time()
+        action, step = decide(graph, expected, head, cur[2] if cur else None)
+        if action == "commit":
+            self.cache[graph] = cur
+            return {"seq": cur[0], "cid": cur[1], "sequence": head["sequence"], "value": head["value"]}
+        seq, prev = step[0], (cur[1] if cur else None)
+        data = gm.mirror_doc(graph, seq, prev, head)
+        cid = gm.raw_cid(data)
+        with open(os.path.join(self.a.out_dir, cid + ".json"), "wb") as f:
+            f.write(data)
+        # Both custodians at once: the pins are independent, and they were
+        # two sequential ssh round trips on every write.
+        #
+        # The first --sync-pins custodians must hold the document before it is
+        # submitted. The rest are pinned after the commit, in the background,
+        # with retries: jacob's Kubo sits on a busy HDD and took 16.8 s for a
+        # 500-byte add (2026-10-07), which was most of a write's latency. The
+        # document also stays in --out-dir here, so it is never held by one
+        # node alone while the background pin catches up.
+        sync, rest = self.a.pin_cmd[:self.a.sync_pins], self.a.pin_cmd[self.a.sync_pins:]
+        with ThreadPoolExecutor(len(sync)) as pool:
+            results = list(pool.map(lambda pin: gm.run(shlex.split(pin), data=data), sync))
+        t_pin = time.time()
+        for pin, (code, out, _err) in zip(sync, results):
+            if code != 0 or out.decode().strip() != cid:
+                raise gm.Unmeasured(f"pin via {pin.split()[0]} did not return {cid}")
+        ref = "yataverse/graph/" + graph
+        # --landed=1: answer once one witness of this fleet reports the commit
+        # (see lake_head landed!); readers verify the 5-of-7 proofs themselves.
+        code, out, err = gm.run(shlex.split(self.a.verifier) + ["submit", self.a.ledger, str(seq), cid,
+                                                                "--ref=" + ref, "--landed=%d" % self.a.landed],
+                                timeout=600)
+        sys.stderr.write(err.decode(errors="replace"))
+        last = (out.decode(errors="replace").strip().splitlines() or [""])[-1]
+        if code == 1:
+            # Another writer took the sequence. Report what is there now.
+            now = self.current(graph)
+            raise Conflict({"sequence": now[2]["head"]["sequence"], "value": now[2]["head"]["value"]} if now else None)
+        if code != 0:
+            raise gm.Unmeasured(last[:200])
+        self.cache[graph] = (seq, cid, json.loads(data))
+        for pin in rest:
+            threading.Thread(target=self._late_pin, args=(pin, data, cid), daemon=True).start()
+        # Where a write's time goes, for the P5 latency budget.
+        sys.stderr.write(f"TIMING {graph[:14]} seq {seq} pins {t_pin - t0:.1f}s "
+                         f"submit {time.time() - t_pin:.1f}s total {time.time() - t0:.1f}s\n")
+        return {"seq": seq, "cid": cid, "sequence": head["sequence"], "value": head["value"]}
 
 
 def handler(writer):
@@ -155,6 +207,10 @@ def handler(writer):
                 return self.reply(400, {"refused": "graph must be a CID"})
             try:
                 cur = writer.current(graph)
+                # The follower reads every graph every ten minutes, so this
+                # keeps the write path's starting point warm.
+                if cur is not None:
+                    writer.cache[graph] = cur
             except gm.Refused as e:
                 return self.reply(409, {"refused": str(e)})
             except (gm.Unmeasured, Exception) as e:
@@ -200,10 +256,16 @@ def main(argv=None):
     p.add_argument("--ledger", required=True)
     p.add_argument("--pin-cmd", action="append", default=[])
     p.add_argument("--cat-cmd", required=True)
+    p.add_argument("--landed", type=int, default=1,
+                   help="witnesses that must report the commit before the writer answers")
+    p.add_argument("--sync-pins", type=int, default=2,
+                   help="how many --pin-cmd custodians must hold a document before it is submitted")
     p.add_argument("--out-dir", required=True)
     a = p.parse_args(argv)
     if len(a.pin_cmd) < 2:
         p.error("pin each document on at least two custodians (--pin-cmd twice)")
+    if not 1 <= a.sync_pins <= len(a.pin_cmd):
+        p.error("--sync-pins must be between 1 and the number of --pin-cmd")
     srv = ThreadingHTTPServer((a.host, a.port), handler(Writer(a)))
     print(f"yataverse-writer on {a.host}:{a.port}", flush=True)
     srv.serve_forever()
