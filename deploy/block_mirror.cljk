@@ -26,8 +26,11 @@
 
 (def fs (js/require "node:fs"))
 
-(defn- fetch-json [url]
+(defn- fetch-json
+  "GET JSON; one retry on a network error (a reset reused connection)."
+  [url & [retried]]
   (-> (js/fetch url #js {:signal (.timeout js/AbortSignal 30000)})
+      (.catch (fn [e] (if retried (throw e) (js/fetch url #js {:signal (.timeout js/AbortSignal 30000)}))))
       (.then (fn [^js r]
                (when-not (= 200 (.-status r)) (throw (g/unmeasured (str url " answered " (.-status r)))))
                (.json r)))
