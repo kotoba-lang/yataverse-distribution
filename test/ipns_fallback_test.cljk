@@ -1,0 +1,39 @@
+;; Gate for deploy/ipns_fallback.cljk (ported from test_ipns_fallback.py).
+(ns ipns-fallback-test
+  (:require [clojure.string :as str]
+            [ipns-fallback :as f]))
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+(def NAME "k51qzi5uqu5dka7ydlst4i6fsavfb4g5t3fji95agn17yq5gw8yvm3rlh67n0q")
+(def now (js/Date.parse "2026-10-07T00:00:00Z"))
+(defn entry [hours-left & [seq value]]
+  #js {"Value" (or value "/ipfs/bafkcurrent") "Sequence" (or seq 4)
+       "Validity" (str (subs (.toISOString (js/Date. (+ now (* hours-left 3600000)))) 0 19) ".000000000Z")})
+(defn fake [e & {:keys [resolve-to publish-ok] :or {publish-ok true}}]
+  (let [calls (atom [])]
+    {:calls calls
+     :get-record (fn [n] (swap! calls conj [:get n]) (if e [(js/Buffer.from "signed-bytes") e] [nil nil]))
+     :put-record (fn [n r] (swap! calls conj [:put n (str r)]) true)
+     :publish (fn [k v s] (swap! calls conj [:publish k v s]) publish-ok)
+     :resolve (fn [n] (or resolve-to (some-> e .-Value)))}))
+(def day (* 24 3600000))
+(println "ipns-fallback gate:")
+(let [ipfs (fake (entry 100)) [ok line] (f/keep-name ipfs NAME "k" now day)]
+  (check "a fresh record is re-put unchanged and never re-signed"
+         (and ok (str/starts-with? line "KEPT") (some #{[:put NAME "signed-bytes"]} @(:calls ipfs))
+              (not-any? #(= :publish (first %)) @(:calls ipfs)))))
+(let [ipfs (fake (entry 10 7)) [ok line] (f/keep-name ipfs NAME "k" now day)]
+  (check "an expiring record is re-signed with the same value and the next sequence"
+         (and ok (some #{[:publish "k" "/ipfs/bafkcurrent" 8]} @(:calls ipfs)) (str/starts-with? line "RESIGNED"))))
+(let [[ok line] (f/keep-name (fake (entry 24)) NAME "k" now day)]
+  (check "the boundary, exactly at the threshold, re-signs" (str/starts-with? line "RESIGNED")))
+(let [ipfs (fake nil) [ok line] (f/keep-name ipfs NAME "k" now day)]
+  (check "an unfetchable name is refused, not invented"
+         (and (not ok) (str/includes? line "not inventing a value") (= [[:get NAME]] @(:calls ipfs)))))
+(let [[ok line] (f/keep-name (fake (entry 1) :resolve-to "/ipfs/bafkother") NAME "k" now day)]
+  (check "a re-sign that does not take effect is refused" (and (not ok) (str/includes? line "resolves to"))))
+(let [[ok line] (f/keep-name (fake (entry 1) :publish-ok false) NAME "k" now day)]
+  (check "a failed publish is refused" (and (not ok) (str/includes? line "re-sign"))))
+(check "validity with nanoseconds parses" (= now (f/parse-validity "2026-10-07T00:00:00.000000123Z")))
+(if (zero? @failures) (println "ipns-fallback gate: ok")
+    (do (println "ipns-fallback gate:" @failures "failed") (js/process.exit 1)))

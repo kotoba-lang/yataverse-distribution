@@ -1,0 +1,112 @@
+;; deploy/ipns_fallback.cljk — keep IPNS names alive from a second custodian
+;; without ever publishing stale data (ADR-2610062000). Ported from
+;; ipns_fallback.py.
+;;
+;; A custodian never chooses a value. For each name it:
+;;   1. fetches the current signed record (`ipfs name get`) and re-puts it
+;;      unchanged (`ipfs name put`), keeping the primary's record available
+;;      without any key;
+;;   2. only when the record's validity falls below --resign-below-hours
+;;      (default 24; the primary renews daily, so this fires only after a
+;;      multi-day primary outage) re-signs the SAME value with sequence + 1,
+;;      then checks resolution returns that value;
+;;   3. refuses a name it cannot fetch at all rather than inventing a value.
+;;
+;; Primary mode (--publish=/ipfs/...) publishes a new value for one name at
+;; network sequence + 1: a fallback may have re-signed while the primary was
+;; away, and a lower sequence is silently ignored by everyone who saw it.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> ipns_fallback.cljk ...):
+;;   --ipfs-bin=PATH --ipfs-path=DIR --name=k51...=KEY ... [--resign-below-hours=24] [--publish=/ipfs/CID [--first]]
+;;
+;; Exit codes: 0 every name kept or re-signed (or published); 1 otherwise.
+
+(ns ipns-fallback
+  (:require [clojure.string :as str]))
+
+(def cp (js/require "node:child_process"))
+(def fs (js/require "node:fs"))
+(def os (js/require "node:os"))
+(def path (js/require "node:path"))
+
+(defn parse-validity
+  "Kubo's RFC 3339 with nanoseconds -> epoch ms."
+  [text]
+  (let [[head frac] (str/split (str/replace text #"Z$" "") #"\." 2)]
+    (js/Date.parse (str head "." (subs (str frac "000") 0 3) "Z"))))
+
+(defn make-ipfs [bin repo]
+  (let [run (fn [args input]
+              (let [r (.spawnSync cp bin (clj->js args)
+                                  (clj->js (cond-> {:timeout 180000 :env {"IPFS_PATH" repo "PATH" "/usr/bin:/bin"}}
+                                             input (assoc :input input))))]
+                {:code (.-status r) :out (or (.-stdout r) (js/Buffer.alloc 0))}))]
+    {:get-record (fn [name]
+                   (let [r (run ["name" "get" name] nil)]
+                     (if (or (not (zero? (:code r))) (zero? (.-length (:out r))))
+                       [nil nil]
+                       (let [i (run ["name" "inspect" "--enc=json"] (:out r))]
+                         (if (zero? (:code i)) [(:out r) (.-Entry (js/JSON.parse (str (:out i))))] [nil nil])))))
+     :put-record (fn [name record]
+                   (let [f (.join path (.mkdtempSync fs (.join path (.tmpdir os) "ipns-")) "record")]
+                     (.writeFileSync fs f record)
+                     (zero? (:code (run ["name" "put" "--force" name f] nil)))))
+     :publish (fn [key value seq]
+                (zero? (:code (run ["name" "publish" (str "--key=" key) (str "--sequence=" seq) "--lifetime=168h" "--ttl=5m" value] nil))))
+     :resolve (fn [name]
+                (let [r (run ["name" "resolve" "--nocache" (str "/ipns/" name)] nil)]
+                  (when (zero? (:code r)) (str/trim (str (:out r))))))}))
+
+(defn keep-name
+  "-> [ok? line]."
+  [ipfs name key now-ms resign-below-ms]
+  (let [[record entry] ((:get-record ipfs) name)]
+    (if (nil? record)
+      [false (str "REFUSE " name " (" key "): no record could be fetched; not inventing a value")]
+      (let [value (.-Value entry) seq (js/parseInt (str (.-Sequence entry)) 10)
+            left (- (parse-validity (.-Validity entry)) now-ms)
+            hours (js/Math.floor (/ left 3600000))]
+        (if (> left resign-below-ms)
+          (let [put ((:put-record ipfs) name record)]
+            [true (str "KEPT " name " (" key ") seq=" seq " value=" value " valid-for=" hours "h reput=" (if put "ok" "failed"))])
+          (cond
+            (not ((:publish ipfs) key value (inc seq)))
+            [false (str "REFUSE " name " (" key "): re-sign of " value " at seq " (inc seq) " failed")]
+            (not= value ((:resolve ipfs) name))
+            [false (str "REFUSE " name " (" key "): re-signed but resolves to " (pr-str ((:resolve ipfs) name)) ", not " value)]
+            :else [true (str "RESIGNED " name " (" key ") seq=" (inc seq) " value=" value " (was valid for " hours "h)")]))))))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))
+        ipfs (make-ipfs (one "--ipfs-bin") (one "--ipfs-path"))
+        names (mapv #(let [[n k] (str/split % #"=" 2)] [n k]) (flags "--name"))]
+    (if-let [value (one "--publish")]
+      (if (not= 1 (count names))
+        (do (println "REFUSE --publish takes exactly one --name") (js/process.exit 1))
+        (let [[name key] (first names)
+              [_ entry] ((:get-record ipfs) name)
+              seq (if entry (inc (js/parseInt (str (.-Sequence entry)) 10)) 0)]
+          (cond
+            ;; The Python tool published at sequence 0 when it could not read
+            ;; the network's record (xavier's `name get` timed out on
+            ;; 2026-10-07): everyone who saw sequence 9 ignores a 0, so the
+            ;; publish "succeeds" and changes nothing. Only a name that has
+            ;; never been published (--first) may start at 0.
+            (and (nil? entry) (not (some #{"--first"} (array-seq (aget js/process "argv")))))
+            (do (println (str "REFUSE " name " (" key "): cannot read the network sequence; not publishing at 0 (use --first for a new name)"))
+                (js/process.exit 1))
+            (not ((:publish ipfs) key value seq))
+            (do (println (str "REFUSE " name " (" key "): publish of " value " at seq " seq " failed")) (js/process.exit 1))
+            (not= value ((:resolve ipfs) name))
+            (do (println (str "REFUSE " name " (" key "): published but resolves to " (pr-str ((:resolve ipfs) name)))) (js/process.exit 1))
+            :else (do (println (str "PUBLISHED " name " (" key ") seq=" seq " value=" value)) (js/process.exit 0)))))
+      (let [results (mapv (fn [[n k]] (keep-name ipfs n k (js/Date.now) (* 3600000 (js/parseInt (or (one "--resign-below-hours") "24") 10)))) names)]
+        (doseq [[_ line] results] (println line))
+        (js/process.exit (if (every? first results) 0 1))))))
+
+(when (some #(str/ends-with? % "ipns_fallback.cljk") (array-seq (aget js/process "argv")))
+  (main))
