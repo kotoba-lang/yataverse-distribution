@@ -1,0 +1,113 @@
+;; deploy/lake_epoch.cljk — build the next yataverse lake epoch from a
+;; verified capture (ADR-2610062000 P2). Ported from lake_epoch.py; the
+;; manifest bytes are identical (graph_head canonical JSON).
+;;
+;;   delta     rows of a capture diff the log does not already hold. The diff
+;;             is relative to the epoch-0 base, so it also holds every later
+;;             epoch's rows; subtracting the log-resolved membership leaves
+;;             what is new. Refuses a CID the log holds with another size, and
+;;             a CID duplicated in the diff.
+;;   manifest  the canonical manifest for epoch N (sorted keys, no
+;;             whitespace): the same inputs give the same bytes and CID on
+;;             every custodian. Rows, bytes and sha256 are computed from the
+;;             inventory file; custody must name two nodes on two WANs.
+;;
+;; Neither step touches the network.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> lake_epoch.cljk ...):
+;;   delta --log-resolved=F --diff=F --out=F
+;;   manifest --epoch=N --prev=CID --inventory-cid=CID --inventory=F --captured=DATE
+;;            --relation=TEXT --custody=JSON --custody=JSON --authority=TEXT --out=F
+;;
+;; Exit codes: 0 written; 1 refused.
+
+(ns lake-epoch
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def fs (js/require "node:fs"))
+(def nc (js/require "node:crypto"))
+
+(def schema "yataverse-lake-manifest/v1")
+(def inventory-format "jsonl {cid,bytes} one row per lake block")
+
+(defn- refuse [msg] (throw (ex-info msg {:kind :refused})))
+
+(defn read-rows
+  "-> JS array of {cid, bytes} objects (kept as JS: logs hold ~825k rows)."
+  [p]
+  (let [text (.readFileSync fs p "utf8")
+        out #js []]
+    (doseq [[n line] (map-indexed vector (str/split text #"\n"))
+            :when (not (str/blank? line))]
+      (let [row (js/JSON.parse line)]
+        (when-not (and (string? (.-cid row)) (js/Number.isInteger (.-bytes row)) (pos? (.-bytes row)))
+          (refuse (str p ":" (inc n) ": not a {cid,bytes} row")))
+        (.push out row)))
+    out))
+
+(defn- sha256-hex [buf] (-> (.createHash nc "sha256") (.update buf) (.digest "hex")))
+
+(defn row-line [row] (str "{\"cid\":" (js/JSON.stringify (.-cid row)) ",\"bytes\":" (.-bytes row) "}\n"))
+
+(defn delta!
+  "-> {:rows :bytes :sha256}; writes `out`."
+  [log-path diff-path out]
+  (let [held (js/Map.)
+        _ (doseq [r (array-seq (read-rows log-path))] (.set held (.-cid r) (.-bytes r)))
+        seen (js/Set.)
+        fresh (reduce (fn [acc r]
+                        (let [size (.get held (.-cid r))]
+                          (cond
+                            (some? size) (if (= size (.-bytes r)) acc
+                                             (refuse (str (.-cid r) ": log holds " size " bytes, capture says " (.-bytes r))))
+                            (.has seen (.-cid r)) (refuse (str (.-cid r) ": duplicated in the capture diff"))
+                            :else (do (.add seen (.-cid r)) (conj! acc r)))))
+                      (transient []) (array-seq (read-rows diff-path)))
+        rows (persistent! fresh)
+        payload (js/Buffer.from (apply str (map row-line rows)) "utf8")]
+    (.writeFileSync fs out payload)
+    {:rows (count rows) :bytes (reduce + 0 (map #(.-bytes %) rows)) :sha256 (sha256-hex payload)}))
+
+(defn manifest
+  "-> the canonical manifest text. custody: seq of string-keyed maps."
+  [{:keys [epoch prev inventory-cid inventory captured relation custody authority]}]
+  (when (or (< epoch 1) (str/blank? prev))
+    (refuse "a new epoch needs epoch >= 1 and the previous manifest CID"))
+  (let [wans (set (map #(get % "wan") custody))]
+    (when (or (< (count custody) 2) (< (count wans) 2) (contains? wans nil))
+      (refuse "custody must name at least two nodes on at least two WANs")))
+  (let [data (.readFileSync fs inventory)
+        rows (array-seq (read-rows inventory))]
+    (when (empty? rows) (refuse "an empty epoch is not committed"))
+    (g/canonical-str {"schema" schema "epoch" epoch "prev" prev
+                      "inventory" {"cid" inventory-cid "format" inventory-format "rows" (count rows)
+                                   "bytes" (reduce + 0 (map #(.-bytes %) rows))
+                                   "sha256" (sha256-hex data) "captured" captured "relation" relation}
+                      "custody" (vec custody) "authority" authority})))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))
+        cmd (first (filter #{"delta" "manifest"} (array-seq (aget js/process "argv"))))]
+    (try
+      (case cmd
+        "delta" (let [r (delta! (one "--log-resolved") (one "--diff") (one "--out"))]
+                  (println (str "DELTA rows=" (:rows r) " bytes=" (:bytes r) " sha256=" (:sha256 r) " out=" (one "--out"))))
+        "manifest" (let [text (manifest {:epoch (js/parseInt (one "--epoch") 10) :prev (one "--prev")
+                                         :inventory-cid (one "--inventory-cid") :inventory (one "--inventory")
+                                         :captured (one "--captured") :relation (one "--relation")
+                                         :custody (mapv g/parse-json (flags "--custody")) :authority (one "--authority")})]
+                     (.writeFileSync fs (one "--out") text)
+                     (println (str "MANIFEST epoch=" (one "--epoch") " bytes=" (.-length (js/Buffer.from text))
+                                   " sha256=" (sha256-hex (js/Buffer.from text)) " out=" (one "--out"))))
+        (do (println "REFUSE usage: delta ... | manifest ...") (js/process.exit 1)))
+      (catch :default e
+        (println (str "REFUSE " (g/message e)))
+        (js/process.exit 1)))))
+
+(when (some #(str/ends-with? % "lake_epoch.cljk") (array-seq (aget js/process "argv")))
+  (main))

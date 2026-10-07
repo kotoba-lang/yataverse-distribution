@@ -90,6 +90,17 @@
     (sequential? v) (str "[" (str/join "," (map canonical-str v)) "]")
     :else (throw (refused (str "unsupported value " (pr-str v))))))
 
+(defn py-json-str
+  "Python json.dumps(v, sort_keys=True) with its default separators
+   (\", \" and \": \"): the receipts the Python tools wrote."
+  [v]
+  (cond
+    (map? v) (str "{" (str/join ", " (map (fn [k] (str (json-str (name k)) ": " (py-json-str (get v k))))
+                                          (sort-by name (keys v))))
+                  "}")
+    (sequential? v) (str "[" (str/join ", " (map py-json-str v)) "]")
+    :else (canonical-str v)))
+
 (defn canonical
   "-> Buffer of canonical JSON. Keys are compared as strings, like Python."
   [v]

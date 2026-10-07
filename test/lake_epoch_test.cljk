@@ -1,0 +1,41 @@
+;; Gate for deploy/lake_epoch.cljk against real epochs.
+;; Run: node <release>/engine/cli.js --classpath deploy test/lake_epoch_test.cljk
+;; Rebuilds epoch 4's delta from its run's own inputs, and the committed
+;; epoch-4 and epoch-5 manifests from their inventories, byte for byte.
+(ns lake-epoch-test
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [lake-epoch :as e]))
+
+(def fs (js/require "node:fs"))
+(def os (js/require "node:os"))
+(def home (aget js/process "env" "HOME"))
+(def run4 (str home "/.local/share/yataverse-lake-cycle/runs/run-20261006T1930Z"))
+(def run5 (str home "/.local/share/yataverse-p6-drill/run-20261007"))
+
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+(defn refusal [f] (try (f) nil (catch :default x (g/message x))))
+
+(println "lake-epoch gate:")
+(let [out (str (.tmpdir os) "/lake-epoch-gate-delta.jsonl")
+      r (e/delta! (str run4 "/log-resolved-before.jsonl") (str run4 "/diff-since-epoch0.jsonl") out)]
+  (check (str "epoch 4 delta rebuilt from its run's inputs: " (:rows r) " rows, byte for byte")
+         (.equals (.readFileSync fs out) (.readFileSync fs (str run4 "/inventory.jsonl")))))
+
+(doseq [[n inv] [[4 (str run4 "/inventory.jsonl")] [5 (str run5 "/inventory.jsonl")]]]
+  (let [committed (.readFileSync fs (str "deploy/lake-manifests/epoch-" n ".json") "utf8")
+        m (g/parse-json committed)
+        i (get m "inventory")
+        text (e/manifest {:epoch (get m "epoch") :prev (get m "prev") :inventory-cid (get i "cid") :inventory inv
+                          :captured (get i "captured") :relation (get i "relation") :custody (get m "custody")
+                          :authority (get m "authority")})]
+    (check (str "epoch " n " manifest rebuilt byte for byte (" (count committed) " bytes)") (= committed text))))
+
+(let [inv (str run5 "/inventory.jsonl")
+      base {:epoch 6 :prev "bafkreiprev" :inventory-cid "c" :inventory inv :captured "d" :relation "r" :authority "a"}]
+  (check "custody on one WAN is refused"
+         (some? (refusal #(e/manifest (assoc base :custody [{"node" "x" "wan" "1"} {"node" "y" "wan" "1"}]))))))
+
+(if (zero? @failures) (println "lake-epoch gate: ok")
+    (do (println "lake-epoch gate:" @failures "failed") (js/process.exit 1)))
