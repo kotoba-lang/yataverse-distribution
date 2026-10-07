@@ -1433,3 +1433,19 @@ The Python module stays while other Python tools import it.
 - **`deploy/lake_inventory.cljk`** is the inventory index from `serve_lake.Inventory`: declared digest and count, no duplicate CIDs, rows by offset, and a refusal when the file changes. It keeps Python's deliberately permissive CID check.
 - **`deploy/verify_lake_leaves.cljk`** reads blocks from the raw store first, then from Kubo offline. It checks size and CID, folds the same running scan hash, and keeps the same checkpoint.
   - **Live on xavier** over epoch 4's 24 blocks: Python ran one round and kotoba two (10 rows, then the rest). The final checkpoints are byte-identical, scan hash included, so either tool resumes the other's readback.
+
+### Lake reader in kotoba (2026-10-07)
+
+`deploy/serve_lake.cljk` covers the listing, the CID-checked blocks, CAR and native receipts, and the epoch composite. It shares `lake_inventory.cljk` and `raw_block_store.cljk`.
+
+**Side by side on jacob**, the kotoba reader (:18196) ran beside the live Python lake-log reader (:18096) with the same 6-epoch arguments:
+
+- `/health` byte-identical (Python's `json.dumps` spacing kept);
+- pages at cursors 0, 821400, 821533 and 825282 byte-identical;
+- 16/16 sampled blocks from epochs 0–5 identical in status and bytes;
+- 12 concurrent pages all 200;
+- an invalid cursor and a foreign CID both 404, as in Python.
+
+One difference: a non-GET request gets 405 where Python answered 501.
+
+**Not switched yet.** The cycle's `reader` step edits that LaunchAgent's arguments by position in their current Python form. The live reader moves together with the matching `step-reader` change, after the kotoba cycle's first full run.

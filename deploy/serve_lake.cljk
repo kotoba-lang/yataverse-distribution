@@ -1,0 +1,293 @@
+;; deploy/serve_lake.cljk — read-only yataverse lake listing and CID-checked
+;; local blocks (ADR-2610062000 Tier 1/2 readers). Ported from serve_lake.py.
+;;
+;;   GET /health                 {"ok", "inventory-sha256", "rows", "bytes"}
+;;   GET /api/v1/lake/blocks     a page of {cid, size}; ?cursor=N
+;;   GET /ipfs/<cid>             the block's bytes, only when it is in the
+;;                               inventory, durably held, and hashes to its CID
+;;
+;; With --epoch (in log order) the reader serves the lake as its log
+;; describes it: each epoch keeps its own inventory, receipts and block
+;; reader, and the composite sha256 is that of the concatenated epochs — what
+;; `lake_head.cljk resolve` writes from the inga log.
+;;
+;; A block is served from the raw block store, else from Kubo offline, and
+;; only when it is durably held: covered by a CAR or native import receipt,
+;; or pinned (direct, recursive, or indirect through a CID root).
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> serve_lake.cljk ...):
+;;   --sha256=HEX --count=N (--inventory=F | --epoch=INV:SHA:COUNT[:CAR_RECEIPTS[:NATIVE...]] ...)
+;;   --ipfs-bin=PATH --ipfs-path=DIR [--raw-block-store=DIR] [--car-receipts=DIR] [--native-receipts=DIR ...]
+;;   [--max-block-bytes=8000000] [--max-concurrent-requests=8] [--large-client-timeout=120]
+;;   [--host=127.0.0.1] [--port=8090]
+
+(ns serve-lake
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [lake-inventory :as li]
+            [raw-block-store :as r]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def http (js/require "node:http"))
+(def cp (js/require "node:child_process"))
+(def nc (js/require "node:crypto"))
+
+(def large-block-threshold 8000000)
+(def max-block-bytes 256000000)
+(def cid-re #"[a-zA-Z0-9]{46,100}")
+(def pinned-cid-re #"(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,200})")
+
+(defn- refuse [msg] (throw (ex-info msg {:kind :inventory})))
+
+;; ── receipts ────────────────────────────────────────────────────────────────
+
+(defn- read-record [p what]
+  (let [rec (try (g/parse-json (.readFileSync fs p "utf8")) (catch :default _ (refuse (str what " receipt unreadable"))))]
+    (when-not (map? rec) (refuse (str what " receipt must be an object")))
+    rec))
+
+(defn receipt-ranges
+  "Covered [start end) row ranges, merged, from CAR import receipts in
+   `car-dir` and native receipts in `native-dirs`; each bound to `inv`."
+  [car-dir native-dirs inv ipfs-path]
+  (let [repo (.resolve path ipfs-path)
+        native (for [d native-dirs f (array-seq (.readdirSync fs d))
+                     :let [m (re-matches #"row-([0-9]+)-([0-9]+)-native\.json" f)] :when m]
+                 (let [start (js/parseInt (nth m 1) 10) end (inc (js/parseInt (nth m 2) 10))
+                       rec (read-record (.join path d f) "native")]
+                   (when-not (and (<= 0 start) (< start end) (<= end (li/row-count inv)) (<= (- end start) 1000))
+                     (refuse "native receipt range is invalid"))
+                   (let [[rows actual-end] (li/rows inv start (- end start))]
+                     (when-not (and (= end actual-end) (= "complete" (get rec "status")) (= (:sha256 inv) (get rec "inventory_sha256"))
+                                    (= start (get rec "start_row")) (= end (get rec "end_row")) (= (count rows) (get rec "blocks"))
+                                    (= (reduce + 0 (map #(get % "size") rows)) (get rec "bytes")) (= repo (get rec "repository"))
+                                    (string? (get rec "root")) (re-matches cid-re (get rec "root"))
+                                    (string? (get rec "source_peer")) (seq (get rec "source_peer")))
+                       (refuse (str "native receipt differs from inventory or repository: " f))))
+                   [start end]))
+        car (when car-dir
+              (for [f (array-seq (.readdirSync fs car-dir)) :when (and (str/starts-with? f "row-") (str/ends-with? f "-import.json"))]
+                (let [m (re-matches #"row-([0-9]+)-([0-9]+)-import\.json" f)
+                      _ (when-not m (refuse "invalid CAR receipt name"))
+                      start (js/parseInt (nth m 1) 10) end (inc (js/parseInt (nth m 2) 10))
+                      rec (read-record (.join path car-dir f) "CAR")]
+                  (when-not (and (= "complete" (get rec "status")) (= (:sha256 inv) (get rec "inventory_sha256"))
+                                 (= start (get rec "start_row")) (= end (get rec "end_row")) (= (- end start) (get rec "blocks"))
+                                 (<= 0 start) (< start end) (<= end (li/row-count inv))
+                                 (string? (get rec "root")) (re-matches cid-re (get rec "root"))
+                                 (string? (get rec "car_sha256")) (re-matches #"[0-9a-f]{64}" (get rec "car_sha256"))
+                                 (= repo (get rec "repository")))
+                    (refuse "CAR receipt differs from inventory or repository"))
+                  [start end])))]
+    (reduce (fn [covered [s e]]
+              (if (and (seq covered) (<= s (second (peek covered))))
+                (conj (pop covered) [(first (peek covered)) (max (second (peek covered)) e)])
+                (conj covered [s e])))
+            [] (sort (concat native car)))))
+
+(defn make-receipts
+  "-> {:covers? fn}; reloads when a receipt directory's mtime changes."
+  [car-dir native-dirs inv ipfs-path]
+  (let [dirs (vec (concat (when car-dir [car-dir]) native-dirs))
+        cache (atom nil)
+        mtimes (fn [] (doseq [d dirs] (when-not (and (.existsSync fs d) (.isDirectory (.statSync fs d)))
+                                       (refuse (str "receipt directory is absent: " d))))
+                 (mapv #(str (.-mtimeNs (.statSync fs % #js {:bigint true}))) dirs))]
+    {:covers? (fn [cid]
+                (let [m (mtimes)]
+                  (when-not (= m (:mtimes @cache))
+                    (reset! cache {:mtimes m :ranges (receipt-ranges car-dir native-dirs inv ipfs-path)}))
+                  (let [row (.get (:positions inv) cid)]
+                    (boolean (some (fn [[s e]] (and (<= s row) (< row e))) (:ranges @cache))))))}))
+
+;; ── local blocks ────────────────────────────────────────────────────────────
+
+(defn- run [argv env timeout-ms]
+  (js/Promise.
+   (fn [resolve _]
+     (.execFile cp (first argv) (clj->js (rest argv)) #js {:env env :timeout timeout-ms :encoding "buffer" :maxBuffer (+ max-block-bytes 1024)}
+                (fn [err stdout _]
+                  (resolve {:code (cond (nil? err) 0 (number? (.-code err)) (.-code err) :else :timeout)
+                            :out (or stdout (js/Buffer.alloc 0))}))))))
+
+(defn- busy [r]
+  (when (= :timeout (:code r)) (throw (ex-info "local IPFS temporarily busy" {:kind :busy})))
+  r)
+
+(defn- indirect-line? [line cid]
+  (let [prefix (str cid " indirect through ")]
+    (and (str/starts-with? line prefix) (boolean (re-matches pinned-cid-re (subs line (count prefix)))))))
+
+(defn- pinned?
+  "-> Promise of true when Kubo pins `cid` directly, recursively, or
+   indirectly through a CID root."
+  [ipfs-bin env cid]
+  (-> (run [ipfs-bin "pin" "ls" "--type=direct" cid] env 15000)
+      (.then busy)
+      (.then (fn [d]
+               (if (and (zero? (:code d)) (= (str cid " direct") (str/trim (str (:out d)))))
+                 true
+                 (-> (run [ipfs-bin "pin" "ls" "--type=all" cid] env 15000)
+                     (.then busy)
+                     (.then (fn [a]
+                              (let [line (str/trim (str (:out a)))]
+                                (and (zero? (:code a))
+                                     (or (= line (str cid " recursive")) (indirect-line? line cid))))))))))))
+
+(defn- kubo-block
+  "-> Promise of the offline block, checked against its size and CID."
+  [ipfs-bin env cid size]
+  (-> (run [ipfs-bin "--offline" "block" "get" cid] env 30000)
+      (.then busy)
+      (.then (fn [b]
+               (when-not (and (zero? (:code b)) (= size (.-length (:out b))))
+                 (refuse "local block unavailable or size differs"))
+               (try (r/verify-cid cid (:out b)) (catch :default _ (refuse "local block CID differs from bytes")))
+               (:out b)))))
+
+(defn make-blocks
+  "-> {:read fn cid -> Promise of Buffer}."
+  [{:keys [ipfs-bin ipfs-path max-bytes raw-root receipts]} inv]
+  (when-not (<= 1 max-bytes max-block-bytes) (refuse "block byte limit must be within 1..256000000"))
+  (let [env (doto (js/Object.assign #js {} (aget js/process "env")) (aset "IPFS_PATH" ipfs-path))]
+    {:read
+     (fn [cid]
+       (let [size (.get (:sizes inv) cid)]
+         (cond
+           (nil? size) (js/Promise.reject (ex-info "CID absent from inventory" {:kind :inventory}))
+           (> size max-bytes) (js/Promise.reject (ex-info "block exceeds API byte limit" {:kind :inventory}))
+           :else
+           (let [raw (when raw-root (try (r/read-block raw-root cid max-bytes)
+                                         (catch :default _ (refuse (str "raw block store refused " cid)))))]
+             (cond
+               (and raw (= size (.-length raw))) (js/Promise.resolve raw)
+               raw (js/Promise.reject (ex-info "raw block size differs from inventory" {:kind :inventory}))
+               :else
+               (-> (if (and receipts ((:covers? receipts) cid)) (js/Promise.resolve true) (pinned? ipfs-bin env cid))
+                   (.then (fn [durable?]
+                            (when-not durable? (refuse "block is not durably pinned or receipted"))
+                            (kubo-block ipfs-bin env cid size)))))))))}))
+
+;; ── the lake as its log describes it ────────────────────────────────────────
+
+(defn epoch-inventory
+  "Composite of per-epoch inventories; its sha256 is the concatenation's."
+  [parts expected-sha256 expected-count]
+  (when (empty? parts) (refuse "an epoch list needs at least one inventory"))
+  (let [h (.createHash nc "sha256")]
+    (doseq [p parts] (.update h (.readFileSync fs (:path p))))
+    (let [total (reduce + 0 (map li/row-count parts))]
+      (when-not (and (= expected-sha256 (.digest h "hex")) (= expected-count total))
+        (refuse "epoch inventories differ from the declared lake log"))
+      (let [owner (js/Map.) sizes (js/Map.)]
+        (doseq [[i p] (map-indexed vector parts)]
+          (.forEach (:sizes p) (fn [size cid]
+                                 (when (.has sizes cid) (refuse (str "CID appears in two epochs: " cid)))
+                                 (.set sizes cid size) (.set owner cid i))))
+        {:parts (vec parts) :starts (vec (reductions + 0 (map li/row-count (butlast parts))))
+         :sha256 expected-sha256 :count total :sizes sizes :owner owner
+         :total-bytes (reduce + 0 (map :total-bytes parts))}))))
+
+(defn composite-rows [inv offset limit]
+  (when (or (neg? offset) (>= offset (:count inv))) (refuse "cursor outside inventory"))
+  (when-not (<= 1 limit 1000) (refuse "inventory row limit must be within 1..1000"))
+  (let [i (dec (count (take-while #(<= % offset) (:starts inv))))
+        start (nth (:starts inv) i)
+        [rows end] (li/rows (nth (:parts inv) i) (- offset start) limit)]
+    [rows (+ start end)]))
+
+;; ── HTTP ────────────────────────────────────────────────────────────────────
+
+(defn- page-json [sha rows end total]
+  ;; key order as the Python reader wrote it
+  (js/JSON.stringify #js {"ok" true "inventory-sha256" sha
+                          "blocks" (clj->js (map (fn [r] #js {"cid" (get r "cid") "size" (get r "size")}) rows))
+                          "cursor" (when (< end total) (str end)) "truncated?" (< end total)}))
+
+(defn handler [{:keys [sha256 total total-bytes sizes rows-fn read-fn max-concurrent large-timeout]}]
+  (let [slots (atom 0) large (atom false)]
+    (fn [req res]
+      (let [send (fn [status type body]
+                   (.writeHead res status (clj->js (cond-> {"Content-Type" type "Content-Length" (.-length body)}
+                                                     (= 200 status) (assoc "Cache-Control" "public, max-age=60"))))
+                   (.end res body))
+            error (fn [status msg] (send status "text/plain; charset=utf-8" (js/Buffer.from (str status " " msg "\n"))))]
+        (if (or (not= "GET" (.-method req)) (>= @slots max-concurrent))
+          (error (if (not= "GET" (.-method req)) 405 503) (if (not= "GET" (.-method req)) "method not allowed" "reader busy"))
+          (let [u (js/URL. (.-url req) "http://reader")
+                p (.-pathname u)
+                large? (atom false)
+                done (fn [] (swap! slots dec) (when @large? (reset! large false)))]
+            (swap! slots inc)
+            (-> (js/Promise.resolve nil)
+                (.then (fn [_]
+                         (cond
+                           (= p "/health")
+                           ;; Python's json.dumps spacing, byte for byte
+                           [200 "application/json" (js/Buffer.from (str "{\"ok\": true, \"inventory-sha256\": \"" sha256 "\", \"rows\": " total ", \"bytes\": " total-bytes "}"))]
+                           (= p "/api/v1/lake/blocks")
+                           (let [keys (set (array-seq (.keys (.-searchParams u))))
+                                 cursors (array-seq (.getAll (.-searchParams u) "cursor"))
+                                 cursor (or (first cursors) "0")]
+                             (when (or (seq (disj keys "cursor")) (> (count cursors) 1)) (refuse "invalid query"))
+                             (when-not (re-matches #"0|[1-9][0-9]*" cursor) (refuse "invalid cursor"))
+                             (let [[rows end] (rows-fn (js/parseInt cursor 10) 200)]
+                               [200 "application/json" (js/Buffer.from (page-json sha256 rows end total))]))
+                           (and (str/starts-with? p "/ipfs/") (= "" (.-search u)))
+                           (let [cid (subs p 6)]
+                             (when-not (re-matches cid-re cid) (refuse "invalid CID"))
+                             (when (> (or (.get sizes cid) 0) large-block-threshold)
+                               (when @large (throw (ex-info "large block reader busy" {:kind :busy})))
+                               (reset! large true) (reset! large? true)
+                               (.setTimeout (.-socket req) (* 1000 large-timeout)))
+                             (.then (read-fn cid) (fn [data] [200 "application/octet-stream" data])))
+                           :else [404 nil nil])))
+                (.then (fn [[status type body]] (if (= 404 status) (error 404 "not found") (send status type body))))
+                (.catch (fn [e] (case (g/kind e)
+                                  :busy (error 503 (g/message e))
+                                  (error 404 (g/message e)))))
+                (.finally done))))))))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))
+        opts {:ipfs-bin (one "--ipfs-bin") :ipfs-path (one "--ipfs-path") :raw-root (one "--raw-block-store")
+              :max-bytes (js/parseInt (or (one "--max-block-bytes") (str large-block-threshold)) 10)}
+        sha (one "--sha256") cnt (js/parseInt (one "--count") 10)
+        max-concurrent (js/parseInt (or (one "--max-concurrent-requests") "8") 10)
+        large-timeout (js/parseInt (or (one "--large-client-timeout") "120") 10)]
+    (when-not (<= 1 max-concurrent 64) (refuse "concurrent request limit must be within 1..64"))
+    (when-not (<= 120 large-timeout 1800) (refuse "large client timeout must be within 120..1800 seconds"))
+    (let [served
+          (if (seq (flags "--epoch"))
+            (let [specs (mapv #(str/split % #":") (flags "--epoch"))
+                  parts (mapv (fn [[inv-path s n]] (li/open-inventory inv-path s (js/parseInt n 10))) specs)
+                  readers (mapv (fn [part [_ _ _ car & natives]]
+                                  (let [natives (vec (remove str/blank? natives))
+                                        car (when (seq car) car)]
+                                    (make-blocks (assoc opts :receipts (when (or car (seq natives)) (make-receipts car natives part (:ipfs-path opts))))
+                                                 part)))
+                                parts specs)
+                  inv (epoch-inventory parts sha cnt)]
+              {:sha256 sha :total (:count inv) :total-bytes (:total-bytes inv) :sizes (:sizes inv)
+               :rows-fn #(composite-rows inv %1 %2)
+               :read-fn (fn [cid] (if-let [i (.get (:owner inv) cid)]
+                                    ((:read (nth readers i)) cid)
+                                    (js/Promise.reject (ex-info "CID absent from inventory" {:kind :inventory}))))})
+            (let [inv (li/open-inventory (one "--inventory") sha cnt)
+                  natives (vec (flags "--native-receipts"))
+                  car (one "--car-receipts")
+                  blocks (make-blocks (assoc opts :receipts (when (or car (seq natives)) (make-receipts car natives inv (:ipfs-path opts)))) inv)]
+              {:sha256 sha :total (li/row-count inv) :total-bytes (:total-bytes inv) :sizes (:sizes inv)
+               :rows-fn #(li/rows inv %1 %2) :read-fn (:read blocks)}))]
+      (.listen (.createServer http (handler (assoc served :max-concurrent max-concurrent :large-timeout large-timeout)))
+               (js/parseInt (or (one "--port") "8090") 10) (or (one "--host") "127.0.0.1")
+               (fn [] (println (str "serve-lake on " (or (one "--host") "127.0.0.1") ":" (or (one "--port") "8090")
+                                    " rows " (:total served) " sha256 " (subs sha 0 8))))))))
+
+(when (some #(str/ends-with? % "serve_lake.cljk") (array-seq (aget js/process "argv")))
+  (main))
