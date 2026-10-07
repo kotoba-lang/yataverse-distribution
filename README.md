@@ -1475,3 +1475,14 @@ One difference: a non-GET request gets 405 where Python answered 501.
 **Side by side on main-2:** `/healthz` returned 200 from both, 5/5 R2 blocks were identical, and an unlisted CID got 404 from both. The live LaunchAgent (`cloud.yataverse.r2-bootstrap-bridge`, used by xavier's replicator through the reverse tunnel) now runs the cljk version, and `/healthz` verifies an R2 block end to end.
 
 This bridge is itself a Cloudflare dependency, kept until the replicas no longer bootstrap from R2. The Python file stays until `replicate_lake` is ported, because its test file covers both.
+
+### CAR lane in kotoba (2026-10-07)
+
+- **`deploy/lake_kubo.cljk`** holds the shared Kubo calls: run against one repository, match the daemon to its repository, and build, pin and verify the batch root.
+- **`deploy/import_lake_car.cljk`** and **`deploy/export_lake_car_from_kubo.cljk`** write the CARv1 header and blocks byte for byte as Python did.
+
+**Gates on real data:**
+
+- **Export on xavier** of epoch 4's 24 blocks: the kotoba CAR is byte-identical to Python's (sha256 `b5099ad9…`), through both the offline CLI and the RPC path, and the receipts are equal.
+- **Round trip, kotoba on both ends:** the kotoba CAR shipped to jacob and imported by the kotoba importer pinned root `bafyreibc43h…`, which is epoch 4's receipt root.
+- **Root alone:** rebuilding epoch 4's batch root from its rows through the cljk code on jacob also gives `bafyreibc43h…`.
