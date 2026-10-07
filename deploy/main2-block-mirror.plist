@@ -14,6 +14,8 @@
     <string>--source=http://yataverse-blocks.220-146-170-114.sslip.io:18140</string>
     <string>--source-peer=/ip4/220.146.170.114/udp/12046/quic-v1/p2p/12D3KooWH5CfezpDdMtYttLLMeib526f7f8QKCC6jCgiHDme4XSV</string>
     <string>--signer=did:key:z6Mkr2JXYtHYmcH84SPxZCQnBCLXGSgcMhc9AAJhpBXnJnFY</string>
+    <string>--signer=did:key:z6MkmfaK8FG1z22ELxpGHyGS11W6yMKwANwC7WsmtydkaUSR</string>
+    <string>--signer=did:key:z6MkmcWXi8ZtzHRvq9x1aKhYA9BbVfpKPFc5QtJJbADArdwz</string>
     <string>--ipfs-bin=/opt/homebrew/bin/ipfs</string>
     <string>--ipfs-path=/Users/junkawasaki/.ipfs</string>
     <string>--state-dir=/Users/junkawasaki/.local/share/block-mirror/state</string>

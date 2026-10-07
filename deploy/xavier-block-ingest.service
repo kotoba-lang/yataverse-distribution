@@ -6,10 +6,13 @@ Wants=ipfs.service
 [Service]
 Type=simple
 WorkingDirectory=/home/xavier/.local/share/block-ingest
-# --allow lists the did:key of every Worker that may write. Each signer's
+# --allow: murakumo.cloud model storage, the murakumo KV store (murakumo-cloud
+# and murakumo-ads-mcp), and the status.murakumo.cloud prober. Every writer Each signer's
 # blocks are held under /block-ingest/<its did:key>/ in Kubo's MFS.
 ExecStart=/usr/local/bin/node /home/xavier/.local/share/yataverse-writer/release/engine/cli.js --classpath /home/xavier/.local/share/block-ingest/bin /home/xavier/.local/share/block-ingest/bin/block_ingest.cljk --host=0.0.0.0 --port=18140 \
   --allow=did:key:z6Mkr2JXYtHYmcH84SPxZCQnBCLXGSgcMhc9AAJhpBXnJnFY \
+  --allow=did:key:z6MkmfaK8FG1z22ELxpGHyGS11W6yMKwANwC7WsmtydkaUSR \
+  --allow=did:key:z6MkmcWXi8ZtzHRvq9x1aKhYA9BbVfpKPFc5QtJJbADArdwz \
   --ipfs-bin=/mnt/nvme/ipfs-xavier/bin/ipfs --ipfs-path=/mnt/nvme/ipfs-xavier/repo \
   --max-block-bytes=16777216 --max-concurrent-puts=4 --rate=20 --burst=40 --state-dir=/home/xavier/.local/share/block-ingest/state
 StandardOutput=append:/home/xavier/.local/share/block-ingest/logs/block-ingest.out.log
