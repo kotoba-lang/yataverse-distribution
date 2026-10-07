@@ -1429,3 +1429,12 @@ The Python originals stay until `lake_epoch_cycle` (which calls them) is ported.
   - Until they are ported, it calls the remote Python tools on xavier and jacob exactly as before.
   - `test/lake_epoch_cycle_test.cljk` covers the step order and run selection: a run stopped after `submit` is resumed, not restarted.
 - The manifest relation now says `lake_epoch delta`, the method rather than the Python file.
+
+### P6 drill in kotoba (2026-10-07)
+
+`deploy/p6_drill.cljk` replaces `p6_drill.py`. It is built on the cycle's kotoba steps.
+
+- **Observation.** `deploy/netwatch.cljk` is a separate lsof sampler: the drill's steps are synchronous and would block an in-process timer. Node children are still recorded by `net_audit/net_audit_hook.cjs`. Every tool the drill runs is now kotoba on node, so the Python audit hook (`net_audit/sitecustomize.py`) is gone.
+- **Gate** (`test/p6_drill_test.cljk`): signing, every field signed, canonical blocks, classification, the summary, and the netwatch tree. It also checks that the epoch-5 action Python signed still verifies under the kotoba code.
+- **Cross-check.** Re-summarising the real 2026-10-07 observation log with the kotoba code reproduces the recorded receipt exactly: tailnet 55, loopback 19, public 123, 0 Cloudflare, 0 name lookups, 71 public remotes.
+- `independent_read_drill.py` is removed. Its kotoba port is the one the drill calls.

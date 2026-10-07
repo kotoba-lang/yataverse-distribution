@@ -1,0 +1,59 @@
+;; Gate for deploy/p6_drill.cljk and deploy/netwatch.cljk (ported from test_p6_drill.py).
+(ns p6-drill-test
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [p6-drill :as p6]
+            [netwatch :as nw]))
+(def fs (js/require "node:fs"))
+(def os (js/require "node:os"))
+(def nc (js/require "node:crypto"))
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+(defn throws? [f] (try (f) false (catch :default _ true)))
+
+(defn keypair []
+  (let [kp (.generateKeyPairSync nc "ed25519")
+        seed (.subarray (.export (.-privateKey kp) #js {:format "der" :type "pkcs8"}) 16)
+        pub (.subarray (.export (.-publicKey kp) #js {:format "der" :type "spki"}) 12)]
+    [(.toString seed "hex") (p6/did-of-pub pub)]))
+(defn action [author] {"schema" p6/action-schema "author" author "chain" "yataverse/lake" "action_seq" 5
+                       "prev_action" "bafkreibfc7kpfjwj2hki7nygkicymkjbk5rgh4mg35ntsf5lddzhuhwuiu"
+                       "timestamp" "2026-10-07T02:34:42Z" "entry_type" "p6-drill" "entry" {"phase" "P6"}})
+
+(println "p6-drill gate:")
+(let [[seed did] (keypair) [_ other] (keypair)
+      signed (p6/sign-action (action did) seed)
+      block (g/canonical signed)]
+  (check "a signed action verifies from the block alone" (= did (get (p6/verify-action block) "author")))
+  (check "a seed that is not the author is refused" (throws? #(p6/sign-action (action other) seed)))
+  (check "every field is signed"
+         (every? (fn [[k v]] (throws? #(p6/verify-action (g/canonical (assoc signed k v)))))
+                 [["action_seq" 6] ["prev_action" "bafkreiother"] ["entry" {"phase" "P7"}] ["chain" "x"] ["author" other]]))
+  (check "a non-canonical block is refused" (throws? #(p6/verify-action (js/Buffer.from (js/JSON.stringify (clj->js signed) nil 1))))))
+(check "the committed epoch-5 action still verifies"
+       (= 5 (get (p6/verify-action (.readFileSync fs "deploy/p6-drill-action-epoch5.json")) "action_seq")))
+
+(let [cf (let [bl (new (.-BlockList (js/require "node:net")))]
+           (.addSubnet bl "104.16.0.0" 13 "ipv4") (.addSubnet bl "172.64.0.0" 13 "ipv4") (.addSubnet bl "2606:4700::" 32 "ipv6") [bl])]
+  (check "classify"
+         (= ["cloudflare" "cloudflare" "tailnet" "loopback" "private" "public" "name"]
+            (map #(p6/classify % cf) ["104.18.24.159" "2606:4700::6812:189f" "100.117.208.83" "127.0.0.1" "192.168.1.3" "220.146.170.114" "xavier"])))
+  (let [f (str (.tmpdir os) "/p6-gate-" (js/Date.now) ".jsonl")]
+    (.writeFileSync fs f (str/join "\n" (map #(js/JSON.stringify (clj->js %))
+                                             [{"ev" "connect" "lang" "node" "host" "100.75.169.8" "port" 12001}
+                                              {"ev" "connect" "lang" "node" "host" "172.67.1.1" "port" 443}
+                                              {"ev" "lsof" "cmd" "ipfs" "remote" "[2606:4700::1]:4001"}
+                                              {"ev" "lsof" "cmd" "tor" "remote" "192.42.116.23:443"}
+                                              {"ev" "dns" "lang" "node" "host" "ipfs.yataverse.com"}
+                                              {"ev" "dns" "lang" "node" "host" "localhost"}])))
+    (let [sm (p6/summarize f cf)]
+      (check "summarize finds Cloudflare in both sources, and the name lookup"
+             (and (= ["172.67.1.1" "2606:4700::1"] (map #(get % "host") (get sm "cloudflare")))
+                  (= ["ipfs.yataverse.com"] (get sm "name_lookups"))
+                  (= {"tailnet" 1 "cloudflare" 2 "public" 1} (get sm "connections_by_class")))))))
+
+(check "netwatch samples the root's tree and tor, not other processes"
+       (= #{10 11 12 30} (nw/tree [[10 1 "node"] [11 10 "ssh"] [12 11 "ipfs"] [20 1 "Codex"] [30 1 "/opt/homebrew/bin/tor"]] 10)))
+
+(if (zero? @failures) (println "p6-drill gate: ok")
+    (do (println "p6-drill gate:" @failures "failed") (js/process.exit 1)))

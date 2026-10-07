@@ -1,0 +1,300 @@
+;; deploy/p6_drill.cljk — ADR-2610062000 P6: one authenticated write,
+;; committed and read back, with Cloudflare never contacted, proven by
+;; observation. Ported from p6_drill.py (run on 2026-10-07, epoch 5).
+;;
+;; The write is a lake drill epoch whose single block is a signed agent
+;; action shaped after Holochain's source chain: author, action_seq,
+;; prev_action, entry, and a signature over everything else under the domain
+;; tag "yataverse/agent-action/v1\n". The block verifies with nothing but
+;; itself; the witnesses' quorum certificate in the proof bundle is the set of
+;; validation receipts.
+;;
+;; Steps (resumable, cycle-state.json as in lake_epoch_cycle.cljk):
+;;   head action custody cids manifest submit bundle resolve reader tier1 tier2 observe
+;;
+;; Observation: every node child records net.Socket#connect and dns.lookup
+;; (net_audit/net_audit_hook.cjs via NODE_OPTIONS; complete for the process);
+;; ssh, kubo, curl and the tor daemon are sampled with lsof every 0.5 s over
+;; the drill's process tree. Every tool of the drill is now kotoba on node,
+;; so the Python audit hook of the first run is no longer needed. No root
+;; packet capture; the receipt says so.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> p6_drill.cljk ...):
+;;   --config=JSON --work=DIR [--until=STEP]
+;;
+;; Exit codes: 0 the drill passed; 1 a check refused; 3 a step could not run.
+
+(ns p6-drill
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [lake-epoch-cycle :as c]
+            [independent-read-drill :as ird]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def nc (js/require "node:crypto"))
+(def cp (js/require "node:child_process"))
+
+(def steps ["head" "action" "custody" "cids" "manifest" "submit" "bundle"
+            "resolve" "reader" "tier1" "tier2" "observe"])
+(def action-schema "yataverse-agent-action/v1")
+(def action-domain "yataverse/agent-action/v1\n")
+
+;; ── the agent action ────────────────────────────────────────────────────────
+
+(def ^:private b58 "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+(defn b58-encode [buf]
+  (let [bytes (vec (array-seq buf))
+        digits (reduce (fn [ds byte]
+                         (loop [i 0 carry byte out []]
+                           (if (< i (count ds))
+                             (let [x (+ (* (nth ds i) 256) carry)]
+                               (recur (inc i) (quot x 58) (conj out (rem x 58))))
+                             (loop [carry carry out out]
+                               (if (pos? carry) (recur (quot carry 58) (conj out (rem carry 58))) out)))))
+                       [] bytes)]
+    (str (apply str (repeat (count (take-while zero? bytes)) "1")) (apply str (map #(nth b58 %) (reverse digits))))))
+
+(defn did-of-pub [pub] (str "did:key:z" (b58-encode (js/Buffer.concat #js [(js/Buffer.from #js [0xed 0x01]) pub]))))
+
+(defn signing-bytes [action]
+  (js/Buffer.concat #js [(js/Buffer.from action-domain) (g/canonical (dissoc action "signature"))]))
+
+(defn- pkcs8 [seed]
+  (.createPrivateKey nc #js {:key (js/Buffer.concat #js [(js/Buffer.from #js [0x30 0x2e 0x02 0x01 0x00 0x30 0x05 0x06 0x03 0x2b 0x65 0x70 0x04 0x22 0x04 0x20]) seed])
+                             :format "der" :type "pkcs8"}))
+
+(defn sign-action
+  "The seed stays in this process."
+  [action seed-hex]
+  (let [sk (pkcs8 (js/Buffer.from seed-hex "hex"))
+        pub (.subarray (.export (.createPublicKey nc sk) #js {:format "der" :type "spki"}) 12)
+        did (did-of-pub pub)]
+    (when-not (= did (get action "author"))
+      (throw (c/refused (str "the seed is " did ", not the action's author " (get action "author")))))
+    (assoc action "signature" (str "z" (b58-encode (.sign nc nil (signing-bytes action) sk))))))
+
+(defn verify-action
+  "-> the action, or throw. Needs nothing but the block itself."
+  [block]
+  (let [action (g/parse-json block)]
+    (when-not (.equals (g/canonical action) block) (throw (c/refused "action block is not canonical JSON")))
+    (when-not (= action-schema (get action "schema")) (throw (c/refused (str "schema " (get action "schema")))))
+    (let [pub (g/ed25519-pub-of-did (get action "author"))
+          sig (g/b58-decode (subs (get action "signature") 1))
+          key (.createPublicKey nc #js {:key (js/Buffer.concat #js [(js/Buffer.from #js [0x30 0x2a 0x30 0x05 0x06 0x03 0x2b 0x65 0x70 0x03 0x21 0x00]) pub])
+                                        :format "der" :type "spki"})]
+      (when-not (and sig (.verify nc nil (signing-bytes action) key sig))
+        (throw (c/refused "action signature does not verify")))
+      action)))
+
+;; ── observation ─────────────────────────────────────────────────────────────
+
+(defn classify [host cf-nets]
+  (let [ip (str/replace (str host) #"%.*$" "")]
+    (cond
+      (= "localhost" ip) "loopback"
+      (not (re-matches #"[0-9a-fA-F.:]+" ip)) "name"
+      (some #(.check % ip (if (str/includes? ip ":") "ipv6" "ipv4")) cf-nets) "cloudflare"
+      (or (str/starts-with? ip "127.") (= "::1" ip)) "loopback"
+      (let [[a b] (map #(js/parseInt % 10) (str/split ip #"\."))] (and (= a 100) (<= 64 b 127))) "tailnet"
+      (str/starts-with? (str/lower-case ip) "fd7a:115c:a1e0") "tailnet"
+      (re-matches #"(10\..*|192\.168\..*|172\.(1[6-9]|2\d|3[01])\..*|169\.254\..*|fe80:.*)" (str/lower-case ip)) "private"
+      :else "public")))
+
+(defn cf-blocklist [v4-file v6-file]
+  (let [bl (.. (js/require "node:net") -BlockList)
+        l (new bl)]
+    (doseq [[f t] [[v4-file "ipv4"] [v6-file "ipv6"]]
+            line (remove str/blank? (str/split-lines (.readFileSync fs f "utf8")))]
+      (let [[addr bits] (str/split (str/trim line) #"/")]
+        (.addSubnet l addr (js/parseInt bits 10) t)))
+    [l]))
+
+(defn summarize [log-path cf-nets]
+  (let [events (->> (str/split-lines (.readFileSync fs log-path "utf8")) (remove str/blank?) (map g/parse-json))
+        split-remote (fn [r] (if (str/starts-with? r "[")
+                               (let [[h p] (str/split (subs r 1) #"\]:")] [h p])
+                               (let [i (.lastIndexOf r ":")] [(subs r 0 i) (subs r (inc i))])))
+        conns (for [e events :when (and (#{"connect" "lsof"} (get e "ev")) (not (get e "path")))]
+                (let [[host port] (if (= "connect" (get e "ev")) [(get e "host") (get e "port")] (split-remote (get e "remote")))]
+                  {:who (or (get e "lang") (get e "cmd")) :host host :port port :class (classify host cf-nets)}))]
+    {"connections_by_class" (frequencies (map :class conns))
+     "cloudflare" (vec (for [x conns :when (= "cloudflare" (:class x))] {"who" (:who x) "host" (:host x) "port" (:port x)}))
+     "name_lookups" (vec (sort (set (for [e events :when (and (= "dns" (get e "ev")) (not (#{"localhost" "127.0.0.1" "::1"} (get e "host"))))]
+                                      (get e "host")))))
+     "public_remotes" (vec (sort (set (for [x conns :when (#{"public" "name"} (:class x))] (str (:who x) " " (:host x) ":" (:port x))))))}))
+
+(defn start-netwatch!
+  "Spawn netwatch.cljk on this process's tree. -> stop fn returning the sample count."
+  [cyc log]
+  (let [count-file (str log ".samples")
+        child (.spawn cp (first (c/engine-argv cyc))
+                      (clj->js (concat (rest (c/engine-argv cyc))
+                                       ["--classpath" c/here (.join path c/here "netwatch.cljk")
+                                        (str "--root-pid=" (.-pid js/process)) (str "--out=" log) (str "--count-file=" count-file)]))
+                      #js {:stdio "ignore" :detached false})]
+    (fn []
+      (.kill child)
+      (js/parseInt (try (str (.readFileSync fs count-file "utf8")) (catch :default _ "0")) 10))))
+
+;; ── steps ───────────────────────────────────────────────────────────────────
+
+(defn step-action [{:keys [c s] :as cyc}]
+  (let [e (get @s "epoch") f (c/p cyc "action.json")]
+    (when-not (get @s "action_block")
+      (let [action {"schema" action-schema "author" (get c "operator") "chain" "yataverse/lake"
+                    "action_seq" e "prev_action" (get @s "prev_cid")
+                    "timestamp" (str (subs (.toISOString (js/Date.)) 0 19) "Z") "entry_type" "p6-drill"
+                    "entry" {"adr" "ADR-2610062000" "phase" "P6"
+                             "claim" "this action was signed, committed by the witness quorum and read back over Tor and libp2p with Cloudflare never contacted"}}
+            block (g/canonical (sign-action action (str/trim (.readFileSync fs (get c "seed") "utf8"))))]
+        (.writeFileSync fs f block)
+        (swap! s assoc "action_block" true)))
+    (let [block (.readFileSync fs f) action (verify-action block)]
+      (swap! s assoc "action" {"sha256" (-> (.createHash nc "sha256") (.update block) (.digest "hex")) "bytes" (.-length block)
+                               "author" (get action "author") "action_seq" (get action "action_seq")})
+      (c/say (str "action seq " (get action "action_seq") " by " (subs (get action "author") 0 24) "… verifies, " (.-length block) " bytes")))))
+
+(defn step-custody [{:keys [c s] :as cyc}]
+  (let [cid (c/add-both! cyc (c/p cyc "action.json") (str "p6-drill-action-epoch" (get @s "epoch") ".json"))
+        x (get c "xavier") j (get c "jacob")]
+    (when-not (= (get-in @s ["action" "sha256"]) (.toString (ird/digest-of cid) "hex"))
+      (throw (c/refused (str cid " does not address the action"))))
+    (doseq [[host env] [[(get x "host") (str "IPFS_PATH=" (get x "ipfs_path") " " (get x "ipfs_bin"))]
+                        [(get j "host") (str "IPFS_PATH=" (get j "ipfs_path") " " (get j "ipfs_bin"))]]]
+      (let [got (str/trim (c/ssh! host (str env " --offline block get " cid " | shasum -a 256 | cut -c1-64")))]
+        (when-not (= got (get-in @s ["action" "sha256"])) (throw (c/refused (str host " reads back " got " for " cid))))))
+    (swap! s assoc-in ["action" "cid"] cid)
+    (.writeFileSync fs (c/p cyc "inventory.jsonl") (str "{\"cid\":\"" cid "\",\"bytes\":" (get-in @s ["action" "bytes"]) "}\n"))
+    (swap! s assoc "inv" {"rows" 1 "bytes" (get-in @s ["action" "bytes"]) "large_rows" []
+                          "sha256" (-> (.createHash nc "sha256") (.update (.readFileSync fs (c/p cyc "inventory.jsonl"))) (.digest "hex"))})
+    (c/say (str "action " cid " added (and so pinned) and read back offline on xavier and jacob"))))
+
+(defn step-manifest [{:keys [c s] :as cyc}]
+  (let [e (get @s "epoch") inv (get @s "inv") w (get c "wan") today (subs (.toISOString (js/Date.)) 0 10)]
+    (c/tool! cyc "lake_epoch.cljk"
+             ["manifest" (str "--epoch=" e) (str "--prev=" (get @s "prev_cid")) (str "--inventory-cid=" (get inv "cid"))
+              (str "--inventory=" (c/p cyc "inventory.jsonl")) (str "--captured=" today)
+              "--relation=P6 drill (ADR-2610062000): one signed agent action, committed and read back with Cloudflare not contacted; not a capture of the lake listing"
+              (str "--custody=" (js/JSON.stringify (clj->js {"node" "jacob" "wan" (get w "jacob") "evidence" (str "offline readback 1/1, pinned, " today)})))
+              (str "--custody=" (js/JSON.stringify (clj->js {"node" "xavier" "wan" (get w "xavier") "evidence" (str "offline readback 1/1, pinned, " today)})))
+              (str "--authority=" (get c "authority")) (str "--out=" (c/p cyc (str "epoch-" e ".json")))]
+             {})
+    (swap! s assoc "manifest_cid" (c/add-both! cyc (c/p cyc (str "epoch-" e ".json")) (str "epoch-" e "-manifest.json")))
+    (c/say (str "manifest " (get @s "manifest_cid")))))
+
+(defn step-resolve [{:keys [c s] :as cyc}]
+  (when-not (get @s "rows_before")
+    ;; jacob's reader still serves the log before this epoch
+    (let [j (get c "jacob")
+          h (c/last-json (c/ssh! (get j "host") (str "curl -s -m 30 http://127.0.0.1:" (get j "reader_port") "/health") {:check? false}))]
+      (when-not (get h "ok") (throw (c/unmeasured (str "reader health: " (pr-str h)))))
+      (swap! s assoc "rows_before" (get h "rows"))
+      (c/save! cyc)))
+  (c/step-resolve cyc (inc (get @s "epoch")))
+  (let [rows (c/rows-of (c/p cyc "log-resolved.jsonl"))]
+    (when-not (and (= (count rows) (inc (get @s "rows_before"))) (some #(= (get-in @s ["action" "cid"]) (.-cid %)) rows))
+      (throw (c/refused (str "log has " (count rows) " rows, expected " (get @s "rows_before") " + the action"))))
+    (swap! s assoc "log" {"rows" (count rows) "sha256" (-> (.createHash nc "sha256") (.update (.readFileSync fs (c/p cyc "log-resolved.jsonl"))) (.digest "hex"))})
+    (c/say (str "log resolves to " (count rows) " rows, the action included"))))
+
+(defn step-reader [{:keys [c s] :as cyc}]
+  (let [j (get c "jacob") e (get @s "epoch")]
+    (c/sh! ["scp" "-q" (c/p cyc "inventory.jsonl") (str (get j "host") ":" (get j "bulk") "/inventory/inventory-epoch" e ".jsonl")])
+    (c/ssh! (get j "host") (str "mkdir -p " (get j "bulk") "/lake-state/epoch" e))
+    (c/step-reader cyc)))
+
+(defn step-tier1 [{:keys [c s] :as cyc}]
+  (let [onion (get c "onion") port (get-in c ["jacob" "onion_port"])
+        socks ["curl" "-s" "-m" "180" "--socks5-hostname" (get c "tor_socks")]
+        health (c/last-json (c/sh! (conj socks (str "http://" onion ":" port "/health")) {:check? false}))]
+    (when-not (and (= (get-in @s ["log" "sha256"]) (get health "inventory-sha256")) (= (get-in @s ["log" "rows"]) (get health "rows")))
+      (throw (c/refused (str "onion reader does not serve the log: " (pr-str health)))))
+    (let [r (.spawnSync cp (first socks) (clj->js (concat (rest socks) [(str "http://" onion ":" port "/ipfs/" (get-in @s ["action" "cid"]))]))
+                        #js {:timeout 240000})
+          block (.-stdout r)]
+      (when-not (= (get-in @s ["action" "sha256"]) (-> (.createHash nc "sha256") (.update block) (.digest "hex")))
+        (throw (c/refused "the onion reader's action block does not match its CID")))
+      (verify-action block)
+      (swap! s assoc "tier1" {"onion" onion "port" port "rows" (get health "rows") "sha256" (get health "inventory-sha256")
+                              "action" "digest and signature verify"})
+      (c/say (str "tier1: onion reader serves " (get health "rows") " rows; the action verifies over Tor")))))
+
+(defn step-tier2 [{:keys [c s] :as cyc}]
+  (let [out (c/tool! cyc "independent_read_drill.cljk"
+                     (concat [(str "--ipfs-bin=" (get c "ipfs_bin")) (str "--ledger-cid=" (get c "ledger_cid"))
+                              (str "--bundle=" (get @s "bundle_cid")) (str "--require-block=" (get-in @s ["action" "cid"]))
+                              (str "--verifier=" (get-in c ["lake_head" "runner"]) " " (.join path c/here "lake_head.cljk"))
+                              "--blocks=3"]
+                             (map #(str "--peer=" %) (get c "peers")))
+                     {:timeout-s 3600 :check? false})
+        r (c/last-json out)]
+    (.writeFileSync fs (c/p cyc "tier2.log") out)
+    (when-not (and (get r "passed") (= (get @s "epoch") (get-in r ["head" "seq"])))
+      (throw (c/refused (str "tier2: " (subs out (max 0 (- (count out) 300)))))))
+    (swap! s assoc "tier2" {"peers" (get r "peers") "rows" (get r "rows") "head" (get r "head") "steps" (mapv #(get % "step") (get r "steps"))})
+    (c/say (str "tier2: libp2p read verifies seq " (get-in r ["head" "seq"]) ", " (get r "rows") " rows, the action by bitswap"))))
+
+(defn step-observe [{:keys [c s] :as cyc}]
+  (let [sm (assoc (summarize (c/p cyc "net-audit.jsonl") (cf-blocklist (get c "cf_ips_v4") (get c "cf_ips_v6")))
+                  "lsof_samples" (get @s "lsof_samples" 0))]
+    (swap! s assoc "observe" sm)
+    (when (seq (get sm "cloudflare")) (throw (c/refused (str "Cloudflare contacted: " (pr-str (take 5 (get sm "cloudflare")))))))
+    (when (seq (get sm "name_lookups")) (throw (c/refused (str "name lookups during the drill: " (pr-str (take 10 (get sm "name_lookups")))))))
+    (c/say (str "observe: 0 Cloudflare connections, 0 name lookups; " (pr-str (get sm "connections_by_class"))))))
+
+(def step-fns {"head" c/step-head "action" step-action "custody" step-custody "cids" c/step-cids "manifest" step-manifest
+               "submit" c/step-submit "bundle" c/step-bundle "resolve" step-resolve "reader" step-reader
+               "tier1" step-tier1 "tier2" step-tier2 "observe" step-observe})
+
+(defn run! [{:keys [s] :as cyc} until]
+  (let [audit (c/p cyc "net-audit.jsonl")
+        env (aget js/process "env")]
+    (aset env "NET_AUDIT_LOG" audit)
+    (aset env "NODE_OPTIONS" (str "--require " (.join path c/here "net_audit" "net_audit_hook.cjs")))
+    (let [stop (start-netwatch! cyc audit)
+          stopped (atom false)
+          stop! (fn [] (when-not @stopped (reset! stopped true) (swap! s update "lsof_samples" (fnil + 0) (stop)) (c/save! cyc)))]
+      (try
+        (loop [[name & more] steps]
+          (cond
+            (nil? name)
+            (let [receipt {"drill" "yataverse-p6" "passed" true "epoch" (get @s "epoch") "action" (get @s "action")
+                           "manifest" (get @s "manifest_cid") "bundle" (get @s "bundle_cid") "log" (get @s "log")
+                           "tier1" (get @s "tier1") "tier2" (get @s "tier2") "observe" (get @s "observe")
+                           "observation_scope" "every node process by hook (complete); ssh, kubo, curl and the tor daemon by lsof every 0.5 s over the drill process tree (sampled); no root packet capture"
+                           "checked" (str (subs (.toISOString (js/Date.)) 0 19) "Z")}]
+              (.writeFileSync fs (c/p cyc "receipt.json") (js/JSON.stringify (clj->js receipt) nil 1))
+              (c/say (js/JSON.stringify (clj->js receipt)))
+              0)
+            (some #{name} (get @s "done")) (recur more)
+            :else
+            (do (when (= name "observe") (stop!))
+                (c/say (str "── " name))
+                ((step-fns name) cyc)
+                (swap! s update "done" conj name)
+                (c/save! cyc)
+                (if (= name until) 0 (recur more)))))
+        (finally (stop!))))))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))
+        cfg (g/parse-json (.readFileSync fs (one "--config") "utf8"))
+        cyc (c/make-cycle cfg (one "--work"))]
+    (c/say "work" (one "--work"))
+    (js/process.exit
+     (try (run! cyc (one "--until"))
+          (catch :default e
+            (c/save! cyc)
+            (if (= :refused (g/kind e))
+              (do (c/say "REFUSED" (g/message e)) 1)
+              (do (c/say "UNMEASURED" (g/message e)) 3)))))))
+
+(when (some #(str/ends-with? % "p6_drill.cljk") (array-seq (aget js/process "argv")))
+  (main))

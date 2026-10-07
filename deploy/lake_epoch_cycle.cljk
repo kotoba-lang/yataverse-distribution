@@ -97,12 +97,12 @@
 (defn p [{:keys [work]} n] (.join path work n))
 (defn say [& xs] (println (str/join " " xs)))
 
-(defn- engine [{:keys [c]}] (vec (take 2 (g/words (get-in c ["lake_head" "runner"])))))
+(defn engine-argv [{:keys [c]}] (vec (take 2 (g/words (get-in c ["lake_head" "runner"])))))
 
 (defn tool!
   "Run one of this directory's kotoba tools. -> stdout."
   [cyc tool args opts]
-  (sh! (into (engine cyc) (concat ["--classpath" here (.join path here tool)] args)) opts))
+  (sh! (into (engine-argv cyc) (concat ["--classpath" here (.join path here tool)] args)) opts))
 
 (defn lake-head
   "-> [code stdout] of lake_head.cljk with the config's runner and extra flags."
