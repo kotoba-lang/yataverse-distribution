@@ -1405,3 +1405,16 @@ Both are valid, because the namespace signature covers dag-cbor, which is order-
 - **`deploy/p2p_writer_drill.cljk`** replaces `p2p_writer_drill.py`. Run from main-2 against xavier's writer over raw IP, it passed: read seq 59 in 4.1 s, replay 200 in 0.05 s, direct path.
 - **`deploy/independent_read_drill.cljk`** is the port of `independent_read_drill.py`. Inventory rows stay JS objects, because about 825k `js->clj` conversions are slow on the interpreter. `test/independent_read_drill_test.cljk` checks `digest-of` for CIDv1 raw and CIDv0.
   - **Live run** with the P6 Tier 2 inputs: the epoch-5 bundle, xavier's raw IP and jacob's relay. Every step passed in 67 s: 7/7 proofs, epochs 5→0 (825,283 rows), 3/3 sampled blocks, and the P6 action block. The Python version stays until `p6_drill` is ported, because `p6_drill` calls it.
+
+### Epoch tools in kotoba (2026-10-07)
+
+- **`deploy/lake_epoch.cljk`** (delta and manifest). `test/lake_epoch_test.cljk`:
+  - rebuilds epoch 4's delta from its run's own inputs (24 rows, byte for byte);
+  - rebuilds the committed `epoch-4.json` and `epoch-5.json` byte for byte;
+  - refuses custody on one WAN.
+
+  It takes 1.4 s over the 825k-row log.
+- **`deploy/diff_lake_inventory.cljk`** (the two-walk diff). `test/diff_lake_inventory_test.cljk` reruns epoch 4's diff from its two walks: 3,749 rows over 821,533 old, with the output and the receipt byte-identical to the Python run. It also covers the refusals.
+- **`graph_head/py-json-str`** writes receipts in Python's default `json.dumps(sort_keys=True)` form, so receipts keep their bytes.
+
+The Python originals stay until `lake_epoch_cycle` (which calls them) is ported.

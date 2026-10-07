@@ -1,0 +1,37 @@
+;; Gate for deploy/diff_lake_inventory.cljk: epoch 4's diff, from its own walks.
+;; Run: node <release>/engine/cli.js --classpath deploy test/diff_lake_inventory_test.cljk
+(ns diff-lake-inventory-test
+  (:require [graph-head :as g]
+            [diff-lake-inventory :as d]))
+
+(def fs (js/require "node:fs"))
+(def os (js/require "node:os"))
+(def home (aget js/process "env" "HOME"))
+(def run4 (str home "/.local/share/yataverse-lake-cycle/runs/run-20261006T1930Z"))
+(def cfg (g/parse-json (.readFileSync fs (str home "/.local/share/yataverse-lake-cycle/bin/lake-epoch-cycle.json") "utf8")))
+
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+(defn refusal [f] (try (f) nil (catch :default x (g/message x))))
+
+(println "diff-lake-inventory gate:")
+(let [dir (.mkdtempSync fs (str (.tmpdir os) "/diff-gate-"))
+      out (str dir "/delta.jsonl") rec (str dir "/receipt.json")
+      args {:old-inventory (get-in cfg ["epoch0" "inventory"]) :old-sha256 (get-in cfg ["epoch0" "sha256"])
+            :candidate-a (str run4 "/candidate-a.jsonl") :candidate-a-state (str run4 "/candidate-a.state.json")
+            :candidate-b (str run4 "/candidate-b.jsonl") :candidate-b-state (str run4 "/candidate-b.state.json")
+            :output out :receipt rec}
+      r (d/delta! args)]
+  (check (str "epoch 4 diff rebuilt byte for byte: " (get r "delta_rows") " rows over " (get r "old_rows") " old")
+         (.equals (.readFileSync fs out) (.readFileSync fs (str run4 "/diff-since-epoch0.jsonl"))))
+  (check "receipt byte for byte" (.equals (.readFileSync fs rec) (.readFileSync fs (str run4 "/diff.receipt.json"))))
+  (check "existing output is refused" (= "delta output or receipt already exists" (refusal #(d/delta! args))))
+  (check "a wrong old digest is refused"
+         (= "old inventory digest differs" (refusal #(d/delta! (assoc args :old-sha256 "00" :output (str dir "/x") :receipt (str dir "/y")))))))
+(check "a dropped old CID is refused"
+       (some? (refusal #(d/merge-delta [["bafa" 1] ["bafb" 2]] [["bafb" 2] ["bafc" 3]]))))
+(check "a changed size is refused"
+       (some? (refusal #(d/merge-delta [["bafa" 1]] [["bafa" 2]]))))
+
+(if (zero? @failures) (println "diff-lake-inventory gate: ok")
+    (do (println "diff-lake-inventory gate:" @failures "failed") (js/process.exit 1)))

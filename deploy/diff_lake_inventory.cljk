@@ -1,0 +1,124 @@
+;; deploy/diff_lake_inventory.cljk — publish only new lake CIDs after two
+;; complete listing walks agree (ADR-2610062000 P2). Ported from
+;; diff_lake_inventory.py; output and receipt are byte-identical.
+;;
+;; Both candidate walks must carry a completion receipt for the same old
+;; inventory, cutoff, sha256, rows, bytes and size. The new inventory must
+;; hold every old CID with its old size, in strictly increasing CID order;
+;; the rows it adds are written as the delta. The two walks are a stability
+;; check, not an atomic snapshot.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> diff_lake_inventory.cljk ...):
+;;   --old-inventory=F --old-sha256=HEX --candidate-a=F --candidate-a-state=F
+;;   --candidate-b=F --candidate-b-state=F --output=F --receipt=F
+;;
+;; Exit codes: 0 written (the receipt is printed); 2 refused.
+
+(ns diff-lake-inventory
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def nc (js/require "node:crypto"))
+
+(def cid-v0 #"Qm[1-9A-HJ-NP-Za-km-z]{44}")
+(def cid-v1 #"b[a-z2-7]{20,200}")
+(defn valid-cid? [c] (and (string? c) (boolean (or (re-matches cid-v0 c) (re-matches cid-v1 c)))))
+
+(defn- refuse [msg] (throw (ex-info msg {:kind :refused})))
+(defn- sha-file [p] (-> (.createHash nc "sha256") (.update (.readFileSync fs p)) (.digest "hex")))
+
+(defn completed-candidate [p state-path old-sha]
+  (let [s (g/parse-json (.readFileSync fs state-path "utf8"))]
+    (when-not (and (= 1 (get s "schema")) (= "complete" (get s "status"))
+                   (= (.resolve path p) (get s "output")) (= old-sha (get s "old_sha256"))
+                   (= (.-size (.statSync fs p)) (get s "size")) (= (sha-file p) (get s "sha256"))
+                   (js/Number.isInteger (get s "rows")) (>= (get s "rows") 1)
+                   (js/Number.isInteger (get s "bytes")) (>= (get s "bytes") 1))
+      (refuse "candidate or completion receipt differs"))
+    s))
+
+(defn inventory-rows
+  "-> vector of [cid size]; refuses a malformed row, a bad CID, or CIDs
+   not strictly increasing."
+  [p]
+  (loop [lines (remove str/blank? (str/split (.readFileSync fs p "utf8") #"\n")) prev "" out (transient [])]
+    (if-let [line (first lines)]
+      (let [row (try (js/JSON.parse line) (catch :default _ (refuse "inventory row is invalid")))
+            cid (.-cid row) size (.-bytes row)]
+        (when-not (and (valid-cid? cid) (> (compare cid prev) 0) (js/Number.isInteger size) (>= size 1))
+          (refuse "inventory CID order or size is invalid"))
+        (recur (rest lines) cid (conj! out [cid size])))
+      (persistent! out))))
+
+(defn merge-delta
+  "Pure. old and new: sorted vectors of [cid size]. -> {:lines [..] :old-count ...}."
+  [old new]
+  (loop [o old n new acc {:lines (transient []) :old-count 0 :old-bytes 0 :new-count 0 :new-bytes 0
+                          :delta-count 0 :delta-bytes 0 :max 0 :oversized 0}]
+    (if-let [[cid size] (first n)]
+      (let [[ocid osize] (first o)
+            acc (-> acc (update :new-count inc) (update :new-bytes + size))]
+        (cond
+          (and ocid (< (compare ocid cid) 0)) (refuse (str "new inventory omits old CID: " ocid))
+          (= ocid cid) (if (= osize size)
+                         (recur (rest o) (rest n) (-> acc (update :old-count inc) (update :old-bytes + size)))
+                         (refuse (str "new inventory changes old CID size: " cid)))
+          :else (recur o (rest n)
+                       (-> acc (update :lines conj! (str "{\"cid\":\"" cid "\",\"bytes\":" size "}\n"))
+                           (update :delta-count inc) (update :delta-bytes + size)
+                           (update :max max size) (update :oversized + (if (> size 8000000) 1 0))))))
+      (if-let [[ocid] (first o)]
+        (refuse (str "new inventory omits old CID: " ocid))
+        (update acc :lines persistent!)))))
+
+(defn delta! [{:keys [old-inventory old-sha256 candidate-a candidate-a-state candidate-b candidate-b-state output receipt]}]
+  (let [paths (map #(.resolve path %) [old-inventory candidate-a candidate-b output receipt])]
+    (when-not (= 5 (count (set paths))) (refuse "input and output paths overlap"))
+    (when (or (.existsSync fs output) (.existsSync fs receipt)) (refuse "delta output or receipt already exists"))
+    (let [old-sha (sha-file old-inventory)]
+      (when-not (= old-sha old-sha256) (refuse "old inventory digest differs"))
+      (let [sa (completed-candidate candidate-a candidate-a-state old-sha)
+            sb (completed-candidate candidate-b candidate-b-state old-sha)]
+        (doseq [k ["sha256" "rows" "bytes" "size"]]
+          (when-not (= (get sa k) (get sb k)) (refuse (str "two complete walks differ: " k))))
+        (when-not (= (get sa "cutoff_utc") (get sb "cutoff_utc")) (refuse "two complete walks use different cutoffs"))
+        (let [r (merge-delta (inventory-rows old-inventory) (inventory-rows candidate-a))]
+          (when-not (and (= (:new-count r) (get sa "rows")) (= (:new-bytes r) (get sa "bytes"))
+                         (= (:new-count r) (+ (:old-count r) (:delta-count r)))
+                         (= (:new-bytes r) (+ (:old-bytes r) (:delta-bytes r))))
+            (refuse "candidate counts differ from completion receipt"))
+          (let [payload (js/Buffer.from (apply str (:lines r)) "utf8")
+                record {"schema" 1 "status" "complete" "old_sha256" old-sha "cutoff_utc" (get sa "cutoff_utc")
+                        "candidate_sha256" (get sa "sha256") "candidate_rows" (:new-count r)
+                        "candidate_bytes" (:new-bytes r) "old_rows" (:old-count r) "old_bytes" (:old-bytes r)
+                        "delta_rows" (:delta-count r) "delta_bytes" (:delta-bytes r)
+                        "delta_sha256" (-> (.createHash nc "sha256") (.update payload) (.digest "hex"))
+                        "delta_max_block_bytes" (:max r) "delta_oversized_rows" (:oversized r)
+                        "scope" "two matching non-atomic public listing walks"}]
+            (.mkdirSync fs (.dirname path output) #js {:recursive true})
+            (.mkdirSync fs (.dirname path receipt) #js {:recursive true})
+            (.writeFileSync fs (str output ".partial") payload)
+            (.renameSync fs (str output ".partial") output)
+            (.writeFileSync fs (str receipt ".partial") (str (g/py-json-str record) "\n"))
+            (.renameSync fs (str receipt ".partial") receipt)
+            record))))))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))]
+    (try
+      (println (g/py-json-str (delta! {:old-inventory (one "--old-inventory") :old-sha256 (one "--old-sha256")
+                                       :candidate-a (one "--candidate-a") :candidate-a-state (one "--candidate-a-state")
+                                       :candidate-b (one "--candidate-b") :candidate-b-state (one "--candidate-b-state")
+                                       :output (one "--output") :receipt (one "--receipt")})))
+      (catch :default e
+        (.write js/process.stderr (str "REFUSED: " (g/message e) "\n"))
+        (js/process.exit 2)))))
+
+(when (some #(str/ends-with? % "diff_lake_inventory.cljk") (array-seq (aget js/process "argv")))
+  (main))
