@@ -1199,3 +1199,49 @@ The commit itself landed 2.9 s after submission. Readers still verify the 5-of-7
 4. It wrote `heads/yataverse/ipns/<graph>.json`.
 
 All four rebuilt heads were **identical to the live R2 objects, signatures included** (3675, 62, 362, 0).
+
+## P6: a write with Cloudflare not contacted (2026-10-07, ADR-2610062000 P6)
+
+**What it proves.** One authenticated write is committed by the witness quorum and read back over Tor (Tier 1) and over libp2p (Tier 2). Nothing in the run contacts Cloudflare, and nothing resolves a DNS name. `deploy/p6_drill.py` runs it end to end. The run is resumable, like the epoch cycle.
+
+**The write.** It is lake epoch 5. Its only block is a signed *agent action* (`yataverse-agent-action/v1`), shaped after Holochain's source-chain action:
+
+- `author` is the lake operator's did:key.
+- `action_seq` is 5, and `prev_action` is the epoch-4 manifest.
+- The entry states the drill's claim.
+- The signature covers every other field, under the domain tag `yataverse/agent-action/v1`.
+
+The block verifies with nothing but itself. The witnesses play Holochain's validation authorities: they apply the writer policy pinned in the ledger, and the 5-of-7 quorum certificate in the proof bundle is the set of validation receipts. The manifest's relation labels the epoch as the P6 drill, not a capture of the lake listing.
+
+**Observation, not a firewall.** main-2 has no root, so no packet capture was run. Instead:
+
+- Every Python child records `socket.connect` and `getaddrinfo` through an audit hook (`deploy/net_audit/sitecustomize.py`, loaded through `PYTHONPATH`).
+- Every node child records `net.Socket#connect` and `dns.lookup` (`deploy/net_audit/net_audit_hook.cjs`, loaded through `NODE_OPTIONS`).
+- Both hooks are complete for their process, not sampled.
+- Other processes are sampled with `lsof` every 0.5 s: ssh, the ephemeral Kubo, curl, and the tor daemon the onion reads go through. Only the drill's process tree is sampled (plus tor). A first try sampled the whole user and picked up unrelated apps' Cloudflare traffic.
+- Every remote is checked against Cloudflare's published ranges (14 IPv4 and 6 IPv6 ranges, fetched before the run). The step refuses on any Cloudflare connection and on any name lookup.
+
+**Run on 2026-10-07 from main-2.** Every step passed. The receipt is `deploy/p6-drill-receipt-20261007.json`.
+
+| Step | Result |
+|---|---|
+| Action | `bafkreigonzau…` (563 bytes); signed by `…QtN8WDk6` and verified |
+| Custody | Added on xavier and jacob with equal CIDs; offline readback on both |
+| Manifest | Epoch 5, `bafkreidclqvc7…` |
+| Submit | Signed; verified by 5 witnesses |
+| Bundle | `bafkreih6zsiy7…` |
+| Resolve | 825,283 rows: the previous 825,282 plus the action |
+| Tier 1 | Over Tor only: the onion reader's `/health` equals the log (sha256 `478af536…`), and the action block it serves verifies (digest and signature) |
+| Tier 2 | An ephemeral Kubo with no bootstrap list and no DNS, given xavier's raw IP and jacob's relay address. It verified the bundle offline against the pinned ledger, walked epochs 5→0, and fetched the action by bitswap |
+| Observe | 0 Cloudflare connections and 0 name lookups, over 458 lsof samples. Connections: 55 tailnet (witnesses and ssh), 19 loopback, 123 public (Kubo DHT peers and Tor relays, none in a Cloudflare range) |
+
+**`independent_read_drill.py` gained two options.**
+
+- `--bundle CID` starts from a bundle instead of the directory. The bundle is still verified against the pinned ledger. The directory still names epoch 4's bundle, and republishing it stays a reviewed step.
+- `--require-block CID` fetches one more block by bitswap. It must be in the log and match its digest.
+
+**Not covered.**
+
+- The witnesses' and custodians' own traffic is not observed. They are reached over the tailnet, and their work in the drill (votes, offline adds) has no Cloudflare dependency in code.
+- Tailscale's own control traffic runs as root and is outside the sample.
+- The Worker still runs on Cloudflare. The drill shows a client can write and read without it, not that it is gone.

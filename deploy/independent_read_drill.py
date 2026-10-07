@@ -109,12 +109,19 @@ def digest_of(cid_bytes_text):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--ipfs-bin", default="ipfs")
-    p.add_argument("--directory-ipns", required=True)
+    p.add_argument("--directory-ipns", help="start from the public directory (the cold-client path)")
+    p.add_argument("--bundle", help="start from this proof bundle CID instead of the directory; the bundle "
+                                    "is still verified offline against the pinned ledger")
+    p.add_argument("--require-block", action="append", default=[],
+                   help="also fetch this block by bitswap and check it against its CID digest")
     p.add_argument("--peer", action="append", required=True, help="raw IP multiaddr; no /dns*")
     p.add_argument("--ledger-cid", required=True, help="the witness ledger CID pinned in the repository")
     p.add_argument("--verifier", required=True, help="command prefix that runs lake_head.cljk")
     p.add_argument("--blocks", type=int, default=6)
     a = p.parse_args(argv)
+    if bool(a.directory_ipns) == bool(a.bundle):
+        print("REFUSE give exactly one of --directory-ipns and --bundle")
+        return 1
     if any("/dns" in peer for peer in a.peer):
         print("REFUSE a /dns multiaddr would make this drill depend on DNS")
         return 1
@@ -123,21 +130,25 @@ def main(argv=None):
     try:
         if not d.start():
             return 3
-        r = d.ipfs("name", "resolve", "--nocache", "/ipns/" + a.directory_ipns, timeout=300)
-        html_path = r.stdout.decode().strip() if r.returncode == 0 else ""
-        if not d.step("resolve-directory", html_path.startswith("/ipfs/"), html_path or r.stderr.decode()[-200:]):
-            return 1
-        html = d.cat(html_path[len("/ipfs/"):]) or b""
-        m = re.search(rb"<code>(bafkrei[a-z2-7]+)</code>", html)
-        json_cid = m.group(1).decode() if m else None
-        directory = json.loads(d.cat(json_cid) or b"{}") if json_cid else {}
-        yv = next((s for s in directory.get("services", []) if s.get("domain") == "yataverse.com"), {})
-        lake = yv.get("lake_log") or {}
-        if not d.step("directory-lake-log", lake.get("proof_bundle"), f"directory {json_cid} names bundle {lake.get('proof_bundle')}"):
-            return 1
-        if not d.step("ledger-pinned", lake.get("witness_ledger") == a.ledger_cid,
-                      f"directory ledger {lake.get('witness_ledger')} vs repository {a.ledger_cid}"):
-            return 1
+        if a.bundle:
+            lake = {"proof_bundle": a.bundle}
+            d.step("bundle-given", True, f"bundle {a.bundle} given; its proofs are checked against the pinned ledger")
+        else:
+            r = d.ipfs("name", "resolve", "--nocache", "/ipns/" + a.directory_ipns, timeout=300)
+            html_path = r.stdout.decode().strip() if r.returncode == 0 else ""
+            if not d.step("resolve-directory", html_path.startswith("/ipfs/"), html_path or r.stderr.decode()[-200:]):
+                return 1
+            html = d.cat(html_path[len("/ipfs/"):]) or b""
+            m = re.search(rb"<code>(bafkrei[a-z2-7]+)</code>", html)
+            json_cid = m.group(1).decode() if m else None
+            directory = json.loads(d.cat(json_cid) or b"{}") if json_cid else {}
+            yv = next((s for s in directory.get("services", []) if s.get("domain") == "yataverse.com"), {})
+            lake = yv.get("lake_log") or {}
+            if not d.step("directory-lake-log", lake.get("proof_bundle"), f"directory {json_cid} names bundle {lake.get('proof_bundle')}"):
+                return 1
+            if not d.step("ledger-pinned", lake.get("witness_ledger") == a.ledger_cid,
+                          f"directory ledger {lake.get('witness_ledger')} vs repository {a.ledger_cid}"):
+                return 1
         ledger, bundle = d.cat(a.ledger_cid), d.cat(lake["proof_bundle"])
         lp, bp = os.path.join(work, "ledger.edn"), os.path.join(work, "bundle.json")
         open(lp, "wb").write(ledger or b"")
@@ -170,6 +181,13 @@ def main(argv=None):
             if r.returncode == 0 and len(r.stdout) == row["bytes"] and hashlib.sha256(r.stdout).digest() == digest_of(row["cid"]):
                 ok_blocks += 1
         d.step("blocks", ok_blocks == len(sample), f"{ok_blocks}/{len(sample)} lake blocks over bitswap match their CID digests")
+        for cid in a.require_block:
+            want = next((r for r in rows if r["cid"] == cid), None)
+            r = d.ipfs("block", "get", cid, timeout=300)
+            good = (want is not None and r.returncode == 0 and len(r.stdout) == want["bytes"]
+                    and hashlib.sha256(r.stdout).digest() == digest_of(cid))
+            d.step("required-block", good, f"{cid} {'in the log and ' if want else 'NOT in the log; '}"
+                                           f"{'matches its digest' if good else 'not read back'}")
         passed = all(s["ok"] for s in d.steps)
         print(json.dumps({"drill": "yataverse-independent-read", "passed": passed, "rows": rows_total,
                           "head": head, "peers": a.peer, "dns": "none", "cloudflare": "none",
