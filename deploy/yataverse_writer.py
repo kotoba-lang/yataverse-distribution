@@ -25,6 +25,13 @@ writer and the P4 mirror produce identical chains: seq N names
 Writes to one graph are serialised in this process. Across processes, or a
 second writer, inga's first-wins sequence is the arbiter: a submit that loses
 its sequence is reported as a conflict, never as a success.
+
+Writers are relays (2026-10-07). The authority is the namespace signature
+inside the document; a writer's own key only admits it to the witnesses'
+policy. Two writers relaying the same head build byte-identical documents,
+so either may answer. A writer need not reach every custodian: it holds the
+document on its own Kubo (--pin-cmd), and custodians that pull committed
+documents themselves (custody_puller.py) are named with --pulled-by.
 """
 
 import argparse
@@ -169,8 +176,12 @@ class Writer:
         sys.stderr.write(err.decode(errors="replace"))
         last = (out.decode(errors="replace").strip().splitlines() or [""])[-1]
         if code == 1:
-            # Another writer took the sequence. Report what is there now.
+            # Another writer took the sequence. If it relayed this same head,
+            # the head is committed: answer as committed, not as a conflict.
             now = self.current(graph)
+            if now and (now[2]["head"]["sequence"], now[2]["head"]["value"]) == (head["sequence"], head["value"]):
+                self.cache[graph] = now
+                return {"seq": now[0], "cid": now[1], "sequence": head["sequence"], "value": head["value"]}
             raise Conflict({"sequence": now[2]["head"]["sequence"], "value": now[2]["head"]["value"]} if now else None)
         if code != 0:
             raise gm.Unmeasured(last[:200])
@@ -262,10 +273,13 @@ def main(argv=None):
                    help="witnesses that must report the commit before the writer answers")
     p.add_argument("--sync-pins", type=int, default=2,
                    help="how many --pin-cmd custodians must hold a document before it is submitted")
+    p.add_argument("--pulled-by", action="append", default=[],
+                   help="a custodian that pulls committed documents itself (custody_puller.py); "
+                        "counts toward the two custodians without this writer reaching it")
     p.add_argument("--out-dir", required=True)
     a = p.parse_args(argv)
-    if len(a.pin_cmd) < 2:
-        p.error("pin each document on at least two custodians (--pin-cmd twice)")
+    if len(a.pin_cmd) < 1 or len(a.pin_cmd) + len(a.pulled_by) < 2:
+        p.error("each document needs two custodians: --pin-cmd twice, or --pin-cmd and --pulled-by")
     if not 1 <= a.sync_pins <= len(a.pin_cmd):
         p.error("--sync-pins must be between 1 and the number of --pin-cmd")
     srv = ThreadingHTTPServer((a.host, a.port), handler(Writer(a)))
