@@ -308,7 +308,7 @@
 (defn serve! [opts store]
   (let [inflight (atom 0)
         allow? (limiter (:rate opts) (:burst opts))]
-    (.listen
+    (let [server
      (.createServer
       http
       (fn [^js req ^js res]
@@ -331,8 +331,14 @@
                   (-> (read-body req (:max-block-bytes opts))
                       (.then (fn [b] (if (= b :too-large) (reply res {:status 413 :json {"refused" "block too large"}}) (go b))))
                       (.finally #(swap! inflight dec)))))
-            :else (go nil)))))
-     (:port opts) (:host opts))))
+            :else (go nil)))))]
+      ;; Node closes idle keep-alive sockets after 5 s by default; a client that
+      ;; reuses one at that moment gets ECONNRESET ("fetch failed"), seen twice
+      ;; on 2026-10-07 (mirror listing, prober head). Keep them past any
+      ;; client's reuse window.
+      (set! (.-keepAliveTimeout server) 65000)
+      (set! (.-headersTimeout server) 66000)
+      (.listen server (:port opts) (:host opts)))))
 
 (defn- flags [k] (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k)))) (array-seq (aget js/process "argv"))))
 
