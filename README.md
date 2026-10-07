@@ -643,7 +643,7 @@ to gad for HTTP-01, then the mapping returns to Xavier. When the public
 subset. A long takeover must also move port 80 and enable gad's Certbot
 renewal timer. Do not run both nodes' port mapping refreshers at once.
 
-`deploy/build_independent_index.py` makes a new dated HTML document from the
+`deploy/build_independent_index.cljk` (kotoba; ported 2026-10-07, rebuilding the published page byte for byte from the source fetched by CID `bafkreigyyull…`) makes a new dated HTML document from the
 exact 2026-09-26 apex snapshot. It refuses a changed source SHA-256, rewrites
 all 50 HTTPS block links to this gateway's own `/ipfs/{cid}` route, and
 replaces source claims about unavailable APIs and live generation. The output

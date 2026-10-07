@@ -1,0 +1,86 @@
+;; deploy/build_independent_index.cljk — build the dated, content-addressed
+;; yataverse page for the own-node gateway (ADR-2610062000). Ported from
+;; build_independent_index.py; the output is byte-identical.
+;;
+;; Input is the exact 2026-09-26 apex HTML snapshot; a changed source is
+;; refused, so an edit to the transformation is reviewed against the new
+;; source instead of silently publishing an incomplete mirror. All 50 HTTPS
+;; block links become this gateway's own /ipfs/{cid}, and the source's claims
+;; about unavailable APIs and live generation are replaced.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> build_independent_index.cljk ...):
+;;   --source=F --output=F
+;; Exit codes: 0 written (the receipt is printed); 2 refused.
+
+(ns build-independent-index
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def fs (js/require "node:fs"))
+(def nc (js/require "node:crypto"))
+
+(def source-sha256 "d8c516b3e3dc08408f3dfd2d2d4d05fe86a8e7d3fb5e83b79ca0f145eec3abd0")
+(def old-block-base "https://ipfs.yataverse.com/ipfs/")
+(def new-block-base "/ipfs/")
+
+(defn- refuse [msg] (throw (ex-info msg {:kind :build})))
+(defn- sha256-hex [buf] (-> (.createHash nc "sha256") (.update buf) (.digest "hex")))
+(defn- occurrences [s sub] (dec (count (str/split (str s "\u0000") (js/RegExp. (.replace sub (js/RegExp. "[.*+?^${}()|[\\]\\\\]" "g") "\\$&") "g")))))
+
+(defn replace-span [page start end replacement]
+  (when-not (and (= 1 (occurrences page start)) (= 1 (occurrences page end)))
+    (refuse "source markup anchor count changed"))
+  (let [i (str/index-of page start)
+        j (str/index-of page end (+ i (count start)))]
+    (str (subs page 0 i) replacement (subs page j))))
+
+(defn- subn [page re replacement]
+  (let [n (count (re-seq re page))] [(str/replace page re replacement) n]))
+
+(defn build
+  "-> [Buffer receipt]."
+  [source]
+  (when-not (= source-sha256 (sha256-hex source)) (refuse "source HTML SHA-256 differs from dated snapshot"))
+  (let [page (.toString source "utf8")]
+    (when-not (= 50 (occurrences page old-block-base)) (refuse "source gateway link count changed"))
+    (let [page (-> page
+                   (str/replace old-block-base new-block-base)
+                   (replace-span "<p class=\"muted\">An IPLD/IPFS-centered mirror" "<div class=\"plan\">"
+                                 (str "<p class=\"muted\">Dated 2026-09-26 read-only snapshot on an own-node IPNS "
+                                      "gateway. The inventory covers 821,533 public CIDs. This gateway returns "
+                                      "bytes only for blocks pinned on this node; unavailable blocks return 404. "
+                                      "The original content CID remains available through IPFS.</p>\n"))
+                   (replace-span "<div class=\"plan\">" "<h2>Machine access</h2>"
+                                 (str "<div class=\"plan\"><div><h3>Independent read path</h3><p>"
+                                      "Browse the dated inventory, retrieve pinned bytes from this gateway, "
+                                      "or use the native ipfs:// links. Updates and other lake APIs remain "
+                                      "unavailable here.</p></div></div>\n"))
+                   (replace-span "<p class=\"muted\">LLMs and agents call the lake through tools, not screens:"
+                                 "<h2>Portable inventory snapshot</h2>"
+                                 (str "<p class=\"muted\">Read-only local endpoints: "
+                                      "<code>GET /health</code>, <code>GET /api/v1/lake/blocks</code> "
+                                      "(dated inventory with integer cursor), and <code>GET /ipfs/{cid}</code> "
+                                      "(only locally pinned bytes). Other APIs are unavailable.</p>\n")))
+          [page cursor-n] (subn page #"More blocks available — next page: <code>/api/v1/lake/blocks\?cursor=[^<]+</code>"
+                                "More blocks available — browse the complete dated inventory at <code>/api/v1/lake/blocks</code>.")
+          _ (when-not (= 1 cursor-n) (refuse "source next-page marker changed"))
+          [page footer-n] (subn page #"identity: content-addressed · naming: DNSLink/IPNS · this page: generated at request time from the same bucket it serves\."
+                                "identity: content-addressed · naming: signed IPNS · this page: dated, static, read-only own-node snapshot.")
+          _ (when (or (not= 1 footer-n) (str/includes? page old-block-base)) (refuse "source footer or gateway links changed"))
+          result (js/Buffer.from page "utf8")]
+      [result {"source_sha256" source-sha256 "sha256" (sha256-hex result) "bytes" (.-length result)
+               "rewritten_block_links" 50 "scope" "dated-own-node-read-only-snapshot"}])))
+
+(defn- flag [k] (some #(when (str/starts-with? % (str k "=")) (subs % (inc (count k)))) (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (try
+    (let [[result receipt] (build (.readFileSync fs (flag "--source")))]
+      (.writeFileSync fs (flag "--output") result)
+      (println (g/py-json-str receipt)))
+    (catch :default e
+      (.write js/process.stderr (str "REFUSED: " (g/message e) "\n"))
+      (js/process.exit 2))))
+
+(when (some #(str/ends-with? % "build_independent_index.cljk") (array-seq (aget js/process "argv")))
+  (main))
