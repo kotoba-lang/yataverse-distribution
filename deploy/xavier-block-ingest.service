@@ -11,7 +11,7 @@ WorkingDirectory=/home/xavier/.local/share/block-ingest
 ExecStart=/usr/local/bin/node /home/xavier/.local/share/yataverse-writer/release/engine/cli.js --classpath /home/xavier/.local/share/block-ingest/bin /home/xavier/.local/share/block-ingest/bin/block_ingest.cljk --host=0.0.0.0 --port=18140 \
   --allow=did:key:z6Mkr2JXYtHYmcH84SPxZCQnBCLXGSgcMhc9AAJhpBXnJnFY \
   --ipfs-bin=/mnt/nvme/ipfs-xavier/bin/ipfs --ipfs-path=/mnt/nvme/ipfs-xavier/repo \
-  --max-block-bytes=16777216 --max-concurrent-puts=4 --rate=20 --burst=40
+  --max-block-bytes=16777216 --max-concurrent-puts=4 --rate=20 --burst=40 --state-dir=/home/xavier/.local/share/block-ingest/state
 StandardOutput=append:/home/xavier/.local/share/block-ingest/logs/block-ingest.out.log
 StandardError=append:/home/xavier/.local/share/block-ingest/logs/block-ingest.err.log
 Restart=on-failure

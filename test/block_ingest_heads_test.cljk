@@ -1,0 +1,63 @@
+;; Gate for block-ingest heads (signed, seq-monotonic names for held blocks)
+;; and the holds listing. Real Ed25519; in-memory store; file-backed heads.
+(ns block-ingest-heads-test
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [block-ingest :as b]
+            [block-ingest-test :as t]))
+
+(def os (js/require "node:os"))
+(def fs (js/require "node:fs"))
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+
+(def now 1790000000)
+(def opts {:allow #{(:did t/murakumo) (:did t/other)} :max-skew 300 :max-block-bytes 1024})
+(def dir (.mkdtempSync fs (str (.tmpdir os) "/heads-")))
+(def store (merge (t/fake-store)
+                  {:holds (fn [_] (js/Promise.resolve ["bafkreib" "bafkreia"]))}
+                  (b/file-heads dir)))
+(def block (js/Buffer.from "status statement v1"))
+(def cid (g/raw-cid block))
+
+(defn head-put [who name seq c]
+  (b/handle-heads opts store now
+                  {:method "PUT" :path (str "/v1/heads/" name)
+                   :headers (t/signed who "PUT" (str "head/" name "/" seq "/" c) now)
+                   :body (js/Buffer.from (js/JSON.stringify #js {:cid c :seq seq}))}))
+(defn head-get [who name]
+  (b/handle-heads opts store now {:method "GET" :path (str "/v1/heads/" (subs (:did who) 8) "/" name)}))
+
+(println "block-ingest heads gate:")
+(-> (head-put t/murakumo "statement" 1 cid)
+    (.then (fn [r]
+             (check "a head must name a block the signer holds (409)" (= 409 (:status r)))
+             (b/handle opts store now {:method "PUT" :path (str "/v1/blocks/" cid)
+                                       :headers (t/signed t/murakumo "PUT" cid now) :body block})))
+    (.then (fn [_] (head-put t/murakumo "statement" 1 cid)))
+    (.then (fn [r]
+             (check "a held block can be named (200)" (and (= 200 (:status r)) (= cid (get-in r [:json "cid"]))))
+             (head-get t/murakumo "statement")))
+    (.then (fn [r]
+             (check "anyone reads the head" (and (= 200 (:status r)) (= 1 (get-in r [:json "seq"]))))
+             (head-put t/murakumo "statement" 1 cid)))
+    (.then (fn [r]
+             (check "seq must grow: a replay or rollback is refused (409)" (= 409 (:status r)))
+             (head-put t/stranger "statement" 9 cid)))
+    (.then (fn [r]
+             (check "a signer not on --allow cannot set heads (403)" (= 403 (:status r)))
+             (b/handle-heads opts store now
+                             {:method "PUT" :path "/v1/heads/statement"
+                              :headers (t/signed t/murakumo "PUT" (str "head/statement/2/" cid) now)
+                              :body (js/Buffer.from (js/JSON.stringify #js {:cid cid :seq 3}))})))
+    (.then (fn [r]
+             (check "the signature covers name, seq and cid (a mismatched body is refused)" (= 401 (:status r)))
+             (head-get t/other "statement")))
+    (.then (fn [r]
+             (check "heads are per signer" (= 404 (:status r)))
+             (b/handle-heads opts store now {:method "GET" :path (str "/v1/holds/" (subs (:did t/murakumo) 8))})))
+    (.then (fn [r]
+             (check "the holds listing answers for a signer" (and (= 200 (:status r)) (= ["bafkreib" "bafkreia"] (get-in r [:json "cids"]))))
+             (check "non-heads routes fall through" (nil? (b/handle-heads opts store now {:method "GET" :path "/v1/blocks/x"})))
+             (println (if (zero? @failures) "block-ingest heads gate: passed" (str "block-ingest heads gate: " @failures " failure(s)")))
+             (js/process.exit (if (zero? @failures) 0 1)))))

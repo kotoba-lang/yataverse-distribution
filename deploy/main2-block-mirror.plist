@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>cloud.yataverse.main2-block-mirror</string>
+  <!-- Second custodian for block-ingest: hold what xavier holds, copied over
+       libp2p (bitswap) into main-2's own Kubo; reserve 30 GB free. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/junkawasaki/.local/share/isekai-score-v5/release/engine/cli.js</string>
+    <string>--classpath</string><string>/Users/junkawasaki/.local/share/block-mirror/bin</string>
+    <string>/Users/junkawasaki/.local/share/block-mirror/bin/block_mirror.cljk</string>
+    <string>--source=http://yataverse-blocks.220-146-170-114.sslip.io:18140</string>
+    <string>--source-peer=/ip4/220.146.170.114/udp/12046/quic-v1/p2p/12D3KooWH5CfezpDdMtYttLLMeib526f7f8QKCC6jCgiHDme4XSV</string>
+    <string>--signer=did:key:z6Mkr2JXYtHYmcH84SPxZCQnBCLXGSgcMhc9AAJhpBXnJnFY</string>
+    <string>--ipfs-bin=/opt/homebrew/bin/ipfs</string>
+    <string>--ipfs-path=/Users/junkawasaki/.ipfs</string>
+    <string>--state-dir=/Users/junkawasaki/.local/share/block-mirror/state</string>
+    <string>--min-free-bytes=30000000000</string>
+    <string>--loop=300</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>/Users/junkawasaki/.local/share/block-mirror/logs/mirror.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/junkawasaki/.local/share/block-mirror/logs/mirror.err.log</string>
+</dict>
+</plist>

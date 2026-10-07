@@ -1581,3 +1581,19 @@ node <release>/engine/cli.js --classpath deploy:test test/block_ingest_test.cljk
 - The service now applies its own per-address rate limit (`--rate`, `--burst`), since nginx's limit is no longer in front of it.
 - Plain HTTP is sufficient for this protocol: writes are signed and bound to their CID, reads are CID-checked, and murakumo encrypts every part. Workers may fetch any port on a host Cloudflare does not proxy.
 - **Entrance:** `http://yataverse-blocks.220-146-170-114.sslip.io:18140`. The nginx files and `install-block-ingest-nginx.sh` remain an optional TLS front.
+
+**Heads, holds listing, and a second custodian on main-2 (2026-10-07).**
+- **Heads** (`PUT/GET /v1/heads/...`): a signer's mutable name for one of its own held blocks. This replaces R2 keys like the status page's `statement`.
+  - A PUT is signed over `head/<name>/<seq>/<cid>`.
+  - The block must be held by the same signer, and `seq` must grow, so a head cannot be rolled back.
+  - GETs are public. Heads are stored under `--state-dir`.
+- **Holds listing:** `GET /v1/holds/<signer>` lists the CIDs a signer holds.
+- **`deploy/block_mirror.cljk`** (LaunchAgent `main2-block-mirror.plist`) keeps main-2's own Kubo holding what xavier holds, per signer.
+  - The listings are read over HTTP. The blocks travel over libp2p (bitswap), so main-2 needs no public port.
+  - Releases follow the source only from a complete listing.
+  - A 30 GB free-space reserve stops new copies first.
+  - Heads are copied when their seq is newer.
+- **First run:** main-2 held xavier's block, the 80 B ciphertext of the production test upload.
+  - It first timed out because of a half-open connection: main-2 listed xavier, but xavier did not list main-2.
+  - The mirror now re-dials the source (`--source-peer`) before retrying a failed copy.
+- **Tests:** `test/block_ingest_heads_test.cljk`, 9 checks: named only if held, monotonic seq, signer allowlist, the signature binding name/seq/cid, per-signer heads, and the holds listing.
