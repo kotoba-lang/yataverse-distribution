@@ -1418,3 +1418,12 @@ Both are valid, because the namespace signature covers dag-cbor, which is order-
 - **`graph_head/py-json-str`** writes receipts in Python's default `json.dumps(sort_keys=True)` form, so receipts keep their bytes.
 
 The Python originals stay until `lake_epoch_cycle` (which calls them) is ported.
+
+### Raw block store in kotoba (2026-10-07)
+
+`deploy/raw_block_store.cljk` uses the same layout and writes byte-identical metadata, so the two implementations share one store.
+
+- **Gate** (`test/raw_block_store_test.cljk`): kotoba reads every block Python wrote, writes the same files byte for byte, and Python reads what kotoba wrote.
+- **Live.** On xavier's real store, 9/9 blocks read back and verified under node 18.
+
+The Python module stays while other Python tools import it.
