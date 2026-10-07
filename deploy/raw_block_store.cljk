@@ -126,3 +126,18 @@
         (write-synced! meta-path (str (g/py-json-str {"schema" 1 "cid" cid "bytes" (.-length data)
                                                       "sha256" (.toString (sha256 data) "hex")})
                                       "\n"))))))
+
+;; CLI: `verify ROOT CID BYTES` exits 0 only when the store holds CID with
+;; exactly BYTES verified bytes (the shipper's check on the receiving host).
+(defn main []
+  (let [args (vec (drop-while #(not (str/ends-with? % "raw_block_store.cljk")) (array-seq (aget js/process "argv"))))
+        [_ cmd root cid n] args]
+    (if (not= "verify" cmd)
+      (do (println "REFUSE usage: raw_block_store.cljk verify ROOT CID BYTES") (js/process.exit 2))
+      (let [data (try (read-block root cid (js/parseInt n 10)) (catch :default e (println "REFUSE" (.-message e)) nil))]
+        (if (and data (= (js/parseInt n 10) (.-length data)))
+          (do (println "VERIFIED" cid (.-length data)) (js/process.exit 0))
+          (do (println "REFUSE" cid "is not held with" n "verified bytes") (js/process.exit 2)))))))
+
+(when (some #(str/ends-with? % "raw_block_store.cljk") (array-seq (aget js/process "argv")))
+  (main))

@@ -1486,3 +1486,5 @@ This bridge is itself a Cloudflare dependency, kept until the replicas no longer
 - **Export on xavier** of epoch 4's 24 blocks: the kotoba CAR is byte-identical to Python's (sha256 `b5099ad9…`), through both the offline CLI and the RPC path, and the receipts are equal.
 - **Round trip, kotoba on both ends:** the kotoba CAR shipped to jacob and imported by the kotoba importer pinned root `bafyreibc43h…`, which is epoch 4's receipt root.
 - **Root alone:** rebuilding epoch 4's batch root from its rows through the cljk code on jacob also gives `bafyreibc43h…`.
+- **`deploy/ship_lake_car.cljk`** uses the remote-Kubo mode the cycle uses. Each end runs as kotoba: `--source-runner` and `--remote-runner` give the hosts' engine prefixes, and the raw-store check is `raw_block_store.cljk verify`.
+  - **End to end:** epoch 4's range was exported on xavier, carried through main-2 and imported on jacob, all in kotoba. The result was `shipped` with root `bafyreibc43h…` (epoch 4's), and the transient CARs were removed on both ends, leaving only the import receipt.

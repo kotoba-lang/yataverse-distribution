@@ -1,0 +1,232 @@
+;; deploy/ship_lake_car.cljk — ship one bounded inventory range to an owned
+;; Kubo node, then checkpoint (ADR-2610062000). Ported from ship_lake_car.py
+;; (remote-Kubo mode, the one the epoch cycle uses); the checkpoint, skip and
+;; export receipts are the same files, so a run either tool started resumes.
+;;
+;; One call ships one contiguous range: export it as a CAR on the source host
+;; (export_lake_car_from_kubo.cljk over ssh), copy it here, verify it, copy it
+;; to the receiving host, import it there (import_lake_car.cljk), check the
+;; import receipt, delete the transient CARs, and advance the checkpoint.
+;; A row the receiving host holds in its raw block store, or an oversized row
+;; with a verified recovery archive, is skipped with a receipt.
+;;
+;; The remote tools are kotoba: --source-runner / --remote-runner are each
+;; host's "node <engine>/cli.js --classpath <dir>" prefix; --source-exporter
+;; and --remote-importer are the .cljk paths on those hosts, and the receiving
+;; host's raw store is checked with raw_block_store.cljk beside the importer.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> ship_lake_car.cljk ...):
+;;   --inventory=F --sha256=HEX --count=N --start-row=N [--stop-row=N] [--max-blocks=200] [--max-bytes=100000000]
+;;   --source-ssh-host=H --source-runner=CMD --source-exporter=PATH --source-inventory=F
+;;   --source-ipfs-bin=PATH --source-ipfs-path=DIR [--source-rpc-url=URL] --source-output-dir=DIR
+;;   [--raw-cids-file=F --remote-raw-block-store=DIR] --state-dir=DIR --ssh-host=H --remote-dir=DIR
+;;   [--remote-car-dir=DIR] [--remote-large-archive=DIR] --remote-runner=CMD --remote-importer=PATH
+;;   --remote-inventory=F --remote-ipfs-bin=PATH --remote-ipfs-path=DIR
+;;
+;; Exit codes: 0 one step done (shipped, skipped, or complete; printed); 2 refused.
+
+(ns ship-lake-car
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [lake-kubo :as k]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def nc (js/require "node:crypto"))
+
+(def max-car-block 8000000)
+(def ssh-opts ["-o" "BatchMode=yes" "-o" "ConnectTimeout=10"])
+
+(defn- refuse [msg] (throw (ex-info msg {:kind :ship})))
+
+(defn shell-join
+  "POSIX-quote argv into one remote command (Python's shlex.join)."
+  [argv]
+  (str/join " " (map #(if (re-matches #"[A-Za-z0-9_@%+=:,./-]+" %) % (str "'" (str/replace % "'" "'\"'\"'") "'")) argv)))
+
+(defn- run! [argv timeout-s]
+  (let [r (.spawnSync cp (first argv) (clj->js (rest argv)) #js {:encoding "utf8" :timeout (* 1000 timeout-s) :maxBuffer (* 64 1024 1024)})]
+    (when (.-error r) (refuse (str "command failed: " (first argv))))
+    (when-not (zero? (.-status r))
+      (refuse (str "command refused: " (first argv) ": " (str/trim (let [e (str (.-stderr r))] (subs e (max 0 (- (count e) 600))))))))
+    (str (.-stdout r))))
+
+(defn- ssh! [host argv timeout-s] (run! (concat ["ssh"] ssh-opts [host (shell-join argv)]) timeout-s))
+
+(defn- last-receipt [out source]
+  (let [line (last (remove str/blank? (str/split-lines out)))]
+    (when-not line (refuse (str source " returned no receipt")))
+    (try (g/parse-json line) (catch :default _ (refuse (str source " returned invalid receipt"))))))
+
+(defn- atomic-json! [p v]
+  (.writeFileSync fs (str p ".partial") (str (g/py-json-str v) "\n"))
+  (.renameSync fs (str p ".partial") p))
+
+(defn selected-rows
+  "-> [rows skipped]: a contiguous range (raw-store and oversized rows end
+   it), or, when the first row cannot ride a CAR, why it is skipped."
+  [p expected-sha expected-count start max-blocks max-bytes raw-cids]
+  (let [buf (.readFileSync fs p)
+        lines (vec (remove str/blank? (str/split (.toString buf "utf8") #"\n")))]
+    (when-not (and (= expected-sha (-> (.createHash nc "sha256") (.update buf) (.digest "hex"))) (= expected-count (count lines)))
+      (refuse "inventory identity differs from dated snapshot"))
+    (if (>= start (count lines))
+      [[] nil]
+      (let [rows (loop [i start rows [] total 0]
+                   (if (or (>= i (min (count lines) (+ start max-blocks))) (>= total max-bytes))
+                     rows
+                     (let [row (try (js/JSON.parse (nth lines i)) (catch :default _ (refuse "invalid inventory row")))
+                           cid (.-cid row) size (.-bytes row)]
+                       (when-not (and (string? cid) (re-matches k/cid-re cid) (js/Number.isInteger size) (>= size 1))
+                         (refuse "invalid inventory CID or size"))
+                       (if (or (contains? raw-cids cid) (> size max-car-block) (> (+ total size (* 1024 (inc (count rows)))) max-bytes))
+                         rows
+                         (recur (inc i) (conj rows {"cid" cid "bytes" size}) (+ total size))))))]
+        (if (seq rows)
+          [rows nil]
+          (let [row (js/JSON.parse (nth lines start))]
+            (cond
+              (contains? raw-cids (.-cid row)) [[] {"row" start "cid" (.-cid row) "bytes" (.-bytes row) "reason" "verified-raw-block-store"}]
+              (> (.-bytes row) max-car-block) [[] {"row" start "cid" (.-cid row) "bytes" (.-bytes row) "reason" "oversized-for-car"}]
+              :else (refuse "single block exceeds CAR byte budget"))))))))
+
+(defn- large-archive-ok? [o skipped sha]
+  (let [rec (get o "receipt")]
+    (and (map? rec) (= 1 (get rec "schema")) (= (get skipped "row") (get rec "row")) (= sha (get rec "inventory_sha256"))
+         (= (get skipped "cid") (get rec "original_cid")) (= (get skipped "bytes") (get rec "original_bytes"))
+         (= "fresh-offline-kubo-import-cat-and-original-cid-rehydration" (get rec "validation"))
+         (string? (get rec "car_sha256")) (re-matches k/sha256-re (get rec "car_sha256"))
+         (js/Number.isInteger (get rec "car_bytes")) (pos? (get rec "car_bytes"))
+         (= (get rec "car_bytes") (get o "car_bytes_on_disk")))))
+
+(defn- verify-skip! [a skipped]
+  (if (= "verified-raw-block-store" (get skipped "reason"))
+    (ssh! (:ssh-host a) (concat (g/words (:remote-runner a))
+                                [(.join path (.dirname path (:remote-importer a)) "raw_block_store.cljk")
+                                 "verify" (:remote-raw-block-store a) (get skipped "cid") (str (get skipped "bytes"))])
+          60)
+    (let [_ (when-not (:remote-large-archive a) (refuse "oversized row has no Jacob recovery archive"))
+          car (str (str/replace (:remote-large-archive a) #"/+$" "") "/row-" (get skipped "row") "-recovery.car")
+          out (ssh! (:ssh-host a) ["sh" "-c" (str "test -f " (shell-join [car]) " && test -f " (shell-join [(str car ".json")])
+                                                  " && printf '%s\\n' \"$(wc -c < " (shell-join [car]) ")\" && cat " (shell-join [(str car ".json")]))]
+                    60)
+          [size-line & json-lines] (str/split-lines out)]
+      (when-not (large-archive-ok? {"receipt" (try (g/parse-json (str/join "\n" json-lines)) (catch :default _ nil))
+                                    "car_bytes_on_disk" (js/parseInt (str/trim size-line) 10)}
+                                   skipped (:sha256 a))
+        (refuse "Jacob large recovery receipt differs from skipped row")))))
+
+(defn ship-once [a]
+  (let [stop (or (:stop-row a) (:count a))]
+    (when-not (and (re-matches k/sha256-re (str (:sha256 a))) (>= (:count a) 1) (<= 0 (:start-row a)) (< (:start-row a) stop) (<= stop (:count a)))
+      (refuse "invalid inventory identity or start"))
+    (when-not (and (<= 1 (:max-blocks a) 1000) (<= 1 (:max-bytes a) 536870912)) (refuse "invalid CAR bounds"))
+    (let [raw-cids (if-let [f (:raw-cids-file a)]
+                     (let [rec (g/parse-json (.readFileSync fs f "utf8")) cids (get rec "cids")]
+                       (when-not (and (= (:sha256 a) (get rec "inventory_sha256")) (sequential? cids)
+                                      (every? #(and (string? %) (re-matches k/cid-re %)) cids)
+                                      (= (count cids) (count (set cids))) (:remote-raw-block-store a))
+                         (refuse "raw CID manifest or Jacob store argument differs"))
+                       (set cids))
+                     #{})
+          sd (:state-dir a)
+          _ (.mkdirSync fs sd #js {:recursive true})
+          lock (.join path sd "ship.lock.pid")]
+      (try (.writeFileSync fs lock (str (.-pid js/process)) #js {:flag "wx"})
+           (catch :default _
+             (let [h (js/parseInt (str (.readFileSync fs lock "utf8")) 10)]
+               (when (and (pos? h) (try (.kill js/process h 0) true (catch :default _ false))) (refuse "shipper already running"))
+               (.writeFileSync fs lock (str (.-pid js/process))))))
+      (try
+        (let [ck (.join path sd "checkpoint.json")
+              state (if (.existsSync fs ck) (g/parse-json (.readFileSync fs ck "utf8")) {"cursor" (:start-row a) "inventory_sha256" (:sha256 a)})
+              start (get state "cursor")]
+          (when-not (and (= (:sha256 a) (get state "inventory_sha256")) (js/Number.isInteger start)) (refuse "checkpoint identity differs"))
+          (when (> start stop) (refuse "checkpoint passed configured stop row"))
+          (if (= start stop)
+            {"status" "complete" "cursor" start "stop_row" stop}
+            (let [[rows skipped] (selected-rows (:inventory a) (:sha256 a) (:count a) start (min (:max-blocks a) (- stop start)) (:max-bytes a) raw-cids)]
+              (if skipped
+                (do (verify-skip! a skipped)
+                    (let [skip (.join path sd (str "skipped-" start ".json"))]
+                      (if (.existsSync fs skip)
+                        (when-not (= skipped (g/parse-json (.readFileSync fs skip "utf8"))) (refuse "oversized skip receipt differs"))
+                        (atomic-json! skip skipped)))
+                    (atomic-json! ck {"cursor" (inc start) "inventory_sha256" (:sha256 a)})
+                    (merge {"status" "skipped-oversized"} skipped))
+                (let [end (+ start (count rows))
+                      name (str "row-" start "-" (dec end))
+                      car (.join path sd (str name ".car"))
+                      export-receipt (.join path sd (str name "-export.json"))
+                      source-car (str (str/replace (:source-output-dir a) #"/+$" "") "/" name ".car")
+                      exported (if (.existsSync fs export-receipt)
+                                 (let [e (g/parse-json (.readFileSync fs export-receipt "utf8"))]
+                                   (when-not (and (.existsSync fs car) (= (get e "sha256") (k/sha256-file car))
+                                                  (= start (get e "start-row")) (= end (get e "end-row")))
+                                     (refuse "saved CAR differs from export receipt"))
+                                   e)
+                                 (let [out (ssh! (:source-ssh-host a)
+                                                 (concat (g/words (:source-runner a))
+                                                         [(:source-exporter a) (str "--inventory=" (:source-inventory a)) (str "--sha256=" (:sha256 a))
+                                                          (str "--count=" (:count a)) (str "--start-row=" start) (str "--max-blocks=" (count rows))
+                                                          (str "--max-bytes=" (:max-bytes a)) (str "--ipfs-bin=" (:source-ipfs-bin a))
+                                                          (str "--ipfs-path=" (:source-ipfs-path a)) (str "--output=" source-car) (str "--receipt=" source-car ".json")]
+                                                         (when (:source-rpc-url a) [(str "--rpc-url=" (:source-rpc-url a))]))
+                                                 1800)]
+                                   (run! (concat ["scp"] ssh-opts [(str (:source-ssh-host a) ":" source-car) car]) 900)
+                                   (let [e (last-receipt out "CAR exporter")]
+                                     (when-not (and (= "complete" (get e "status")) (= start (get e "start-row")) (= end (get e "end-row"))
+                                                    (= (count rows) (get e "blocks")) (= (get e "sha256") (k/sha256-file car)))
+                                       (refuse "CAR export receipt differs"))
+                                     (atomic-json! export-receipt e)
+                                     e)))
+                      remote-car (str (str/replace (or (:remote-car-dir a) (:remote-dir a)) #"/+$" "") "/" name ".car")
+                      remote-receipt (str (str/replace (:remote-dir a) #"/+$" "") "/" name "-import.json")]
+                  (run! (concat ["scp"] ssh-opts [car (str (:ssh-host a) ":" remote-car)]) 900)
+                  (let [imported (last-receipt (ssh! (:ssh-host a)
+                                                     (concat (g/words (:remote-runner a))
+                                                             [(:remote-importer a) (str "--inventory=" (:remote-inventory a)) (str "--sha256=" (:sha256 a))
+                                                              (str "--count=" (:count a)) (str "--start-row=" start) (str "--max-blocks=" (count rows))
+                                                              (str "--car=" remote-car) (str "--car-sha256=" (get exported "sha256"))
+                                                              (str "--ipfs-bin=" (:remote-ipfs-bin a)) (str "--ipfs-path=" (:remote-ipfs-path a))
+                                                              (str "--receipt=" remote-receipt)])
+                                                     1200)
+                                               "Jacob importer")]
+                    (when-not (and (= "complete" (get imported "status")) (= start (get imported "start_row")) (= end (get imported "end_row"))
+                                   (= (get exported "sha256") (get imported "car_sha256")) (= (count rows) (get imported "blocks")))
+                      (refuse "Jacob import receipt differs"))
+                    ;; keep the durable import receipt; drop the transient CARs before advancing
+                    (ssh! (:ssh-host a) ["rm" "-f" "--" remote-car] 120)
+                    (ssh! (:source-ssh-host a) ["rm" "-f" "--" source-car (str source-car ".json")] 120)
+                    (atomic-json! ck {"cursor" end "inventory_sha256" (:sha256 a) "last_root" (get imported "root")
+                                      "last_car_sha256" (get exported "sha256")})
+                    (.unlinkSync fs car)
+                    {"status" "shipped" "start_row" start "end_row" end "blocks" (count rows) "root" (get imported "root")}))))))
+        (finally (try (.unlinkSync fs lock) (catch :default _ nil)))))))
+
+(defn- flag [kk] (some #(when (str/starts-with? % (str kk "=")) (subs % (inc (count kk)))) (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [n #(some-> (flag %) (js/parseInt 10))
+        a {:inventory (flag "--inventory") :sha256 (flag "--sha256") :count (n "--count") :start-row (n "--start-row")
+           :stop-row (n "--stop-row") :max-blocks (or (n "--max-blocks") 200) :max-bytes (or (n "--max-bytes") 100000000)
+           :source-ssh-host (flag "--source-ssh-host") :source-runner (flag "--source-runner") :source-exporter (flag "--source-exporter")
+           :source-inventory (flag "--source-inventory") :source-ipfs-bin (flag "--source-ipfs-bin") :source-ipfs-path (flag "--source-ipfs-path")
+           :source-rpc-url (flag "--source-rpc-url") :source-output-dir (flag "--source-output-dir") :raw-cids-file (flag "--raw-cids-file")
+           :state-dir (flag "--state-dir") :ssh-host (flag "--ssh-host") :remote-dir (flag "--remote-dir") :remote-car-dir (flag "--remote-car-dir")
+           :remote-large-archive (flag "--remote-large-archive") :remote-runner (flag "--remote-runner") :remote-importer (flag "--remote-importer")
+           :remote-inventory (flag "--remote-inventory") :remote-ipfs-bin (flag "--remote-ipfs-bin") :remote-ipfs-path (flag "--remote-ipfs-path")
+           :remote-raw-block-store (flag "--remote-raw-block-store")}]
+    (try
+      (when-not (every? a [:source-ssh-host :source-runner :source-exporter :source-inventory :source-ipfs-bin :source-ipfs-path
+                           :source-output-dir :state-dir :ssh-host :remote-dir :remote-runner :remote-importer :remote-inventory
+                           :remote-ipfs-bin :remote-ipfs-path])
+        (refuse "remote Kubo source and receiver arguments are incomplete"))
+      (println (g/py-json-str (ship-once a)))
+      (catch :default e
+        (.write js/process.stderr (str "REFUSED: " (g/message e) "\n"))
+        (js/process.exit 2)))))
+
+(when (some #(str/ends-with? % "ship_lake_car.cljk") (array-seq (aget js/process "argv")))
+  (main))
