@@ -105,3 +105,51 @@ class StaleCache(unittest.TestCase):
         finally:
             gm.verify_head = orig
         self.assertEqual(calls, [cur], "a fresh read equal to the cache is not retried")
+
+
+class TwoWriters(unittest.TestCase):
+    """Two relays, one inga: the second to submit a sequence loses it."""
+
+    def _writer(self, after_loss):
+        import tempfile
+        w = yw.Writer.__new__(yw.Writer)
+        w.locks, w.guard, w.cache = {}, yw.threading.Lock(), {}
+        w.a = type("A", (), {"signer": [], "out_dir": tempfile.mkdtemp(), "pin_cmd": ["pin"], "sync_pins": 1,
+                             "verifier": "v", "ledger": "l", "landed": 1})()
+        w.current = lambda graph: after_loss
+        return w
+
+    def _lose_submit(self, w, h, cur):
+        orig = gm.run
+
+        def fake_run(cmd, data=None, timeout=300):
+            if cmd == ["pin"]:
+                return 0, gm.raw_cid(data).encode(), b""
+            return 1, b"REFUSED seq taken", b""
+        gm.run = fake_run
+        try:
+            return w._write(G, {"sequence": 11}, h, cur)
+        finally:
+            gm.run = orig
+
+    def test_the_other_writer_relayed_the_same_head(self):
+        cur = (5, "c5", doc(5, head(11)))
+        h = head(12, "bafyreinew")
+        w = self._writer((6, "c6", doc(6, h)))
+        self.assertEqual(self._lose_submit(w, h, cur), {"seq": 6, "cid": "c6", "sequence": 12, "value": "bafyreinew"})
+        self.assertEqual(w.cache[G][0], 6)
+
+    def test_the_other_writer_relayed_a_different_head(self):
+        cur = (5, "c5", doc(5, head(11)))
+        w = self._writer((6, "c6", doc(6, head(12, "bafyreiother"))))
+        with self.assertRaises(yw.Conflict) as e:
+            self._lose_submit(w, head(12, "bafyreinew"), cur)
+        self.assertEqual(e.exception.current, {"sequence": 12, "value": "bafyreiother"})
+
+
+class Custody(unittest.TestCase):
+    def test_a_pulled_custodian_counts_toward_two(self):
+        base = ["--signer", "d", "--verifier", "v", "--ledger", "l", "--cat-cmd", "c", "--out-dir", "/tmp/x"]
+        for bad in (["--pin-cmd", "a"], ["--pulled-by", "jacob"], ["--pulled-by", "a", "--pulled-by", "b"]):
+            with self.assertRaises(SystemExit, msg=bad):
+                yw.main(base + bad)

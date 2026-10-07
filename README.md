@@ -1245,3 +1245,52 @@ The block verifies with nothing but itself. The witnesses play Holochain's valid
 - The witnesses' and custodians' own traffic is not observed. They are reached over the tailnet, and their work in the drill (votes, offline adds) has no Cloudflare dependency in code.
 - Tailscale's own control traffic runs as root and is outside the sample.
 - The Worker still runs on Cloudflare. The drill shows a client can write and read without it, not that it is gone.
+
+## Two writers and pulled custody (2026-10-07, ADR-2610062000 P5, after cutover)
+
+**Shape, after Holochain.** A writer is a relay, not an authority. The authority is the namespace signature inside each graph document. A writer's own key only admits it to the witnesses' writer policy. Two writers relaying the same head build byte-identical documents, so inga's first-wins sequence is the only arbitration either needs. Custody is pulled, the way Holochain's validation authorities hold entries: nobody pushes to a custodian.
+
+**Writers.**
+
+| Writer | Host | Key | Role at the entrance |
+|---|---|---|---|
+| `cloud.yataverse.main2-writer` | main-2 | `…FwkbAtmq` (generated on main-2) | backup |
+| `yataverse-writer.service` (`deploy/xavier-yataverse-writer.service`) | xavier | `…ZM8NyHz` (generated on xavier, never leaves it) | primary |
+
+- The witness-key ledger lists both keys for every `yataverse/graph/` ref (network-awai/network-isekai, `:writer-policy`). Every `from_seq` is unchanged.
+- The policy was rolled out to the 7 witnesses one at a time. Each restart was gated on all 7 answering, which took 18 to 24 s per witness.
+- The new ledger is `bafkreigph5due5aoxci7wujnj7cphjxzbtahxno73wqtado67a6okfg57e`, held on xavier and jacob. Only the graph writer sets changed, so the lake policy is the same.
+
+**Entrance** (`deploy/xavier-yataverse-writer.conf`).
+
+- nginx sends requests to xavier's own writer on loopback first. It falls back to main-2's writer over the tailnet.
+- A POST is retried on the other writer only when the first could not be reached or timed out (`proxy_next_upstream error timeout non_idempotent`, at most 2 tries). The retry is safe because a writer that finds its head already committed answers 200.
+- `X-Yataverse-Writer` names the writer that answered.
+
+**Writer changes** (`deploy/yataverse_writer.py`).
+
+- When a submit loses its sequence to a writer that relayed the same head, the writer now answers as committed instead of 409.
+- `--pulled-by NAME` names a custodian that pulls documents itself. It counts toward the two custodians, so a writer only has to hold a document on its own Kubo before submitting.
+
+**Pulled custody** (`deploy/custody_puller.py`, `deploy/jacob-custody-puller.plist`). jacob runs this every 60 s:
+
+1. Read each graph's committed head from the witnesses.
+2. Walk `prev` back until it reaches a document it already holds.
+3. Fetch each document by bitswap (`pin add`).
+4. Validate the CID, schema, graph and seq, and the namespace signature on the head the document carries.
+
+A document that fails validation is unpinned and reported as a `WARRANT` line with the ref, seq, CID and reason. That is the evidence a reader needs to refuse it.
+
+**Live, 2026-10-07.**
+
+- jacob's first pull held all 42 documents of the 4 graphs back to seq 0, and every signature verified. It took 8 minutes, mostly waiting on the HDD repo's pin lock.
+- The first production write through xavier was graph `bafyreiha3q2…` seq 41. The bundle names writer `…ZM8NyHz`. The follower projected it to R2 (AGREE), and jacob held it.
+- **Failover drill.** With xavier's writer stopped, a replay of the committed head (seq 42) through the public entrance went to main-2 (`X-Yataverse-Writer: 127.0.0.1:18130, 100.108.223.94:18130`). It answered 200 in 8 s with the same document. With xavier's writer started again, the same replay was answered by xavier.
+
+**Tests.** 3 new writer tests (same head relayed by the other writer, a different head relayed by the other writer, and the custodian count) and 5 puller tests (a chain back to seq 0, wrong bytes, wrong seq or graph, `prev` against seq 0, and a head not signed by the namespace).
+
+**Still single.**
+
+- The entrance is xavier's nginx, and both writers sit behind it.
+- The Worker knows one URL.
+- main-2's writer still pushes to jacob over ssh, as well as the pull.
