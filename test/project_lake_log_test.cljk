@@ -1,0 +1,37 @@
+;; Gate for deploy/project_lake_log.cljk (ported from test_project_lake_log.py).
+(ns project-lake-log-test
+  (:require [clojure.string :as str]
+            [project-lake-log :as pl]
+            [graph-head :as g]))
+(def fs (js/require "node:fs"))
+(def os (js/require "node:os"))
+(def nc (js/require "node:crypto"))
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+(defn refusal [f] (try (f) nil (catch :default e (g/message e))))
+(def dir (.mkdtempSync fs (str (.tmpdir os) "/pll-gate-")))
+(defn epoch [n cids]
+  (let [text (apply str (map #(str "{\"cid\":\"" % "\",\"bytes\":" (inc (count %)) "}\n") cids))
+        p (str dir "/e" n ".jsonl")]
+    (.writeFileSync fs p text)
+    {"epoch" n "path" p "rows" (count cids) "inventory" (str "bafkreiinv" n)
+     "sha256" (-> (.createHash nc "sha256") (.update text) (.digest "hex"))}))
+(def e0 (epoch 0 ["a" "b" "c"]))
+(def e1 (epoch 1 ["d" "e"]))
+(def head {"seq" 1 "manifest" "m" "bundle" "b"})
+(println "project-lake-log gate:")
+(let [objs (pl/build [e0 e1] head 2)]
+  (check "pages cover every row in order, and head.json is last"
+         (and (= "lake-log/head.json" (first (last objs)))
+              (= ["a" "b" "c" "d" "e"] (mapcat (fn [[_ v]] (map #(.-cid %) (array-seq (js/JSON.parse (str v))))) (butlast objs)))
+              (= 5 (.-rows (js/JSON.parse (str (second (last objs)))))))))
+(check "refuses an inventory that is not the manifest's"
+       (and (str/includes? (refusal #(pl/build [(assoc e0 "sha256" (apply str (repeat 64 "0"))) e1] head)) "sha256")
+            (str/includes? (refusal #(pl/build [(assoc e0 "rows" 4) e1] head)) "rows")))
+(check "refuses epochs out of order, or a head that does not match"
+       (and (str/includes? (refusal #(pl/build [e1 e0] head)) "log order")
+            (str/includes? (refusal #(pl/build [e0 e1] (assoc head "seq" 2))) "head seq")))
+(check "same input, same bytes"
+       (= (map (fn [[k v]] [k (str v)]) (pl/build [e0 e1] head)) (map (fn [[k v]] [k (str v)]) (pl/build [e0 e1] head))))
+(if (zero? @failures) (println "project-lake-log gate: ok")
+    (do (println "project-lake-log gate:" @failures "failed") (js/process.exit 1)))
