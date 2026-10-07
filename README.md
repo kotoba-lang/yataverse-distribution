@@ -1351,3 +1351,26 @@ node <release>/engine/cli.js --classpath deploy deploy/<tool>.cljk ...
   - Its bytes must match the Python writer's exactly, because a document's CID is its identity.
   - `test/graph_head_test.cljk` checks that against every committed document in main-2's docs directory: 59 documents re-serialise byte for byte, hash to their names, rebuild from their fields, and verify. It also checks the RFC 4648 base32 vectors, Python's `ensure_ascii` escaping, and dag-cbor key order.
 - **`deploy/custody_puller.cljk`** replaces `custody_puller.py`. `test/custody_puller_test.cljk` ports the 5 Python cases. On jacob, the first cljk round held all 4 graphs (+0) from the Python puller's state file. The LaunchAgent now runs the cljk version.
+
+### yataverse-writer in kotoba (2026-10-07)
+
+`deploy/yataverse_writer.cljk` replaces `yataverse_writer.py`. The protocol, the documents and the answers are the same.
+
+**Concurrency.** Python ran a thread per request. The kotoba writer is asynchronous:
+
+- Child processes (pins, submit, the witness read) run through `execFile`.
+- A promise chain per graph serialises writes. Reads and other graphs proceed meanwhile.
+
+**Two traps found while porting.**
+
+- **SCI error wrapping.** The kotoba engine (SCI) wraps an exception thrown inside a callback in its own error. `ex-data` then returns SCI's map, and the original becomes the cause. Read naively, every conflict and refusal would have answered 503. `graph-head/info`, `kind` and `message` follow the cause chain. The writer gate caught this.
+- **Timeouts.** A killed child (timeout) has no numeric exit code. Treating it as 1 would have read it as "another writer took the sequence", so the writer reports 99 for it instead.
+
+**Gate.** `test/yataverse_writer_test.cljk` ports all 12 Python cases. That includes both two-writer outcomes, driven through `write-step` with stubbed processes.
+
+**Live, 2026-10-07.**
+
+- A side-by-side run on main-2 (loopback :18140) against the real witnesses: GET 200, replay 200 (idempotent), a head with an altered field 403, malformed body 400.
+- main-2 (backup) then xavier (primary) were switched to the cljk writer.
+- A replay through the public entrance was answered by xavier.
+- The first production write on the cljk writer was graph `bafyreiha3q2…` seq 57: pins 0.2 s, submit 16.6 s.

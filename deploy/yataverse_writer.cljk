@@ -1,0 +1,339 @@
+;; deploy/yataverse_writer.cljk — the fleet proposer for graph heads
+;; (ADR-2610062000 D3, P5). Ported from yataverse_writer.py; same protocol,
+;; same documents (graph_head.cljk is byte-identical to the Python writer).
+;;
+;; The Worker stops being the arbiter of a graph head. A write goes here
+;; first. It checks the head is signed by the pinned namespace signer and that
+;; it advances exactly the head inga holds now (a compare-and-set), submits the
+;; next mirror document to the inga ref yataverse/graph/<graph> signed with
+;; this writer's key, and answers once the commit has landed.
+;;
+;;   POST /v1/graph-head  {"graph": cid, "expected": {"sequence": n[, "value": cid]} | null,
+;;                         "head": <signed head record>}
+;;     200 {"committed": {"seq", "cid", "sequence", "value"}}   committed, or already the head
+;;     409 {"conflict": {"sequence", "value"} | null}           expected is not the current head
+;;     400 / 403 {"refused": reason}                            malformed, or not the signer
+;;     503 {"unmeasured": reason}                               witnesses or custodians unreachable
+;;   GET  /v1/graph-head?graph=cid
+;;     200 {"seq", "cid", "document"} | 404 when inga holds no record for the graph
+;;   GET  /health
+;;
+;; Writers are relays (2026-10-07): the authority is the namespace signature
+;; inside the document; a writer's key only admits it to the witnesses'
+;; policy. Two writers relaying the same head build byte-identical documents,
+;; and a writer that loses a sequence to that same head answers 200. A writer
+;; holds each document on its own Kubo (--pin-cmd) before it submits;
+;; custodians that pull committed documents themselves (custody_puller.cljk)
+;; are named with --pulled-by.
+;;
+;; Writes to one graph are serialised here (a promise chain per graph); other
+;; graphs and reads proceed meanwhile. Across writers, inga's first-wins
+;; sequence is the arbiter.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> yataverse_writer.cljk ...):
+;;   --host=ADDR ... --port=18130 --signer=did:key:... --verifier="<lake_head + --writer-seed>"
+;;   --ledger=LEDGER --pin-cmd="<reads stdin, prints CID>" ... [--pulled-by=NAME ...]
+;;   --cat-cmd="<prints {cid}>" --out-dir=DIR [--landed=1] [--sync-pins=1]
+
+(ns yataverse-writer
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def http (js/require "node:http"))
+(def cp (js/require "node:child_process"))
+
+(def max-body (* 16 1024))
+
+(defn conflict [current] (ex-info "expected head is not the current head" {:kind :conflict :current current}))
+
+;; ── pure ────────────────────────────────────────────────────────────────────
+
+(defn head-key [h] (when h {"sequence" (get h "sequence") "value" (get h "value")}))
+
+(defn decide
+  "Pure. current-doc is the parsed document inga holds for the graph, or nil.
+   -> [:commit] when `head` is already the current head, [:submit seq] for
+   the next document; throws a conflict or a refusal."
+  [expected head current-doc]
+  (let [cur (get current-doc "head")]
+    (cond
+      (and cur (= (head-key cur) (head-key head))) [:commit]
+      ;; `expected` may name only the sequence: one sequence names one
+      ;; committed head, so it is a sufficient compare-and-set; a value, when
+      ;; given, must match too.
+      (not (or (and (nil? expected) (nil? cur))
+               (and expected cur
+                    (= (get expected "sequence") (get cur "sequence"))
+                    (= (get expected "value" (get cur "value")) (get cur "value")))))
+      (throw (conflict (head-key cur)))
+      ;; The sequence only has to move forward: several R2 writes can
+      ;; collapse into one step.
+      (and cur (< (get head "sequence") (inc (get cur "sequence"))))
+      (throw (g/refused (str "head sequence " (get head "sequence") " does not advance past " (get cur "sequence"))))
+      (nil? current-doc) [:submit 0]
+      :else [:submit (inc (get current-doc "seq"))])))
+
+(defn valid-expected? [e]
+  (or (nil? e)
+      (and (map? e) (contains? e "sequence") (every? #{"sequence" "value"} (keys e))
+           (number? (get e "sequence")) (js/Number.isInteger (get e "sequence")))))
+
+;; ── processes, async ────────────────────────────────────────────────────────
+
+(defn run
+  "-> Promise of {:code :out (Buffer) :err (string)}; never rejects."
+  ([argv] (run argv nil 300))
+  ([argv input timeout-s]
+   (js/Promise.
+    (fn [resolve _]
+      (let [child (.execFile cp (first argv) (clj->js (rest argv))
+                             #js {:timeout (* 1000 timeout-s) :maxBuffer (* 64 1024 1024) :encoding "buffer"}
+                             (fn [err stdout stderr]
+                               ;; a kill (timeout) has no numeric code: report 99, never 1, which
+                               ;; means "another writer took the sequence"
+                               (resolve {:code (cond (nil? err) 0 (number? (.-code err)) (.-code err) :else 99)
+                                         :out (or stdout (js/Buffer.alloc 0)) :err (str (or stderr ""))})))]
+        (when input (.end (.-stdin child) input)))))))
+
+(defn- last-line [buf] (or (last (str/split-lines (str/trim (str buf)))) ""))
+
+;; ── the writer ──────────────────────────────────────────────────────────────
+
+(defn make-writer [opts]
+  {:opts opts :cache (atom {}) :tails (atom {})})
+
+(defn- read-doc
+  "-> Promise of the parsed document `cid`, from --out-dir or --cat-cmd."
+  [{:keys [opts]} cid]
+  (let [f (.join path (:out-dir opts) (str cid ".json"))]
+    (-> (if (.existsSync fs f)
+          (js/Promise.resolve (.readFileSync fs f))
+          (-> (run (g/words (str/replace (:cat-cmd opts) "{cid}" cid)))
+              (.then (fn [r] (when (zero? (:code r)) (:out r))))))
+        (.then (fn [data]
+                 (when data
+                   (when-not (= cid (g/raw-cid data))
+                     (throw (g/refused (str "document bytes do not hash to " cid))))
+                   (g/parse-json data)))))))
+
+(defn current
+  "-> Promise of [seq cid doc], or nil when inga holds no record."
+  [{:keys [opts] :as w} graph]
+  (-> (run (conj (g/words (:verifier opts)) "verify" (:ledger opts) (str "--ref=yataverse/graph/" graph)) nil 180)
+      (.then (fn [{:keys [code out]}]
+               (let [line (last-line out)
+                     m (re-find #"^VERIFIED \S+ seq (\d+) cid (\S+)" line)]
+                 (cond
+                   (and (zero? code) m)
+                   (let [seq (js/parseInt (nth m 1) 10) cid (nth m 2)]
+                     (-> (read-doc w cid)
+                         (.then (fn [doc]
+                                  (when-not doc
+                                    (throw (g/unmeasured (str "document " cid " for seq " seq " is not readable"))))
+                                  (when-not (and (= g/schema (get doc "schema")) (= graph (get doc "graph"))
+                                                 (= seq (get doc "seq")))
+                                    (throw (g/refused (str "document " cid " is not the seq " seq " mirror of " graph))))
+                                  [seq cid doc]))))
+                   (= 4 code) nil
+                   (= 1 code) (throw (g/refused (str "witnesses disagree: " (subs line 0 (min 200 (count line))))))
+                   :else (throw (g/unmeasured (str "witnesses did not prove a head: " (subs line 0 (min 200 (count line))))))))))))
+
+(defn- late-pin! [pin data cid]
+  ((fn attempt [n]
+     (-> (run (g/words pin) data 600)
+         (.then (fn [{:keys [code out]}]
+                  (cond
+                    (and (zero? code) (= cid (str/trim (str out))))
+                    (.write js/process.stderr (str "LATE-PIN " cid " via " (first (g/words pin)) " ok (attempt " (inc n) ")\n"))
+                    (< n 5) (js/setTimeout #(attempt (inc n)) (* 30000 (inc n)))
+                    :else (.write js/process.stderr (str "LATE-PIN " cid " via " (first (g/words pin)) " FAILED\n")))))))
+   0))
+
+(defn- write-step
+  "One decision and, if needed, one submit, from `cur`. -> Promise of the
+   committed answer; rejects with a conflict, refusal or unmeasured error."
+  [{:keys [opts cache] :as w} graph expected head cur]
+  (let [t0 (js/Date.now)
+        [action seq] (decide expected head (nth cur 2 nil))]
+    (if (= :commit action)
+      (do (swap! cache assoc graph cur)
+          (js/Promise.resolve {"seq" (nth cur 0) "cid" (nth cur 1) "sequence" (get head "sequence") "value" (get head "value")}))
+      (let [data (g/mirror-doc graph seq (nth cur 1 nil) head)
+            cid (g/raw-cid data)
+            sync-pins (take (:sync-pins opts) (:pin-cmd opts))
+            rest-pins (drop (:sync-pins opts) (:pin-cmd opts))
+            answer {"seq" seq "cid" cid "sequence" (get head "sequence") "value" (get head "value")}
+            t-pin (atom nil)]
+        (.writeFileSync fs (.join path (:out-dir opts) (str cid ".json")) data)
+        (-> (js/Promise.all (clj->js (map #(run (g/words %) data 300) sync-pins)))
+            (.then (fn [results]
+                     (doseq [[pin r] (map vector sync-pins (array-seq results))]
+                       (when-not (and (zero? (:code r)) (= cid (str/trim (str (:out r)))))
+                         (throw (g/unmeasured (str "pin via " (first (g/words pin)) " did not return " cid)))))
+                     (reset! t-pin (js/Date.now))
+                     ;; --landed: answer once that many witnesses report the
+                     ;; commit (lake_head landed!); readers verify the proofs.
+                     (run (conj (g/words (:verifier opts)) "submit" (:ledger opts) (str seq) cid
+                                (str "--ref=yataverse/graph/" graph) (str "--landed=" (:landed opts)))
+                          nil 600)))
+            (.then (fn [{:keys [code out err]}]
+                     (.write js/process.stderr err)
+                     (cond
+                       (= 1 code)
+                       ;; Another writer took the sequence. If it relayed this
+                       ;; same head, the head is committed.
+                       (-> (current w graph)
+                           (.then (fn [now]
+                                    (if (and now (= (head-key (get (nth now 2) "head")) (head-key head)))
+                                      (do (swap! cache assoc graph now)
+                                          {"seq" (nth now 0) "cid" (nth now 1) "sequence" (get head "sequence") "value" (get head "value")})
+                                      (throw (conflict (head-key (get (nth now 2 nil) "head"))))))))
+                       (not (zero? code)) (throw (g/unmeasured (subs (last-line out) 0 (min 200 (count (last-line out))))))
+                       :else
+                       (do (swap! cache assoc graph [seq cid (g/parse-json data)])
+                           (doseq [pin rest-pins] (late-pin! pin data cid))
+                           (.write js/process.stderr
+                                   (str "TIMING " (subs graph 0 14) " seq " seq
+                                        " pins " (.toFixed (/ (- @t-pin t0) 1000) 1) "s"
+                                        " submit " (.toFixed (/ (- (js/Date.now) @t-pin) 1000) 1) "s"
+                                        " total " (.toFixed (/ (- (js/Date.now) t0) 1000) 1) "s\n"))
+                           answer)))))))))
+
+(defn- serialized
+  "Run (f) after every earlier write to `graph` has settled."
+  [{:keys [tails]} graph f]
+  (let [p (-> (get @tails graph (js/Promise.resolve nil))
+              (.catch (fn [_] nil))
+              (.then (fn [_] (f))))]
+    (swap! tails assoc graph p)
+    p))
+
+(defn write!
+  "-> Promise of the committed answer."
+  [{:keys [opts cache] :as w} graph expected head]
+  (g/verify-head head graph (:signer opts))
+  (serialized w graph
+              (fn []
+                (-> (if-let [c (get @cache graph)] (js/Promise.resolve c) (current w graph))
+                    (.then (fn [cur]
+                             (-> (write-step w graph expected head cur)
+                                 (.catch (fn [e]
+                                           (if (= :conflict (g/kind e))
+                                             ;; the cache may have been the stale party:
+                                             ;; decide again on a fresh read before 409
+                                             (-> (current w graph)
+                                                 (.then (fn [fresh]
+                                                          (if (not= (take 2 fresh) (take 2 cur))
+                                                            (do (swap! cache dissoc graph)
+                                                                (write-step w graph expected head fresh))
+                                                            (throw e)))))
+                                             (throw e)))))))))))
+
+;; ── HTTP ────────────────────────────────────────────────────────────────────
+
+(defn- reply [res status body]
+  (let [data (js/Buffer.from (js/JSON.stringify (clj->js body)))]
+    (.writeHead res status #js {"content-type" "application/json" "content-length" (.-length data)})
+    (.end res data)))
+
+(defn- log [req status]
+  (.write js/process.stderr (str (.. req -socket -remoteAddress) " \"" (.-method req) " " (.-url req) "\" " status "\n")))
+
+(defn- answer-error [res graph expected head e]
+  (case (g/kind e)
+    :conflict (do (.write js/process.stderr (str "CONFLICT " (subs graph 0 14) " expected " (js/JSON.stringify (clj->js expected))
+                                                 " head " (get head "sequence") " current " (js/JSON.stringify (clj->js (:current (g/info e)))) "\n"))
+                  (reply res 409 {"conflict" (:current (g/info e))}) 409)
+    :refused (do (.write js/process.stderr (str "REFUSED " (subs graph 0 14) " head " (when (map? head) (get head "sequence")) ": " (g/message e) "\n"))
+                 (reply res 403 {"refused" (subs (g/message e) 0 (min 200 (count (g/message e))))}) 403)
+    (do (reply res 503 {"unmeasured" (subs (str (g/message e)) 0 (min 200 (count (str (g/message e)))))}) 503)))
+
+(defn handler [{:keys [cache] :as w}]
+  (fn [req res]
+    (let [u (js/URL. (.-url req) "http://writer")
+          p (.-pathname u)
+          done (fn [status] (log req status))]
+      (cond
+        (and (= "GET" (.-method req)) (= p "/health"))
+        (do (reply res 200 {"ok" true "service" "yataverse-writer"}) (done 200))
+
+        (and (= "GET" (.-method req)) (= p "/v1/graph-head"))
+        (let [graph (or (.get (.-searchParams u) "graph") "")]
+          (if-not (re-matches g/graph-re graph)
+            (do (reply res 400 {"refused" "graph must be a CID"}) (done 400))
+            (-> (current w graph)
+                (.then (fn [cur]
+                         (if cur
+                           (do (swap! cache assoc graph cur)   ; keeps the write path warm
+                               (reply res 200 {"seq" (nth cur 0) "cid" (nth cur 1) "document" (nth cur 2)}) (done 200))
+                           (do (reply res 404 {"absent" graph}) (done 404)))))
+                (.catch (fn [e]
+                          (if (= :refused (g/kind e))
+                            (do (reply res 409 {"refused" (g/message e)}) (done 409))
+                            (do (reply res 503 {"unmeasured" (subs (str (g/message e)) 0 (min 200 (count (str (g/message e)))))}) (done 503))))))))
+
+        (and (= "POST" (.-method req)) (= p "/v1/graph-head"))
+        (let [chunks (atom []) size (atom 0)]
+          (.on req "data" (fn [c] (swap! size + (.-length c)) (when (<= @size max-body) (swap! chunks conj c))))
+          (.on req "end"
+               (fn []
+                 (if (or (zero? @size) (> @size max-body))
+                   (do (reply res 400 {"refused" (str "body must be 1.." max-body " bytes")}) (done 400))
+                   (let [parsed (try (let [r (g/parse-json (js/Buffer.concat (clj->js @chunks)))]
+                                       (when-not (map? r) (throw (js/Error. "body must be a JSON object")))
+                                       (when-not (and (string? (get r "graph")) (re-matches g/graph-re (get r "graph")))
+                                         (throw (js/Error. "graph must be a CID")))
+                                       (when-not (contains? r "head") (throw (js/Error. "head is required")))
+                                       (when-not (valid-expected? (get r "expected"))
+                                         (throw (js/Error. "expected must be null or {sequence[, value]}")))
+                                       r)
+                                     (catch :default e {::error (g/message e)}))]
+                     (if-let [err (::error parsed)]
+                       (do (reply res 400 {"refused" (subs err 0 (min 200 (count err)))}) (done 400))
+                       (let [graph (get parsed "graph") expected (get parsed "expected") head (get parsed "head")]
+                         (-> (js/Promise.resolve nil)
+                             (.then (fn [_] (write! w graph expected head)))
+                             (.then (fn [ans] (reply res 200 {"committed" ans}) (done 200)))
+                             (.catch (fn [e] (done (answer-error res graph expected head e))))))))))))
+
+        :else (do (reply res 404 {"refused" "not found"}) (done 404))))))
+
+;; ── main ────────────────────────────────────────────────────────────────────
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn parse-opts
+  "-> opts, or {:error msg}."
+  [one many]
+  (let [opts {:hosts (or (seq (many "--host")) ["127.0.0.1"])
+              :port (js/parseInt (or (one "--port") "18130") 10)
+              :signer (vec (many "--signer")) :verifier (one "--verifier") :ledger (one "--ledger")
+              :pin-cmd (vec (many "--pin-cmd")) :pulled-by (vec (many "--pulled-by"))
+              :cat-cmd (one "--cat-cmd") :out-dir (one "--out-dir")
+              :landed (js/parseInt (or (one "--landed") "1") 10)
+              :sync-pins (js/parseInt (or (one "--sync-pins") "2") 10)}]
+    (cond
+      (not (and (seq (:signer opts)) (:verifier opts) (:ledger opts) (:cat-cmd opts) (:out-dir opts)))
+      {:error "need --signer --verifier --ledger --cat-cmd --out-dir"}
+      (or (empty? (:pin-cmd opts)) (< (+ (count (:pin-cmd opts)) (count (:pulled-by opts))) 2))
+      {:error "each document needs two custodians: --pin-cmd twice, or --pin-cmd and --pulled-by"}
+      (not (<= 1 (:sync-pins opts) (count (:pin-cmd opts))))
+      {:error "--sync-pins must be between 1 and the number of --pin-cmd"}
+      :else opts)))
+
+(defn main []
+  (let [opts (parse-opts #(first (flags %)) flags)]
+    (when-let [e (:error opts)] (println "REFUSE" e) (js/process.exit 1))
+    (.mkdirSync fs (:out-dir opts) #js {:recursive true})
+    (let [w (make-writer opts)
+          h (handler w)]
+      (doseq [host (:hosts opts)]
+        (.listen (.createServer http h) (:port opts) host))
+      (println (str "yataverse-writer on " (str/join ", " (map #(str % ":" (:port opts)) (:hosts opts))))))))
+
+(when (some #(str/ends-with? % "yataverse_writer.cljk") (array-seq (aget js/process "argv")))
+  (main))

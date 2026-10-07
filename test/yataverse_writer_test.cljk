@@ -1,0 +1,79 @@
+;; Gate for deploy/yataverse_writer.cljk (ported from test_yataverse_writer.py).
+;; Run: node <release>/engine/cli.js --classpath deploy test/yataverse_writer_test.cljk
+(ns yataverse-writer-test
+  (:require [graph-head :as g]
+            [yataverse-writer :as yw]))
+
+(def os (js/require "node:os"))
+(def fs (js/require "node:fs"))
+(def G "bafyreiha3q2g6ghjzjtydkvsudnixlbpbf6dlw6b7etd2l3ch4mbruv54e")
+(defn head [seq & [value]] {"name" G "value" (or value "bafyreiaaa") "sequence" seq})
+(defn doc [seq h] {"schema" g/schema "graph" G "seq" seq "prev" nil "head" h})
+
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+(defn thrown [f] (try (f) nil (catch :default e (or (g/kind e) :other))))
+
+(println "yataverse-writer gate:")
+(check "first write creates seq 0" (= [:submit 0] (yw/decide nil (head 0) nil)))
+(let [cur (doc 4 (head 10 "bafyreiold"))]
+  (check "next write advances by one" (= [:submit 5] (yw/decide {"sequence" 10 "value" "bafyreiold"} (head 11 "bafyreinew") cur)))
+  (check "a stale expectation is a conflict naming the current head"
+         (= {"sequence" 10 "value" "bafyreiold"}
+            (try (yw/decide {"sequence" 9 "value" "bafyreiolder"} (head 10 "bafyreinew") cur) nil
+                 (catch :default e (:current (g/info e))))))
+  (check "the sequence must move forward; several R2 writes may collapse into one step"
+         (and (= :refused (thrown #(yw/decide {"sequence" 10 "value" "bafyreiold"} (head 10 "bafyreinew") cur)))
+              (= [:submit 5] (yw/decide {"sequence" 10 "value" "bafyreiold"} (head 13 "bafyreinew") cur))))
+  (check "expected may name only the sequence"
+         (and (= [:submit 5] (yw/decide {"sequence" 10} (head 11 "bafyreinew") cur))
+              (= :conflict (thrown #(yw/decide {"sequence" 9} (head 11 "bafyreinew") cur)))
+              (= :conflict (thrown #(yw/decide {"sequence" 10 "value" "bafyreiwrong"} (head 11 "bafyreinew") cur))))))
+(check "create when a head exists is a conflict"
+       (= :conflict (thrown #(yw/decide nil (head 0) (doc 0 (head 0 "bafyreiother"))))))
+(let [h (head 11 "bafyreinew")]
+  (check "retrying the committed head is idempotent" (= [:commit] (yw/decide {"sequence" 10 "value" "bafyreiold"} h (doc 5 h)))))
+(check "expected must be null or {sequence[, value]}"
+       (and (yw/valid-expected? nil) (yw/valid-expected? {"sequence" 3}) (yw/valid-expected? {"sequence" 3 "value" "v"})
+            (not (yw/valid-expected? {"sequence" "3"})) (not (yw/valid-expected? {"value" "v"}))
+            (not (yw/valid-expected? {"sequence" 3 "x" 1}))))
+(let [opts (fn [& kvs] (let [m (apply hash-map kvs)]
+                         (yw/parse-opts #(first (get m % [])) #(get m % []))))
+      base ["--signer" ["d"] "--verifier" ["v"] "--ledger" ["l"] "--cat-cmd" ["c"] "--out-dir" ["/tmp/x"]]]
+  (check "two custodians: --pin-cmd twice, or --pin-cmd and --pulled-by"
+         (and (:error (apply opts (concat base ["--pin-cmd" ["a"]])))
+              (:error (apply opts (concat base ["--pulled-by" ["jacob"]])))
+              (:error (apply opts (concat base ["--pulled-by" ["a" "b"]])))
+              (not (:error (apply opts (concat base ["--pin-cmd" ["a"] "--pulled-by" ["jacob"] "--sync-pins" ["1"]]))))
+              (:error (apply opts (concat base ["--pin-cmd" ["a"] "--pulled-by" ["jacob"] "--sync-pins" ["2"]]))))))
+
+;; Two relays, one inga: the second to submit a sequence loses it (submit
+;; exits 1). Same head -> committed; a different head -> conflict.
+(defn two-writers [after-loss head-in]
+  (let [dir (.mkdtempSync fs (str (.tmpdir os) "/ywt-"))
+        w (yw/make-writer {:out-dir dir :pin-cmd ["pin"] :sync-pins 1 :verifier "v" :ledger "l" :landed 1 :signer []})
+        cur [5 "c5" (doc 5 (head 11))]]
+    ;; with-redefs would revert when the body returns its promise, before
+    ;; the async steps run; hold the stubs until the step settles.
+    (let [real-run yw/run real-current yw/current]
+      (set! yw/run (fn [argv & [data]]
+                     (js/Promise.resolve (if (= ["pin"] (vec argv))
+                                           {:code 0 :out (js/Buffer.from (g/raw-cid data)) :err ""}
+                                           {:code 1 :out (js/Buffer.from "REFUSED seq taken") :err ""}))))
+      (set! yw/current (fn [_ _] (js/Promise.resolve after-loss)))
+      (-> (#'yw/write-step w G {"sequence" 11} head-in cur)
+          (.then (fn [ans] {:ok ans}) (fn [e] {:err e}))
+          (.finally (fn [] (set! yw/run real-run) (set! yw/current real-current)))))))
+
+(def h-new (head 12 "bafyreinew"))
+(-> (two-writers [6 "c6" (doc 6 h-new)] h-new)
+    (.then (fn [same] (.then (two-writers [6 "c6" (doc 6 (head 12 "bafyreiother"))] h-new) (fn [diff] [same diff]))))
+    (.then (fn [[same diff]]
+             (do
+               (check "the other writer relayed the same head: committed, not 409"
+                      (= {"seq" 6 "cid" "c6" "sequence" 12 "value" "bafyreinew"} (:ok same)))
+               (check "the other writer relayed a different head: conflict naming it"
+                      (= {"sequence" 12 "value" "bafyreiother"} (some-> (:err diff) g/info :current))))
+             (if (zero? @failures)
+               (println "yataverse-writer gate: ok")
+               (do (println "yataverse-writer gate:" @failures "failed") (js/process.exit 1))))))

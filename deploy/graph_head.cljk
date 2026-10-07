@@ -21,7 +21,26 @@
 
 (defn refused [msg] (ex-info msg {:kind :refused}))
 (defn unmeasured [msg] (ex-info msg {:kind :unmeasured}))
-(defn kind [e] (:kind (ex-data e)))
+(defn info
+  "The ex-data this namespace attached, found through the cause chain: the
+   kotoba engine (SCI) wraps an exception thrown inside a callback in its own
+   error, whose ex-data is SCI's, with the original as the cause."
+  [e]
+  (loop [e e n 0]
+    (when (and e (< n 8))
+      (if-let [k (:kind (ex-data e))]
+        (ex-data e)
+        (recur (ex-cause e) (inc n))))))
+
+(defn kind [e] (:kind (info e)))
+
+(defn message
+  "The original message, through the same wrapping."
+  [e]
+  (loop [e e n 0]
+    (cond (nil? e) ""
+          (or (:kind (ex-data e)) (nil? (ex-cause e)) (>= n 8)) (.-message e)
+          :else (recur (ex-cause e) (inc n)))))
 
 ;; ── base58btc / base32 ───────────────────────────────────────────────────────
 

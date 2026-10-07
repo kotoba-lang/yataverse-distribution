@@ -1,19 +1,19 @@
 [Unit]
-Description=yataverse-writer relay on xavier (ADR-2610062000 P5; second writer, own key)
+Description=yataverse-writer relay on xavier (ADR-2610062000 P5; second writer, own key; kotoba)
 After=network-online.target ipfs.service
 Wants=ipfs.service
 
 [Service]
 Type=simple
 WorkingDirectory=/home/xavier/.local/share/yataverse-writer
-ExecStart=/usr/bin/python3 -u /home/xavier/.local/share/yataverse-writer/bin/yataverse_writer.py --host 127.0.0.1 --port 18130 \
-  --signer did:key:z6Mko2hmPxwvKwMPa5oj61JqXnQYSPjo5n6NhKLagvhtVuQp \
-  --verifier "/usr/local/bin/node /home/xavier/.local/share/yataverse-writer/release/engine/cli.js --classpath /home/xavier/.local/share/yataverse-writer/release/inga/src:/home/xavier/.local/share/yataverse-writer/release/inga-node/src:/home/xavier/.local/share/yataverse-writer/release/storage/src:/home/xavier/.local/share/yataverse-writer/release/text/src:/home/xavier/.local/share/yataverse-writer/release/edn/src:/home/xavier/.local/share/yataverse-writer/release/bytes/src /home/xavier/.local/share/yataverse-writer/bin/lake_head.cljk --writer-seed=/home/xavier/.local/share/yataverse-writer/writer.seed" \
-  --ledger /home/xavier/.local/share/yataverse-writer/score-witness-v5.edn \
-  --pin-cmd "env IPFS_PATH=/mnt/nvme/ipfs-xavier/repo /mnt/nvme/ipfs-xavier/bin/ipfs add -Q --cid-version=1 --raw-leaves" \
-  --pulled-by jacob \
-  --cat-cmd "env IPFS_PATH=/mnt/nvme/ipfs-xavier/repo /mnt/nvme/ipfs-xavier/bin/ipfs cat {cid}" \
-  --out-dir /home/xavier/.local/share/yataverse-writer/docs --sync-pins 1
+ExecStart=/usr/local/bin/node /home/xavier/.local/share/yataverse-writer/release/engine/cli.js --classpath /home/xavier/.local/share/yataverse-writer/bin /home/xavier/.local/share/yataverse-writer/bin/yataverse_writer.cljk --host=127.0.0.1 --port=18130 \
+  --signer=did:key:z6Mko2hmPxwvKwMPa5oj61JqXnQYSPjo5n6NhKLagvhtVuQp \
+  "--verifier=/usr/local/bin/node /home/xavier/.local/share/yataverse-writer/release/engine/cli.js --classpath /home/xavier/.local/share/yataverse-writer/release/inga/src:/home/xavier/.local/share/yataverse-writer/release/inga-node/src:/home/xavier/.local/share/yataverse-writer/release/storage/src:/home/xavier/.local/share/yataverse-writer/release/text/src:/home/xavier/.local/share/yataverse-writer/release/edn/src:/home/xavier/.local/share/yataverse-writer/release/bytes/src /home/xavier/.local/share/yataverse-writer/bin/lake_head.cljk --writer-seed=/home/xavier/.local/share/yataverse-writer/writer.seed" \
+  --ledger=/home/xavier/.local/share/yataverse-writer/score-witness-v5.edn \
+  "--pin-cmd=env IPFS_PATH=/mnt/nvme/ipfs-xavier/repo /mnt/nvme/ipfs-xavier/bin/ipfs add -Q --cid-version=1 --raw-leaves" \
+  --pulled-by=jacob \
+  "--cat-cmd=env IPFS_PATH=/mnt/nvme/ipfs-xavier/repo /mnt/nvme/ipfs-xavier/bin/ipfs cat {cid}" \
+  --out-dir=/home/xavier/.local/share/yataverse-writer/docs --sync-pins=1
 StandardOutput=append:/home/xavier/.local/share/yataverse-writer/logs/writer.out.log
 StandardError=append:/home/xavier/.local/share/yataverse-writer/logs/writer.err.log
 Restart=on-failure
