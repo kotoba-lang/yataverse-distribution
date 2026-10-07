@@ -1133,3 +1133,11 @@ Seven unit tests cover the decision.
 - The Worker still writes R2 directly. Moving its writes to the writer, and fencing direct R2 head writes, needs the Worker deploy path (control-plane#774).
 - The writer listens on loopback only.
 - The follower that writes R2 from inga does not exist yet.
+
+**Writer latency and the Worker's compare-and-set (2026-10-07).**
+
+- `lake_head submit` now verifies every 2 s, up to ten times, after each submission instead of once after 20 s. The overall bound is unchanged.
+- `expected` may name only the sequence. The Worker knows the sequence it read, and one sequence names one committed head.
+- The writer listens on main-2's tailnet address (100.108.223.94:18130), and the mirror uses that address.
+
+**Measured.** A real write with `expected {sequence: 3665}` committed R2 head 3666 as seq 24 in 18.7 s, end to end. Most of that is a cold node start for each verification and the two pins over ssh. Those are the next things to cut.

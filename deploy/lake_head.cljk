@@ -258,22 +258,30 @@
   committed (observed 2026-10-06: the first epoch-0 submit vanished), so
   `submitted: true` is not an outcome."
   [l seq' cid min-agree]
-  (letfn [(attempt [i]
+  ;; Each submission is followed by up to ten verifies two seconds apart, not
+  ;; one verify after twenty. A healthy chain commits in a few seconds, and the
+  ;; yataverse-writer (ADR-2610062000 P5) answers a Worker's write only after
+  ;; this returns, so the wait is write latency. The overall bound (13
+  ;; submissions, about 20 s each) is unchanged.
+  (letfn [(sleep [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
+          (settle [[rs v] i poll]
+            (cond
+              (and (= :verified (:status v)) (= seq' (:seq v)) (= cid (:cid v)))
+              (do (report [rs v]) (exit! 0))
+              (and (= :verified (:status v)) (not= cid (:cid v)) (= seq' (:seq v)))
+              (do (out "REFUSE seq" seq' "is held by" (:cid v)) (exit! 1))
+              (and (= :verified (:status v)) (> (:seq v) seq'))
+              (do (out "REFUSE head already at seq" (:seq v)) (exit! 1))
+              (< poll 9) (-> (sleep 2000) (.then (fn [_] (verify! l min-agree)))
+                             (.then #(settle % i (inc poll))))
+              :else (attempt (inc i))))
+          (attempt [i]
             (if (> i 12)
               (do (out "UNMEASURED gave up after" i "submissions") (exit! 3))
               (-> (submit-once l seq' cid i)
-                  (.then (fn [_] (js/Promise. (fn [res] (js/setTimeout res 20000)))))
+                  (.then (fn [_] (sleep 2000)))
                   (.then (fn [_] (verify! l min-agree)))
-                  (.then (fn [[rs v]]
-                           (cond
-                             (and (= :verified (:status v)) (= seq' (:seq v)) (= cid (:cid v)))
-                             (do (report [rs v]) (exit! 0))
-                             (and (= :verified (:status v)) (>= (:seq v) seq') (not= cid (:cid v))
-                                  (= seq' (:seq v)))
-                             (do (out "REFUSE seq" seq' "is held by" (:cid v)) (exit! 1))
-                             (and (= :verified (:status v)) (> (:seq v) seq'))
-                             (do (out "REFUSE head already at seq" (:seq v)) (exit! 1))
-                             :else (attempt (inc i))))))))]
+                  (.then #(settle % i 0)))))]
     (attempt 0)))
 
 ;; ── bundle: a proof anyone can check without the tailnet ────────────────────

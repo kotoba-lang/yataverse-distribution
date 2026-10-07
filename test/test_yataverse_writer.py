@@ -47,6 +47,14 @@ class Decide(unittest.TestCase):
         self.assertEqual(yw.decide(G, {"sequence": 10, "value": "bafyreiold"}, head(13, "bafyreinew"), cur),
                          ("submit", (5, None)), "several R2 writes may collapse into one step")
 
+    def test_expected_may_name_only_the_sequence(self):
+        cur = doc(4, head(10, "bafyreiold"))
+        self.assertEqual(yw.decide(G, {"sequence": 10}, head(11, "bafyreinew"), cur), ("submit", (5, None)))
+        with self.assertRaises(yw.Conflict):
+            yw.decide(G, {"sequence": 9}, head(11, "bafyreinew"), cur)
+        with self.assertRaises(yw.Conflict):
+            yw.decide(G, {"sequence": 10, "value": "bafyreiwrong"}, head(11, "bafyreinew"), cur)
+
     def test_retrying_the_committed_head_is_idempotent(self):
         h = head(11, "bafyreinew")
         self.assertEqual(yw.decide(G, {"sequence": 10, "value": "bafyreiold"}, h, doc(5, h)), ("commit", None))
