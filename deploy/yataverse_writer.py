@@ -58,7 +58,14 @@ def decide(graph, expected, head, current_doc):
     cur_key = {"sequence": cur["sequence"], "value": cur["value"]} if cur else None
     if cur and (cur["sequence"], cur["value"]) == (head["sequence"], head["value"]):
         return "commit", None
-    if expected != cur_key:
+    # `expected` may name only the sequence: the Worker knows the sequence it
+    # read, not always the value. One sequence names one committed head, so
+    # the sequence alone is a sufficient compare-and-set; a value, when given,
+    # must match too.
+    if not (expected is None and cur is None) and not (
+            expected is not None and cur is not None
+            and expected["sequence"] == cur["sequence"]
+            and expected.get("value", cur["value"]) == cur["value"]):
         raise Conflict(cur_key)
     # The compare-and-set is `expected`; it is what prevents a lost update.
     # The sequence only has to move forward: the P4 mirror, which now writes
@@ -167,8 +174,10 @@ def handler(writer):
                 graph, expected, head = req["graph"], req.get("expected"), req["head"]
                 if not (isinstance(graph, str) and gm.GRAPH_RE.fullmatch(graph)):
                     raise ValueError("graph must be a CID")
-                if expected is not None and not (isinstance(expected, dict) and set(expected) == {"sequence", "value"}):
-                    raise ValueError("expected must be null or {sequence, value}")
+                if expected is not None and not (isinstance(expected, dict) and "sequence" in expected
+                                                 and set(expected) <= {"sequence", "value"}
+                                                 and isinstance(expected["sequence"], int)):
+                    raise ValueError("expected must be null or {sequence[, value]}")
             except (ValueError, KeyError, TypeError) as e:
                 return self.reply(400, {"refused": str(e)[:200]})
             try:
