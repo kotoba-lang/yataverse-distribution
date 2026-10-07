@@ -93,8 +93,13 @@ The private key is not in this repository. Both nodes published the current
 HTML CID, and Xavier resolved gad's record with `--nocache`.
 
 `deploy/refresh-ipns.sh` refuses a missing or malformed CID file and a
-CID that is not recursively pinned on the local node. It checks that Kubo
-published exactly the expected name and CID. The two user timers renew
+CID that is not recursively pinned on the local node. It reads the current
+record from the network (`ipfs name get` + `ipfs name inspect`) and publishes
+at that sequence + 1, refusing when the record cannot be read; see
+[IPNS fallback custodian](#ipns-fallback-custodian-2026-10-06) for why the
+local sequence is not trusted. It checks that Kubo published exactly the
+expected name and CID, and that `ipfs name resolve --nocache` then returns
+that CID. The two user timers renew
 the record at staggered times, before its 168-hour expiry:
 
 | node | files to install as the node user | UTC schedule |
@@ -797,13 +802,14 @@ The keys were copied from xavier and appear under identical names on both hosts.
 
 **Primary signers must publish network-aware.** Kubo takes a publish's sequence number from its local datastore. After a fallback re-sign, a primary publishing at its stale local sequence is silently ignored. Primaries therefore use `--publish VALUE`, which reads the network sequence and publishes at +1. xavier's directory unit already does this.
 
-The site refreshers below do **not** yet:
+The site refreshers do the same since 2026-10-07: they read the network record with `ipfs name get` + `ipfs name inspect --enc=json`, publish with `--sequence <network+1>`, and refuse unless `ipfs name resolve --nocache` returns the new value. A refresher that cannot read the network record refuses rather than fall back to its local sequence.
 
-- `deploy/refresh-ipns.sh` here
-- network-isekai `deploy/refresh-ipns.sh`
-- itonami `renew_static_ipns.py`
-
-Until they are converted, a fallback re-sign during a long xavier outage would freeze those sites' content updates after xavier returns. Their records would still resolve.
+| Refresher | xavier unit | Name |
+|---|---|---|
+| `deploy/refresh-ipns.sh` here | `yataverse-ipns-refresh` | `yataverse-apex` |
+| `deploy/refresh-ipns.sh` here, with key `itonami-static` | `itonami-ipns-refresh` | `itonami-static` |
+| network-isekai `deploy/refresh-ipns.sh` | `isekai-ipns-refresh` | `isekai-static` |
+| cloud-itonami `ops/independent/renew_static_ipns.py` | `itonami-static-ipns-renew` (system) | `itonami-static` |
 
 **Measured on 2026-10-06.**
 
