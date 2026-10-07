@@ -34,9 +34,35 @@ if ! "$ipfs_bin" pin ls --type=recursive "$cid" >/dev/null; then
   exit 2
 fi
 
-published=$("$ipfs_bin" name publish --key="$key_name" --lifetime=168h --ttl=5m "/ipfs/$cid")
+# Kubo takes a publish's sequence from the local datastore. A fallback
+# custodian (jacob, deploy/ipns_fallback.py) may have re-signed this name at a
+# higher sequence while this node was away, and a lower sequence is ignored
+# everywhere. So publish one above the sequence the network holds, and refuse
+# when that sequence cannot be read rather than trusting the local one.
+record=$(mktemp)
+trap 'rm -f "$record"' EXIT
+if ! "$ipfs_bin" name get "$expected_name" > "$record" || [ ! -s "$record" ]; then
+  echo "REFUSED: current IPNS record could not be fetched" >&2
+  exit 2
+fi
+network_seq=$("$ipfs_bin" name inspect --enc=json < "$record" |
+  python3 -c 'import json, sys; print(int(json.load(sys.stdin)["Entry"]["Sequence"]))') || network_seq=
+case "$network_seq" in
+  ''|*[!0-9]*)
+    echo "REFUSED: current IPNS record sequence could not be read" >&2
+    exit 2
+    ;;
+esac
+sequence=$((network_seq + 1))
+
+published=$("$ipfs_bin" name publish --key="$key_name" --sequence="$sequence" --lifetime=168h --ttl=5m "/ipfs/$cid")
 if [ "$published" != "Published to $expected_name: /ipfs/$cid" ]; then
   echo "REFUSED: published name or target did not match" >&2
   exit 2
 fi
-printf '%s\n' "$published"
+resolved=$("$ipfs_bin" name resolve --nocache "/ipns/$expected_name")
+if [ "$resolved" != "/ipfs/$cid" ]; then
+  echo "REFUSED: published at sequence $sequence but resolves to $resolved" >&2
+  exit 2
+fi
+printf '%s (sequence %s, network had %s)\n' "$published" "$sequence" "$network_seq"
