@@ -1,0 +1,117 @@
+;; deploy/custody_puller.cljk — hold what inga committed: a custodian pulls
+;; graph-head documents itself (ADR-2610062000, after Holochain).
+;;
+;; A writer puts each document on its own Kubo before it submits. Every other
+;; custodian then fetches it, the way Holochain's validation authorities hold
+;; the entries of their neighbourhood: nobody pushes to them. For each graph
+;; this reads the committed head from the witnesses (5 of 7), walks the chain
+;; back through `prev` until it reaches a document it already holds, and for
+;; each document:
+;;
+;;   fetch     ipfs pin add (bitswap from whichever peer has it)
+;;   validate  CID, schema, graph and seq, `prev` against seq 0, and the
+;;             namespace signature on the head it carries
+;;
+;; A document that fails validation is unpinned and reported as a WARRANT
+;; line (ref, seq, cid, reason): the evidence a reader needs to refuse it.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> custody_puller.cljk ...):
+;;   --graph=G ... --signer=did:key:... --verifier="<lake_head command>"
+;;   --ledger=LEDGER --ipfs="<ipfs command>" --state=STATE.json
+;;   [--fetch-timeout=300] [--loop=SECONDS]
+;;
+;; Exit codes (one round): 0 every head held and valid; 1 a warrant was
+;; raised; 3 a head or document could not be read.
+
+(ns custody-puller
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def fs (js/require "node:fs"))
+
+(defn check-doc
+  "Pure. -> the parsed document, or throw a refusal."
+  [graph seq cid data signers]
+  (when-not (= cid (g/raw-cid data))
+    (throw (g/refused (str "bytes do not hash to " cid))))
+  (let [doc (try (g/parse-json data) (catch :default _ (throw (g/refused "not JSON"))))]
+    (when-not (and (= g/schema (get doc "schema")) (= graph (get doc "graph")) (= seq (get doc "seq")))
+      (throw (g/refused (str "not the seq " seq " document of " graph))))
+    (when-not (= (zero? seq) (nil? (get doc "prev")))
+      (throw (g/refused (str "seq " seq " with prev " (pr-str (get doc "prev"))))))
+    (g/verify-head (get doc "head") graph signers)
+    doc))
+
+(defn- read-held [p]
+  (try (set (js->clj (js/JSON.parse (.readFileSync fs p "utf8")))) (catch :default _ #{})))
+
+(defn- save-held! [p held]
+  (.writeFileSync fs (str p ".tmp") (js/JSON.stringify (clj->js (sort held))))
+  (.renameSync fs (str p ".tmp") p))
+
+(defn- fetch! [ipfs cid timeout-s]
+  (let [pin (g/run! (into ipfs ["pin" "add" "--progress=false" cid]) nil timeout-s)]
+    (when-not (zero? (:code pin))
+      (throw (g/unmeasured (str "pin add " cid ": " (str/trim (:err pin))))))
+    (let [cat (g/run! (into ipfs ["cat" "--offline" cid]) nil 120)]
+      (when-not (zero? (:code cat))
+        (throw (g/unmeasured (str "cat " cid ": " (str/trim (:err cat))))))
+      (:out cat))))
+
+(defn pull!
+  "-> [head-seq new-count]; throws a refusal (after printing the warrant)
+   or an unmeasured error."
+  [{:keys [verifier ledger ipfs signers state fetch-timeout]} held graph]
+  (let [ref (str "yataverse/graph/" graph)]
+    (if-let [[head-seq head-cid] (g/witness-head verifier ledger ref)]
+      (loop [seq head-seq cid head-cid n 0]
+        (if (or (nil? cid) (contains? @held cid))
+          [head-seq n]
+          (let [data (fetch! ipfs cid fetch-timeout)
+                doc (try (check-doc graph seq cid data signers)
+                         (catch :default e
+                           (g/run! (into ipfs ["pin" "rm" cid]) nil 120)
+                           (println (js/JSON.stringify (clj->js {:warrant {:ref ref :seq seq :cid cid
+                                                                           :reason (subs (.-message e) 0 (min 200 (count (.-message e))))}})))
+                           (throw e)))]
+            (swap! held conj cid)
+            (save-held! state @held)
+            (recur (dec seq) (get doc "prev") (inc n)))))
+      [nil 0])))
+
+(defn once! [opts held]
+  (reduce (fn [worst graph]
+            (try (let [[seq n] (pull! opts held graph)]
+                   (println (str "HELD " (subs graph 0 14) " head seq " seq " (+" n ")"))
+                   worst)
+                 (catch :default e
+                   (if (= :refused (g/kind e))
+                     1
+                     (do (println (str "UNMEASURED " (subs graph 0 14) " " (.-message e)))
+                         (if (= worst 1) 1 3))))))
+          0 (:graphs opts)))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one (fn [k] (first (flags k)))
+        opts {:graphs (vec (flags "--graph")) :signers (vec (flags "--signer"))
+              :verifier (one "--verifier") :ledger (one "--ledger")
+              :ipfs (g/words (or (one "--ipfs") "")) :state (one "--state")
+              :fetch-timeout (js/parseInt (or (one "--fetch-timeout") "300") 10)}
+        loop-s (some-> (one "--loop") (js/parseInt 10))]
+    (when-not (and (seq (:graphs opts)) (seq (:signers opts)) (:verifier opts) (:ledger opts)
+                   (seq (:ipfs opts)) (:state opts))
+      (println "REFUSE need --graph --signer --verifier --ledger --ipfs --state")
+      (js/process.exit 1))
+    (let [held (atom (read-held (:state opts)))]
+      (if loop-s
+        ;; a timeout chain, not an interval: a slow round (the first pull of
+        ;; a long chain took 8 minutes on jacob) must not queue the next ones
+        ((fn tick [] (once! opts held) (js/setTimeout tick (* 1000 loop-s))))
+        (js/process.exit (once! opts held))))))
+
+(when (some #(str/ends-with? % "custody_puller.cljk") (array-seq (aget js/process "argv")))
+  (main))

@@ -1272,7 +1272,7 @@ The block verifies with nothing but itself. The witnesses play Holochain's valid
 - When a submit loses its sequence to a writer that relayed the same head, the writer now answers as committed instead of 409.
 - `--pulled-by NAME` names a custodian that pulls documents itself. It counts toward the two custodians, so a writer only has to hold a document on its own Kubo before submitting.
 
-**Pulled custody** (`deploy/custody_puller.py`, `deploy/jacob-custody-puller.plist`). jacob runs this every 60 s:
+**Pulled custody** (`deploy/custody_puller.cljk`, `deploy/jacob-custody-puller.plist`; ported from Python to kotoba on 2026-10-07, same behaviour and state file). jacob runs this every 60 s:
 
 1. Read each graph's committed head from the witnesses.
 2. Walk `prev` back until it reaches a document it already holds.
@@ -1338,3 +1338,16 @@ A document that fails validation is unpinned and reported as a `WARRANT` line wi
 - **Witnesses on the tailnet.** Every writer submits to the 7 witnesses at tailnet addresses, so consensus still uses Tailscale. Moving the witness mesh to libp2p is the next step.
 - **One public peer.** xavier is the only public peer. With xavier down, main-2's writer is reachable only when hole punching happens to work. A second public peer on another network would remove this single point. That is the same gap as the third independent line.
 - **No address discovery.** Clients learn writer addresses out of band. xavier's UPnP ports change on restart.
+
+## Kotoba port of the graph-head tools (2026-10-07)
+
+Owner direction: the tools are written in kotoba (`.cljk`), not Python. They run on the same engine as `lake_head.cljk`:
+
+```
+node <release>/engine/cli.js --classpath deploy deploy/<tool>.cljk ...
+```
+
+- **`deploy/graph_head.cljk`** is the shared namespace. It covers canonical JSON, raw CIDs, dag-cbor, the namespace-signature check, and the witness head query.
+  - Its bytes must match the Python writer's exactly, because a document's CID is its identity.
+  - `test/graph_head_test.cljk` checks that against every committed document in main-2's docs directory: 59 documents re-serialise byte for byte, hash to their names, rebuild from their fields, and verify. It also checks the RFC 4648 base32 vectors, Python's `ensure_ascii` escaping, and dag-cbor key order.
+- **`deploy/custody_puller.cljk`** replaces `custody_puller.py`. `test/custody_puller_test.cljk` ports the 5 Python cases. On jacob, the first cljk round held all 4 graphs (+0) from the Python puller's state file. The LaunchAgent now runs the cljk version.

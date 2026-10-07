@@ -1,0 +1,61 @@
+;; Gate for deploy/custody_puller.cljk check-doc (ported from test_custody_puller.py).
+;; Run: node <release>/engine/cli.js --classpath deploy test/custody_puller_test.cljk
+(ns custody-puller-test
+  (:require [graph-head :as g]
+            [custody-puller :as c]))
+
+(def nc (js/require "node:crypto"))
+(def G "bafyreiha3q2g6ghjzjtydkvsudnixlbpbf6dlw6b7etd2l3ch4mbruv54e")
+(def V "bafyreigchr5r5xm64kssxkkyrebtfxozp6lfmvyoimvighzir4bn3rhkn4")
+(def b58 "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+(defn b58-encode [buf]
+  (let [bytes (vec (array-seq buf))
+        digits (reduce (fn [ds byte]
+                         (loop [i 0 carry byte out []]
+                           (if (< i (count ds))
+                             (let [x (+ (* (nth ds i) 256) carry)]
+                               (recur (inc i) (quot x 58) (conj out (rem x 58))))
+                             (loop [carry carry out out]
+                               (if (pos? carry) (recur (quot carry 58) (conj out (rem carry 58))) out)))))
+                       [] bytes)]
+    (str (apply str (repeat (count (take-while zero? bytes)) "1")) (apply str (map #(nth b58 %) (reverse digits))))))
+
+(defn keypair []
+  (let [kp (.generateKeyPairSync nc "ed25519")
+        pub (.subarray (.export (.-publicKey kp) #js {:format "der" :type "spki"}) 12)]
+    {:priv (.-privateKey kp) :did (str "did:key:z" (b58-encode (js/Buffer.concat #js [(js/Buffer.from #js [0xed 0x01]) pub])))}))
+
+(defn signed [{:keys [priv did]} sequence]
+  (let [rec {"name" G "value" V "sequence" sequence}]
+    (assoc rec "public_key_multibase" did
+           "signature_multibase" (str "z" (b58-encode (.sign nc nil (g/dag-cbor rec) priv))))))
+
+(def k (keypair))
+(def pins [(:did k)])
+(defn doc [seq prev & [key graph]]
+  (let [data (g/mirror-doc (or graph G) seq prev (signed (or key k) (+ 100 seq)))] [data (g/raw-cid data)]))
+(defn refused? [f] (try (f) false (catch :default e (= :refused (g/kind e)))))
+
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+
+(println "custody-puller gate:")
+(let [[d0 c0] (doc 0 nil) [d1 c1] (doc 1 c0)]
+  (check "a chain validates back to seq 0"
+         (and (= c0 (get (c/check-doc G 1 c1 d1 pins) "prev"))
+              (nil? (get (c/check-doc G 0 c0 d0 pins) "prev"))))
+  (check "bytes that do not hash to the cid" (refused? #(c/check-doc G 0 c1 d0 pins))))
+(let [[d1 c1] (doc 1 "bafkreiprev")]
+  (check "wrong seq or graph"
+         (and (refused? #(c/check-doc G 2 c1 d1 pins))
+              (refused? #(c/check-doc "bafyreig6tog2dqujgwgmmzu2gycl2m4nhetgwsbp3thlxk6lteqj5bdjr4" 1 c1 d1 pins)))))
+(check "prev must match seq 0"
+       (and (let [[d c] (doc 0 "bafkreiprev")] (refused? #(c/check-doc G 0 c d pins)))
+            (let [[d c] (doc 3 nil)] (refused? #(c/check-doc G 3 c d pins)))))
+(check "a head not signed by the namespace is a warrant"
+       (let [[d c] (doc 1 "bafkreiprev" (keypair))] (refused? #(c/check-doc G 1 c d pins))))
+
+(if (zero? @failures)
+  (println "custody-puller gate: ok")
+  (do (println "custody-puller gate:" @failures "failed") (js/process.exit 1)))
