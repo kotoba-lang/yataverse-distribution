@@ -807,9 +807,10 @@ The site refreshers do the same since 2026-10-07: they read the network record w
 | Refresher | xavier unit | Name |
 |---|---|---|
 | `deploy/refresh-ipns.sh` here | `yataverse-ipns-refresh` | `yataverse-apex` |
-| `deploy/refresh-ipns.sh` here, with key `itonami-static` | `itonami-ipns-refresh` | `itonami-static` |
 | network-isekai `deploy/refresh-ipns.sh` | `isekai-ipns-refresh` | `isekai-static` |
 | cloud-itonami `ops/independent/renew_static_ipns.py` | `itonami-static-ipns-renew` (system) | `itonami-static` |
+
+**One publisher per name.** `itonami-static` is renewed only by cloud-itonami's `renew_static_ipns.py`, which refuses unless the name already resolves to the CID in its verified manifest. This repository used to ship `{xavier,gad}-itonami-ipns-refresh` units that ran `refresh-ipns.sh` with key `itonami-static` from a plain CID file. Those files still named the 2026-09-27 CID `bafybeifjlvr…`, so after the verified 2026-09-30 release `bafybeid6m…` they rolled the static entrance back twice a day. They were removed on 2026-10-07. Retired copies are kept under `~/.config/systemd/user/retired-20261007/` on both nodes. On each node, `bafybeid6m…` was re-signed at network sequence + 1 with `ipns_fallback.py --publish`, and both renewers then succeeded (seq 13). The entrance served index `2f64…` and DID `7130…`, the same bytes as `itonami.cloud`.
 
 **Measured on 2026-10-06.**
 
