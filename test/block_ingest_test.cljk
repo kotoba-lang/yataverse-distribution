@@ -51,6 +51,12 @@
 
 (defn req [method path headers body] {:method method :path path :headers headers :body body})
 
+(let [allow? (b/limiter 2 3)]
+  (check "the rate limit allows a burst, then refills at the rate, per address"
+         (and (= [true true true false] (mapv #(allow? "a" %) [0 0 0 0]))
+              (allow? "b" 0)
+              (allow? "a" 600) (not (allow? "a" 600)))))
+
 (defn run []
   (let [store (fake-store)
         h #(b/handle opts store now %)]

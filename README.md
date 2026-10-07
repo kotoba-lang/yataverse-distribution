@@ -1575,3 +1575,9 @@ node <release>/engine/cli.js --classpath deploy:test test/block_ingest_test.cljk
   - the ACME port-80 vhost;
   - a webroot certificate for `yataverse-blocks.220-146-170-114.sslip.io`;
   - the 443 vhost.
+
+**Public without root (2026-10-07).** xavier has no root for nginx or certificates, so block-ingest is not behind nginx.
+- It listens on `0.0.0.0:18140`, and the router forwards external 18140 to it. The `xavier-block-ingest-upnp.{service,timer}` units set the forwarding over UPnP, as the xavier user, with a 1-hour lease renewed every 20 minutes. If xavier goes away, the mapping lapses.
+- The service now applies its own per-address rate limit (`--rate`, `--burst`), since nginx's limit is no longer in front of it.
+- Plain HTTP is sufficient for this protocol: writes are signed and bound to their CID, reads are CID-checked, and murakumo encrypts every part. Workers may fetch any port on a host Cloudflare does not proxy.
+- **Entrance:** `http://yataverse-blocks.220-146-170-114.sslip.io:18140`. The nginx files and `install-block-ingest-nginx.sh` remain an optional TLS front.

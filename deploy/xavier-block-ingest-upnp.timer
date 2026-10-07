@@ -1,0 +1,9 @@
+[Unit]
+Description=Renew the block-ingest router port mapping
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=20min
+
+[Install]
+WantedBy=timers.target

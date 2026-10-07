@@ -1,0 +1,9 @@
+[Unit]
+Description=Router port 18140 -> xavier block-ingest (UPnP, xavier user; renewed by the timer)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# A one-hour lease renewed every 20 minutes: it survives a router reboot within
+# 20 minutes and lapses on its own when xavier is gone.
+ExecStart=/bin/sh -c 'ip=$(hostname -I | tr " " "\\n" | grep "^192\\.168\\." | head -1); exec /usr/bin/upnpc -e block-ingest -a "$ip" 18140 18140 TCP 3600'
