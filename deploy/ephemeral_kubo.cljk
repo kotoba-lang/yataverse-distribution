@@ -1,0 +1,83 @@
+;; deploy/ephemeral_kubo.cljk — a throwaway Kubo for the independence drills
+;; (ADR-2610062000). Shared by p2p_writer_drill.cljk, independent_read_drill
+;; and p6_drill.
+;;
+;; The client knows only what it is handed: no bootstrap list, AutoConf off
+;; (it would fetch config by DNS name), no delegated routers, and peers given
+;; as raw-IP multiaddrs. A /dns multiaddr is refused by the callers.
+
+(ns ephemeral-kubo
+  (:require [clojure.string :as str]))
+
+(def cp (js/require "node:child_process"))
+(def fs (js/require "node:fs"))
+(def os (js/require "node:os"))
+(def path (js/require "node:path"))
+
+(defn ipfs!
+  "Synchronous `ipfs` in this repo. -> {:code :out :err} (strings)."
+  ([k args] (ipfs! k args 120))
+  ([{:keys [bin repo]} args timeout-s]
+   (let [r (.spawnSync cp bin (clj->js args)
+                       #js {:encoding "utf8" :timeout (* 1000 timeout-s)
+                            :env #js {"IPFS_PATH" repo "PATH" "/usr/bin:/bin"}})]
+     {:code (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")})))
+
+(defn ipfs-bytes!
+  "Like ipfs! but stdout as a Buffer (block and cat reads)."
+  [{:keys [bin repo]} args timeout-s]
+  (let [r (.spawnSync cp bin (clj->js args)
+                      #js {:timeout (* 1000 timeout-s) :maxBuffer (* 512 1024 1024)
+                           :env #js {"IPFS_PATH" repo "PATH" "/usr/bin:/bin"}})]
+    {:code (.-status r) :out (or (.-stdout r) (js/Buffer.alloc 0))}))
+
+(defn start!
+  "Init and start a Kubo; `routing` is \"none\" or \"dht\"; extra config pairs
+   [[key json] ...]. -> Promise of the handle {:bin :repo :daemon}; rejects
+   when the daemon does not come online."
+  [bin routing extra]
+  (let [repo (.mkdtempSync fs (.join path (.tmpdir os) "yataverse-drill-"))
+        k {:bin bin :repo repo}]
+    (ipfs! k ["init" "--profile=test"])
+    (doseq [[key v] (concat [["Bootstrap" "[]"] ["AutoConf.Enabled" "false"] ["Routing.Type" (str "\"" routing "\"")]
+                             ["DNS.Resolvers" "{}"] ["Routing.DelegatedRouters" "[]"] ["Ipns.DelegatedPublishers" "[]"]
+                             ["Addresses.API" "\"/ip4/127.0.0.1/tcp/0\""] ["Addresses.Gateway" "\"/ip4/127.0.0.1/tcp/0\""]
+                             ["Addresses.Swarm" "[\"/ip4/0.0.0.0/tcp/0\",\"/ip4/0.0.0.0/udp/0/quic-v1\"]"]
+                             ["Swarm.RelayClient.Enabled" "true"]]
+                            extra)]
+      (ipfs! k ["config" "--json" key v]))
+    (let [daemon (.spawn cp bin #js ["daemon" "--enable-gc=false"]
+                         #js {:env #js {"IPFS_PATH" repo "PATH" "/usr/bin:/bin"} :stdio "ignore"})
+          k (assoc k :daemon daemon)
+          api (.join path repo "api")
+          exited (atom nil)]
+      (.on daemon "exit" (fn [c] (reset! exited c)))
+      ;; Poll for the daemon's api file, never with `ipfs` itself first:
+      ;; before it exists every `ipfs` command opens the repo offline and
+      ;; takes repo.lock, and a daemon starting in that moment exits 1
+      ;; (two drills failed that way on 2026-10-07).
+      (js/Promise.
+       (fn [resolve reject]
+         ((fn poll [n]
+            (cond
+              (some? @exited) (reject (js/Error. (str "daemon exited " @exited " before coming online")))
+              (and (.existsSync fs api) (zero? (:code (ipfs! k ["swarm" "peers"] 10)))) (resolve k)
+              (> n 90) (reject (js/Error. "daemon did not come online"))
+              :else (js/setTimeout #(poll (inc n)) 1000)))
+          0))))))
+
+(defn stop! [{:keys [daemon repo]}]
+  (when daemon
+    (.kill daemon "SIGTERM"))
+  (js/setTimeout #(try (.rmSync fs repo #js {:recursive true :force true}) (catch :default _ nil)) 3000))
+
+(defn dns-free? [addrs] (not-any? #(str/includes? % "/dns") addrs))
+
+(defn peer-of [addr] (last (str/split addr #"/p2p/")))
+
+(defn connections
+  "Lines of `swarm peers` for `peer`, each :relay or :direct."
+  [k peer]
+  (->> (str/split-lines (:out (ipfs! k ["swarm" "peers"])))
+       (filter #(str/ends-with? % peer))
+       (mapv #(if (str/includes? % "/p2p-circuit") :relay :direct))))

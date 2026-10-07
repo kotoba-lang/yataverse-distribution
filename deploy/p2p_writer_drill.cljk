@@ -1,0 +1,130 @@
+;; deploy/p2p_writer_drill.cljk — reach each yataverse-writer over libp2p only
+;; (ADR-2610062000, after Holochain). Ported from p2p_writer_drill.py.
+;;
+;; The client is an ephemeral Kubo (ephemeral_kubo.cljk) that knows only the
+;; raw-IP multiaddrs it is given. For each writer it opens the protocol
+;; /x/yataverse/graph-head/1 with `ipfs p2p forward`, then over that stream:
+;;
+;;   read    GET /v1/graph-head for a graph
+;;   replay  POST that committed head back with its own sequence as expected;
+;;           a writer answers 200 with the same document and submits nothing
+;;
+;; A writer behind NAT is given as /p2p-circuit/ addresses on several relays:
+;; a relayed connection is limited and carries no stream, so the drill waits
+;; for DCUtR to make it direct. The receipt records which path held.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> p2p_writer_drill.cljk ...):
+;;   --ipfs-bin=PATH --graph=G --writer=NAME=ADDR[,ADDR...] ...
+;;   [--upgrade-wait=45] [--read-tries=5]
+;;
+;; Exit codes: 0 every writer answered both; 1 one refused; 3 the drill could not run.
+
+(ns p2p-writer-drill
+  (:require [clojure.string :as str]
+            [ephemeral-kubo :as k]))
+
+(def net (js/require "node:net"))
+(def protocol "/x/yataverse/graph-head/1")
+
+(defn- free-port []
+  (js/Promise. (fn [resolve _]
+                 (let [s (.createServer net)]
+                   (.listen s 0 "127.0.0.1" (fn [] (let [p (.-port (.address s))] (.close s #(resolve p)))))))))
+
+(defn- http [port method p body]
+  (-> (js/fetch (str "http://127.0.0.1:" port p)
+                (clj->js (cond-> {:method method :signal (js/AbortSignal.timeout 300000)
+                                  :headers {"content-type" "application/json"}}
+                           body (assoc :body (js/JSON.stringify body)))))
+      (.then (fn [r] (.then (.json r) (fn [j] [(.-status r) j]))))))
+
+(defn- sleep [ms] (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+
+(defn- retry [n f]
+  (-> (f) (.catch (fn [e] (if (pos? n) (.then (sleep 3000) #(retry (dec n) f)) (throw e))))))
+
+(defn- wait-direct [kubo peer seconds]
+  (let [t0 (js/Date.now)]
+    ((fn poll []
+       (if (or (some #{:direct} (k/connections kubo peer)) (> (- (js/Date.now) t0) (* 1000 seconds)))
+         (js/Promise.resolve (/ (- (js/Date.now) t0) 1000))
+         (.then (sleep 1000) poll))))))
+
+(defn- read-and-replay
+  "Over a forwarded local port: GET the head, POST it back. -> Promise of a result map."
+  [port graph opts]
+  (let [t0 (js/Date.now)]
+    (-> (retry (:read-tries opts) #(http port "GET" (str "/v1/graph-head?graph=" graph) nil))
+        (.then (fn [[status cur]]
+                 (let [read {"status" status "seq" (.-seq cur) "cid" (.-cid cur) "s" (/ (- (js/Date.now) t0) 1000)}]
+                   (if-not (= 200 status)
+                     {"read" read "error" (str "read " status)}
+                     (let [h (.. cur -document -head)
+                           t1 (js/Date.now)
+                           body #js {:graph graph :expected #js {:sequence (.-sequence h)} :head h}]
+                       (.then (http port "POST" "/v1/graph-head" body)
+                              (fn [[status out]]
+                                (let [cid (some-> out .-committed .-cid)]
+                                  {"read" read
+                                   "replay" {"status" status "cid" cid "s" (/ (- (js/Date.now) t1) 1000)}
+                                   "same" (and (= 200 status) (= (.-cid cur) cid))})))))))))))
+
+(defn- one-writer [kubo graph opts [name addrs]]
+  (let [peer (k/peer-of (first addrs))
+        base {"writer" name "peer" peer "addrs" addrs}
+        done (fn [m] (k/ipfs! kubo ["p2p" "close" "--all"]) (merge base m))]
+    (if (not-every? #(= peer (k/peer-of %)) addrs)
+      (js/Promise.resolve (done {"error" "addresses name different peers"}))
+      (let [connected (mapv #(zero? (:code (k/ipfs! kubo ["swarm" "connect" %] 90))) addrs)
+            relayed? (every? #(str/includes? % "/p2p-circuit") addrs)]
+        (if (not-any? true? connected)
+          (js/Promise.resolve (done {"connected_via" connected "error" "no address connected"}))
+          (-> (if relayed? (wait-direct kubo peer (:upgrade-wait opts)) (js/Promise.resolve nil))
+              (.then (fn [upgrade-s]
+                       (.then (free-port)
+                              (fn [port]
+                                (let [fwd (k/ipfs! kubo ["p2p" "forward" protocol (str "/ip4/127.0.0.1/tcp/" port) (str "/p2p/" peer)])]
+                                  (if-not (zero? (:code fwd))
+                                    {"error" (str "forward: " (str/trim (:err fwd)))}
+                                    (.then (read-and-replay port graph opts)
+                                           (fn [m] (cond-> (assoc m "path" (mapv clojure.core/name (k/connections kubo peer)))
+                                                     upgrade-s (assoc "upgrade_s" upgrade-s))))))))))
+              (.then (fn [m] (done (assoc m "connected_via" connected))))
+              (.catch (fn [e] (done {"connected_via" connected "error" (.-message e)})))))))))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))
+        writers (mapv #(let [[n a] (str/split % #"=" 2)] [n (str/split a #",")]) (flags "--writer"))
+        opts {:upgrade-wait (js/parseInt (or (one "--upgrade-wait") "45") 10)
+              :read-tries (js/parseInt (or (one "--read-tries") "5") 10)}
+        graph (one "--graph")]
+    (when-not (and graph (seq writers)) (println "REFUSE need --graph and --writer") (js/process.exit 1))
+    (when-not (k/dns-free? (mapcat second writers))
+      (println "REFUSE a /dns multiaddr would make this drill depend on DNS") (js/process.exit 1))
+    (-> (k/start! (or (one "--ipfs-bin") "ipfs") "none"
+                  [["Experimental.Libp2pStreamMounting" "true"] ["Swarm.EnableHolePunching" "true"]])
+        (.then (fn [kubo]
+                 (-> (reduce (fn [p w] (.then p (fn [acc] (.then (one-writer kubo graph opts w) #(conj acc %)))))
+                             (js/Promise.resolve []) writers)
+                     (.then (fn [results]
+                              (doseq [r results]
+                                (println (str (if (get r "same") "PASS " "FAIL ") (get r "writer") ": "
+                                              (or (get r "error")
+                                                  (str "read seq " (get-in r ["read" "seq"]) " in " (get-in r ["read" "s"]) "s, replay "
+                                                       (get-in r ["replay" "status"]) " in " (get-in r ["replay" "s"]) "s, path "
+                                                       (get r "path"))))))
+                              (let [passed (every? #(get % "same") results)]
+                                (println (js/JSON.stringify
+                                          (clj->js {"drill" "yataverse-p2p-writer" "passed" passed "protocol" protocol
+                                                    "graph" graph "dns" "none" "tailscale" "none" "cloudflare" "none"
+                                                    "writers" results "checked" (.toISOString (js/Date.))})))
+                                (k/stop! kubo)
+                                (js/setTimeout #(js/process.exit (if passed 0 1)) 3500)))))))
+        (.catch (fn [e] (println "UNMEASURED" (.-message e)) (js/process.exit 3))))))
+
+(when (some #(str/ends-with? % "p2p_writer_drill.cljk") (array-seq (aget js/process "argv")))
+  (main))

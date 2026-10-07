@@ -1,0 +1,161 @@
+;; deploy/independent_read_drill.cljk — read yataverse with no Cloudflare and
+;; no DNS (ADR-2610062000). Ported from independent_read_drill.py.
+;;
+;; A client that knows only the public directory's IPNS name (or a proof
+;; bundle CID) and the witness-ledger CID pinned in this repository should be
+;; able to:
+;;
+;;   1. resolve the directory over the DHT (or take the bundle as given),
+;;   2. read the yataverse lake_log entry and check its ledger CID,
+;;   3. fetch the proof bundle and verify it offline against the ledger,
+;;   4. walk the manifests from the head back to epoch 0, checking each
+;;      inventory against its manifest's sha256 and row count,
+;;   5. fetch sample lake blocks (and any --require-block) over bitswap and
+;;      check them against digests recomputed from the CID text.
+;;
+;; The client is an ephemeral Kubo (ephemeral_kubo.cljk) with DHT-only routing
+;; and exactly the raw-IP peers given. Every step prints a line; the last line
+;; is a JSON receipt.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> independent_read_drill.cljk ...):
+;;   --ipfs-bin=PATH (--directory-ipns=NAME | --bundle=CID) --peer=ADDR ...
+;;   --ledger-cid=CID --verifier="<lake_head command>" [--blocks=6] [--require-block=CID ...]
+;;
+;; Exit codes: 0 every step passed; 1 a step was refused; 3 the drill could not run.
+
+(ns independent-read-drill
+  (:require [clojure.string :as str]
+            [ephemeral-kubo :as k]
+            [graph-head :as g]))
+
+(def nc (js/require "node:crypto"))
+(def fs (js/require "node:fs"))
+(def os (js/require "node:os"))
+(def path (js/require "node:path"))
+
+(def ^:private b32 "abcdefghijklmnopqrstuvwxyz234567")
+
+(defn digest-of
+  "Pure. The sha2-256 digest named by a lake CID (CIDv0 Qm..., or CIDv1
+   base32 raw/dag-pb), recomputed from the CID text rather than trusted."
+  [cid]
+  (if (str/starts-with? cid "Qm")
+    (.subarray (g/b58-decode cid) 2)
+    (let [bits (apply str (map #(.padStart (.toString (.indexOf b32 %) 2) 5 "0") (subs cid 1)))
+          raw (js/Buffer.from (clj->js (map #(js/parseInt (apply str %) 2) (partition 8 bits))))
+          ;; version, codec (one-byte varints for raw / dag-pb / dag-cbor), then 0x12 0x20
+          i 2]
+      (.subarray raw (+ i 2) (+ i 34)))))
+
+(defn sha256 [buf] (-> (.createHash nc "sha256") (.update buf) (.digest)))
+
+(defn- rng
+  "Deterministic sample, seeded like the Python drill's Random(len(rows))
+   in spirit: the same rows give the same sample."
+  [seed]
+  (let [s (atom (bit-or seed 1))]
+    (fn [n] (swap! s #(mod (+ (* % 1103515245) 12345) 2147483648)) (mod @s n))))
+
+(defn- flags [kk]
+  (keep #(when (str/starts-with? % (str kk "=")) (subs % (inc (count kk))))
+        (array-seq (aget js/process "argv"))))
+
+(defn run-drill [kubo {:keys [directory-ipns bundle ledger-cid verifier blocks require-block peers]}]
+  (let [steps (atom [])
+        step! (fn [name ok detail]
+                (swap! steps conj {"step" name "ok" (boolean ok) "detail" detail})
+                (println (str (if ok "PASS " "FAIL ") name ": " detail))
+                ok)
+        cat (fn [cid] (let [r (k/ipfs-bytes! kubo ["cat" cid] 600)] (when (zero? (:code r)) (:out r))))
+        work (.mkdtempSync fs (.join path (.tmpdir os) "yataverse-drill-files-"))
+        fail (fn [] {:passed false :steps @steps})]
+    (or
+     ;; 1-2: the bundle, from the directory or as given
+     (let [lake (if bundle
+                  (do (step! "bundle-given" true (str "bundle " bundle " given; checked against the pinned ledger"))
+                      {"proof_bundle" bundle})
+                  (let [r (k/ipfs! kubo ["name" "resolve" "--nocache" (str "/ipns/" directory-ipns)] 300)
+                        html-path (str/trim (:out r))]
+                    (when (step! "resolve-directory" (str/starts-with? html-path "/ipfs/") (if (seq html-path) html-path (:err r)))
+                      (let [html (str (or (cat (subs html-path 6)) ""))
+                            json-cid (second (re-find #"<code>(bafkrei[a-z2-7]+)</code>" html))
+                            directory (if json-cid (g/parse-json (or (cat json-cid) "{}")) {})
+                            yv (first (filter #(= "yataverse.com" (get % "domain")) (get directory "services")))
+                            lake (get yv "lake_log")]
+                        (when (and (step! "directory-lake-log" (get lake "proof_bundle")
+                                          (str "directory " json-cid " names bundle " (get lake "proof_bundle")))
+                                   (step! "ledger-pinned" (= ledger-cid (get lake "witness_ledger"))
+                                          (str "directory ledger " (get lake "witness_ledger") " vs repository " ledger-cid)))
+                          lake)))))]
+       (when lake
+         ;; 3: verify the bundle offline
+         (let [lp (.join path work "ledger.edn") bp (.join path work "bundle.json")
+               ledger (cat ledger-cid) bun (cat (get lake "proof_bundle"))]
+           (.writeFileSync fs lp (or ledger "")) (.writeFileSync fs bp (or bun ""))
+           (let [v (g/run! (conj (g/words verifier) "verify-bundle" lp bp) nil 300)
+                 line (or (last (str/split-lines (str/trim (str (:out v))))) (:err v))]
+             (when (step! "verify-bundle" (and (zero? (:code v)) (str/includes? (str (:out v)) "VERIFIED-BUNDLE")) (subs line 0 (min 200 (count line))))
+               ;; 4: walk the manifests
+               (let [head (get (g/parse-json bun) "head")
+                     walked (loop [cid (get head "cid") seq (get head "seq") rows []]
+                              (let [man (g/parse-json (or (cat cid) "{}"))
+                                    inv (get man "inventory")
+                                    data (or (cat (get inv "cid" "")) (js/Buffer.alloc 0))
+                                    lines (remove str/blank? (str/split (str data) #"\n"))
+                                    good (and (= seq (get man "epoch")) (= (get inv "sha256") (.toString (sha256 data) "hex"))
+                                              (= (get inv "rows") (count lines)))]
+                                (cond
+                                  (not (step! (str "manifest-epoch-" seq) good (str cid " inventory " (get inv "cid") " rows " (count lines)))) nil
+                                  ;; rows stay JS objects: ~825k of them, and js->clj
+                                  ;; per row is slow on the interpreter
+                                  (zero? seq) (into rows (map #(js/JSON.parse %) lines))
+                                  :else (recur (get man "prev") (dec seq) (into rows (map #(js/JSON.parse %) lines))))))]
+                 (when walked
+                   ;; 5: blocks over bitswap
+                   (let [small (vec (filter #(<= (.-bytes %) (* 2 1024 1024)) walked))
+                         pick (rng (count walked))
+                         sample (repeatedly (min blocks (count small)) #(nth small (pick (count small))))
+                         block-ok (fn [row] (let [r (k/ipfs-bytes! kubo ["block" "get" (.-cid row)] 300)]
+                                              (and (zero? (:code r)) (= (.-bytes row) (.-length (:out r)))
+                                                   (.equals (sha256 (:out r)) (digest-of (.-cid row))))))
+                         ok-blocks (count (filter block-ok sample))]
+                     (step! "blocks" (= ok-blocks (count sample))
+                            (str ok-blocks "/" (count sample) " lake blocks over bitswap match their CID digests"))
+                     (doseq [cid require-block]
+                       (let [want (first (filter #(= cid (.-cid %)) walked))
+                             good (and want (block-ok want))]
+                         (step! "required-block" good (str cid " " (if want "in the log and " "NOT in the log; ")
+                                                           (if good "matches its digest" "not read back")))))
+                     (.rmSync fs work #js {:recursive true :force true})
+                     {:passed (every? #(get % "ok") @steps) :steps @steps :rows (count walked) :head head}))))))))
+     (fail))))
+
+(defn main []
+  (let [one #(first (flags %))
+        opts {:directory-ipns (one "--directory-ipns") :bundle (one "--bundle") :ledger-cid (one "--ledger-cid")
+              :verifier (one "--verifier") :blocks (js/parseInt (or (one "--blocks") "6") 10)
+              :require-block (vec (flags "--require-block")) :peers (vec (flags "--peer"))}]
+    (when-not (= 1 (count (filter some? [(:directory-ipns opts) (:bundle opts)])))
+      (println "REFUSE give exactly one of --directory-ipns and --bundle") (js/process.exit 1))
+    (when-not (and (seq (:peers opts)) (:ledger-cid opts) (:verifier opts))
+      (println "REFUSE need --peer --ledger-cid --verifier") (js/process.exit 1))
+    (when-not (k/dns-free? (:peers opts))
+      (println "REFUSE a /dns multiaddr would make this drill depend on DNS") (js/process.exit 1))
+    (-> (k/start! (or (one "--ipfs-bin") "ipfs") "dht" [["Swarm.Transports.Network.Relay" "true"]])
+        (.then (fn [kubo]
+                 (let [connected (count (filter #(zero? (:code (k/ipfs! kubo ["swarm" "connect" %] 60))) (:peers opts)))]
+                   (if-not (pos? connected)
+                     (do (println (str "FAIL peer: connected 0/" (count (:peers opts)))) (k/stop! kubo)
+                         (js/setTimeout #(js/process.exit 3) 3500))
+                     (do (println (str "PASS peer: connected " connected "/" (count (:peers opts)) " peers by raw IP multiaddr"))
+                         (let [r (run-drill kubo opts)]
+                           (println (js/JSON.stringify
+                                     (clj->js {"drill" "yataverse-independent-read" "passed" (:passed r) "rows" (:rows r)
+                                               "head" (:head r) "peers" (:peers opts) "dns" "none" "cloudflare" "none"
+                                               "checked" (.toISOString (js/Date.)) "steps" (:steps r)})))
+                           (k/stop! kubo)
+                           (js/setTimeout #(js/process.exit (if (:passed r) 0 1)) 3500)))))))
+        (.catch (fn [e] (println "UNMEASURED" (.-message e)) (js/process.exit 3))))))
+
+(when (some #(str/ends-with? % "independent_read_drill.cljk") (array-seq (aget js/process "argv")))
+  (main))
