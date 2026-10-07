@@ -164,9 +164,17 @@
       (exit! 1))
     l))
 
+(defn policy-of
+  "The writer policy readers enforce: --writer-policy=FILE when given, else
+  the ledger's own :writer-policy (network-awai/network-isekai#347 pinned it
+  beside the witness keys), else none."
+  [l]
+  (or writer-policy (:writer-policy l)))
+
 (defn context [l]
   (let [ids (mapv :id (:witnesses l))]
     {:chain-id (:chain-id l)
+     :writer-policy (policy-of l)
      :hash-fn seams/hash-fn
      :quorum (c/quorum-size (count ids))
      :verify-fn (seams/verify-fn (:pubkeys l))
@@ -196,7 +204,7 @@
              (let [record (select-keys head ["ref" "seq" "cid"])
                    reason (commitment/verify-commitment
                            {:record record :block (:block proof) :qc (:qc proof)} ctx)]
-               (if-let [why (or reason (when writer-policy (writer-refusal writer-policy (:chain-id ctx) head)))]
+               (if-let [why (or reason (when-let [p (:writer-policy ctx)] (writer-refusal p (:chain-id ctx) head)))]
                  {:id (:id w) :refused why}
                  {:id (:id w) :seq (get head "seq") :cid (get head "cid")
                   :head (select-keys head ["ref" "seq" "cid" "writer" "sig"])
@@ -312,8 +320,8 @@
     (cond
       (not (and (= ref-name (get head "ref")) (= (:chain-id l) (get b "chain-id"))))
       (do (out "REFUSE bundle is for" (get head "ref") "on" (get b "chain-id")) (exit! 1))
-      (and writer-policy (writer-refusal writer-policy (:chain-id l) head))
-      (do (out "REFUSE bundle head writer:" (name (writer-refusal writer-policy (:chain-id l) head))) (exit! 1))
+      (and (policy-of l) (writer-refusal (policy-of l) (:chain-id l) head))
+      (do (out "REFUSE bundle head writer:" (name (writer-refusal (policy-of l) (:chain-id l) head))) (exit! 1))
       (>= ok min-agree)
       (do (out "VERIFIED-BUNDLE" ref-name "seq" (get head "seq") "cid" (get head "cid")
                "proofs-ok" ok "(committed by quorum; not a proof that no higher seq exists)" detail)
