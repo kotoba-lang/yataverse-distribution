@@ -97,8 +97,20 @@ def main(argv=None):
         c = classify(i, r)
         detail = f"inga {i and i['sequence']} r2 {r and r['sequence']}"
         if c == "inga-ahead" and a.project:
+            # R2 has no conditional put from here, so narrow the race instead:
+            # the Worker may copy a NEWER head between our read and our write,
+            # and an unconditional write would roll R2 back. Re-read R2 just
+            # before writing, and after writing re-check and repair once more.
+            # inga stays the authority; a rollback that slips through is
+            # repaired on the next run.
             try:
-                project(a.r2_put_cmd, g, i)
+                done = False
+                for _ in range(3):
+                    i, r = inga_head(a.writer_url, g), r2_head(a.r2_get_cmd, g)
+                    if classify(i, r) != "inga-ahead":
+                        done = True
+                        break
+                    project(a.r2_put_cmd, g, i)
                 print(f"PROJECTED {g} {detail}", flush=True)
             except Exception as e:
                 print(f"UNMEASURED {g}: {e}", flush=True)

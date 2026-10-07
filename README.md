@@ -1171,3 +1171,31 @@ The entrance is rate-limited at 2 r/s per address with a burst of 10, takes bodi
 | End to end | 18–55 s | 5.1 s |
 
 The commit itself landed 2.9 s after submission. Readers still verify the 5-of-7 proofs independently. The lake cycle keeps using verified submits.
+
+## P5 cutover and drills (2026-10-07)
+
+**Cutover.** yataverse's Worker runs `KOTOBASE_HEAD_INGA=writer` (cloud-kotoba/kotobase-control-plane#775, env and bundle in #776, version `01b0b50a`). `/_health` reports `head_authority: inga-writer`.
+
+- The first Worker writes answered 409. The last head the previous version wrote to R2 (3673) was not yet in inga, so a Worker reading R2 expected a sequence inga did not hold.
+- Seeding that head through the writer, the ADR's "seed the final head" step, cleared it. Later Worker writes commit through the writer (200).
+- The P4 mirror is retired: after the cutover it would have been a path for R2 writes into inga.
+
+**Follower.** `deploy/main2-r2-head-follower.plist` now runs `--cutover --project` every 2 minutes. R2 being ahead is an error, and inga being ahead is written to R2. The first run projected a head the Worker had not copied yet.
+
+`--project` re-reads R2 just before writing and re-checks afterwards. R2 has no conditional put from this side, so a race with the Worker copying a newer head is narrowed, not closed. A rollback that slips through is repaired on the next run because inga is the authority.
+
+**Drill B: fence.** On main-2 the writer was stopped from 11:09:47 to 11:19:56.
+
+- Two Worker writes reached xavier's entrance during that window (11:10:53, 11:16:25). Both got 502 and were refused.
+- R2's head stayed at 3674 throughout.
+- After the restart the next Worker write committed (seq 32).
+- Inga decided; R2 accepted nothing inga did not commit.
+
+**Drill C: rebuild without R2, Cloudflare or main-2.** `deploy/recover_graph_heads.py` ran on xavier.
+
+1. It asked all 7 witnesses for each graph's committed head and required 5 to agree.
+2. It read each mirror document from xavier's own Kubo offline and checked the bytes against the CID.
+3. It verified the namespace signature.
+4. It wrote `heads/yataverse/ipns/<graph>.json`.
+
+All four rebuilt heads were **identical to the live R2 objects, signatures included** (3675, 62, 362, 0).
