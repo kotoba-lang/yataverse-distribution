@@ -643,7 +643,7 @@ to gad for HTTP-01, then the mapping returns to Xavier. When the public
 subset. A long takeover must also move port 80 and enable gad's Certbot
 renewal timer. Do not run both nodes' port mapping refreshers at once.
 
-`deploy/build_independent_index.py` makes a new dated HTML document from the
+`deploy/build_independent_index.cljk` (kotoba; ported 2026-10-07, rebuilding the published page byte for byte from the source fetched by CID `bafkreigyyull…`) makes a new dated HTML document from the
 exact 2026-09-26 apex snapshot. It refuses a changed source SHA-256, rewrites
 all 50 HTTPS block links to this gateway's own `/ipfs/{cid}` route, and
 replaces source claims about unavailable APIs and live generation. The output
@@ -1045,7 +1045,7 @@ The state file in `--work` makes an interrupted run continue from the step where
 - **Install.** The tools go in `~/.local/share/yataverse-lake-cycle/bin`. The cycle resolves its sibling tools from its own directory.
 - **Still reviewed by hand.** The printed follow-ups: the manifest commit, jacob's reader, and the directory pointer. Until they are done, the directory and the onion reader lag the log by at most the epochs cut since. The log and the witnesses do not lag.
 
-## Lake listing from the log: `deploy/project_lake_log.py` (2026-10-07, opt-in)
+## Lake listing from the log: `deploy/project_lake_log.cljk` (2026-10-07, opt-in)
 
 **What it writes.** The `lake-log/` layout that cloud-kotoba/kotobase-ipfs#71 reads when `KOTOBASE_LAKE_LISTING=log`:
 
@@ -1438,3 +1438,98 @@ The Python originals stay until `lake_epoch_cycle` (which calls them) is ported.
 - **Gate** (`test/p6_drill_test.cljk`): signing, every field signed, canonical blocks, classification, the summary, and the netwatch tree. It also checks that the epoch-5 action Python signed still verifies under the kotoba code.
 - **Cross-check.** Re-summarising the real 2026-10-07 observation log with the kotoba code reproduces the recorded receipt exactly: tailnet 55, loopback 19, public 123, 0 Cloudflare, 0 name lookups, 71 public remotes.
 - `independent_read_drill.py` is removed. Its kotoba port is the one the drill calls.
+### Raw block store in kotoba (2026-10-07)
+
+`deploy/raw_block_store.cljk` uses the same layout and writes byte-identical metadata, so the two implementations share one store.
+
+- **Gate** (`test/raw_block_store_test.cljk`): kotoba reads every block Python wrote, writes the same files byte for byte, and Python reads what kotoba wrote.
+- **Live.** On xavier's real store, 9/9 blocks read back and verified under node 18.
+
+The Python module stays while other Python tools import it.
+
+### Leaf readback in kotoba (2026-10-07)
+
+- **`deploy/lake_inventory.cljk`** is the inventory index from `serve_lake.Inventory`: declared digest and count, no duplicate CIDs, rows by offset, and a refusal when the file changes. It keeps Python's deliberately permissive CID check.
+- **`deploy/verify_lake_leaves.cljk`** reads blocks from the raw store first, then from Kubo offline. It checks size and CID, folds the same running scan hash, and keeps the same checkpoint.
+  - **Live on xavier** over epoch 4's 24 blocks: Python ran one round and kotoba two (10 rows, then the rest). The final checkpoints are byte-identical, scan hash included, so either tool resumes the other's readback.
+
+### Lake reader in kotoba (2026-10-07)
+
+`deploy/serve_lake.cljk` covers the listing, the CID-checked blocks, CAR and native receipts, and the epoch composite. It shares `lake_inventory.cljk` and `raw_block_store.cljk`.
+
+**Side by side on jacob**, the kotoba reader (:18196) ran beside the live Python lake-log reader (:18096) with the same 6-epoch arguments:
+
+- `/health` byte-identical (Python's `json.dumps` spacing kept);
+- pages at cursors 0, 821400, 821533 and 825282 byte-identical;
+- 16/16 sampled blocks from epochs 0–5 identical in status and bytes;
+- 12 concurrent pages all 200;
+- an invalid cursor and a foreign CID both 404, as in Python.
+
+One difference: a non-GET request gets 405 where Python answered 501.
+
+**Not switched yet.** The cycle's `reader` step edits that LaunchAgent's arguments by position in their current Python form. The live reader moves together with the matching `step-reader` change, after the kotoba cycle's first full run.
+
+### IPNS fallback in kotoba (2026-10-07)
+
+`deploy/ipns_fallback.cljk` keeps the same rules: re-put the signed record unchanged; re-sign the same value at sequence+1 only when its validity falls below the threshold; never invent a value. `test/ipns_fallback_test.cljk` ports the 6 Python cases.
+
+**One behaviour change.** In `--publish` (primary) mode, the Python tool published at sequence 0 whenever it could not read the network record. Everyone who has seen a higher sequence ignores a 0, yet the tool still reported PUBLISHED, because resolution returned the unchanged old value. The kotoba version refuses instead, unless `--first` is given for a name that has never been published. On 2026-10-07, xavier's `name get` timed out right after its Kubo restart, and the Python version, given the same name, also timed out.
+
+**Live.**
+
+- Run from main-2, both versions printed the same KEPT line for the directory name (seq 9, valid 163 h).
+- jacob's fallback LaunchAgent now runs the cljk version: 4/4 names KEPT (the directory, yataverse-apex, isekai-static, itonami-static).
+- xavier's primary unit now runs the cljk version: it PUBLISHED the directory's same value at seq 10, and the name still resolves to it.
+
+### R2 bootstrap bridge in kotoba (2026-10-07)
+
+`deploy/r2_origin_bridge.cljk` keeps the same contract:
+
+- loopback only;
+- only CIDs from the pinned inventory;
+- every body checked against its size and CID;
+- one token refresh on a 401;
+- a byte budget on memory.
+
+**Side by side on main-2:** `/healthz` returned 200 from both, 5/5 R2 blocks were identical, and an unlisted CID got 404 from both. The live LaunchAgent (`cloud.yataverse.r2-bootstrap-bridge`, used by xavier's replicator through the reverse tunnel) now runs the cljk version, and `/healthz` verifies an R2 block end to end.
+
+This bridge is itself a Cloudflare dependency, kept until the replicas no longer bootstrap from R2. The Python file stays until `replicate_lake` is ported, because its test file covers both.
+
+### CAR lane in kotoba (2026-10-07)
+
+- **`deploy/lake_kubo.cljk`** holds the shared Kubo calls: run against one repository, match the daemon to its repository, and build, pin and verify the batch root.
+- **`deploy/import_lake_car.cljk`** and **`deploy/export_lake_car_from_kubo.cljk`** write the CARv1 header and blocks byte for byte as Python did.
+
+**Gates on real data:**
+
+- **Export on xavier** of epoch 4's 24 blocks: the kotoba CAR is byte-identical to Python's (sha256 `b5099ad9…`), through both the offline CLI and the RPC path, and the receipts are equal.
+- **Round trip, kotoba on both ends:** the kotoba CAR shipped to jacob and imported by the kotoba importer pinned root `bafyreibc43h…`, which is epoch 4's receipt root.
+- **Root alone:** rebuilding epoch 4's batch root from its rows through the cljk code on jacob also gives `bafyreibc43h…`.
+- **`deploy/ship_lake_car.cljk`** uses the remote-Kubo mode the cycle uses. Each end runs as kotoba: `--source-runner` and `--remote-runner` give the hosts' engine prefixes, and the raw-store check is `raw_block_store.cljk verify`.
+  - **End to end:** epoch 4's range was exported on xavier, carried through main-2 and imported on jacob, all in kotoba. The result was `shipped` with root `bafyreibc43h…` (epoch 4's), and the transient CARs were removed on both ends, leaving only the import receipt.
+- **`deploy/audit_lake.cljk`** provides the receipt audit and the inventory audit. Receipt names are frozen before pins are listed, and `direct_pin_rows` counts over the direct ∪ recursive union, as Python did. **On jacob**, over epoch 4's receipts, its report is byte-identical to Python's: 24/24 covered through the CAR root.
+- **`deploy/router_standby.cljk`** keeps the same guarded decision: three confirmed failures; no takeover while the primary still listens; no deletion of a working mapping without `--allow-router-cutover`; rollback when a replacement fails. `test/router_standby_test.cljk` ports the 6 Python cases. It runs on gad, which has been offline since 2026-10-02, so it is not deployed yet.
+
+### First production epoch cut by the kotoba cycle (2026-10-07)
+
+The kotoba cycle ran on the production runs directory from `head` to `reader` and committed **epoch 6**.
+
+| Step | Result |
+|---|---|
+| Capture | Two full walks of about 4,128 pages each at cutoff 2026-10-07T03:00Z: 825,389 rows, agreeing |
+| Diff | 3,856 rows since epoch 0 |
+| Resolve | The first attempt timed out while I was running two full `pin ls` audits on jacob. The rerun resolved 6 epochs, 825,283 rows |
+| Delta | 107 rows, 64,735 bytes, none large |
+| xavier | Leaf readback 107/107 |
+| jacob | Audit complete, readback 107/107 |
+| Manifest | `bafkreiezmplv…` |
+| Submit | Verified by 7 witnesses |
+| Bundle | `bafkreie5xqy…` |
+| Check | 825,390 rows covering the listing (the 1 row only in the log is the P6 action) |
+| Reader | The onion reader serves 825,390 rows (`2334fb3e`) |
+
+**Follow-ups committed:** `deploy/lake-manifests/epoch-6.json` and the reader plist. The directory pointer stays a reviewed step.
+
+**Schedule.** The 04:30 LaunchAgent now runs the cljk cycle, which has a run lock. The Python cycle schedule was paused during this run so that it could not resume the same run beside it.
+
+**Retired.** `lake_epoch_cycle.py`, `capture_lake_inventory.py`, `diff_lake_inventory.py` and `lake_epoch.py`. The cycle still calls the remote Python tools on xavier and jacob (replicate, temporary reader, CAR export/import, audit, large lane) until they switch to their verified kotoba ports.

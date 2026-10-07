@@ -15,12 +15,13 @@
 	<string>Standard</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/opt/homebrew/bin/python3</string>
-		<string>/Users/junkawasaki/.local/share/yataverse-lake-cycle/bin/lake_epoch_cycle.py</string>
-		<string>--config</string>
-		<string>/Users/junkawasaki/.local/share/yataverse-lake-cycle/bin/lake-epoch-cycle.json</string>
-		<string>--work-root</string>
-		<string>/Users/junkawasaki/.local/share/yataverse-lake-cycle/runs</string>
+		<string>/opt/homebrew/bin/node</string>
+		<string>/Users/junkawasaki/.local/share/isekai-score-v5/release/engine/cli.js</string>
+		<string>--classpath</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-lake-cycle/bin</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-lake-cycle/bin/lake_epoch_cycle.cljk</string>
+		<string>--config=/Users/junkawasaki/.local/share/yataverse-lake-cycle/bin/lake-epoch-cycle.json</string>
+		<string>--work-root=/Users/junkawasaki/.local/share/yataverse-lake-cycle/runs</string>
 	</array>
 	<key>StandardErrorPath</key>
 	<string>/Users/junkawasaki/.local/share/yataverse-lake-cycle/logs/cycle.err.log</string>

@@ -1,0 +1,99 @@
+;; deploy/project_lake_log.cljk — project the inga lake log into the
+;; `lake-log/` layout the Worker's opt-in log listing reads
+;; (cloud-kotoba/kotobase-ipfs#71, ADR-2610062000 P3). Ported from
+;; project_lake_log.py; the objects are byte-identical.
+;;
+;;   lake-log/head.json
+;;     {"seq", "manifest", "bundle", "rows",
+;;      "epochs": [{"epoch", "inventory", "sha256", "rows", "page_rows", "prefix"}]}
+;;   lake-log/pages/<inventory sha256>/<n>.json    a JSON array of {cid, bytes}
+;;
+;; Input is the per-epoch inventories in log order, each checked against its
+;; sha256 and row count, plus the verified head. Pages are content-named by
+;; the inventory's sha256, so a rerun writes the same objects; head.json is
+;; written last, so a reader never sees a head naming pages not yet there.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> project_lake_log.cljk ...):
+;;   --epoch=EPOCH:INVENTORY:SHA256:ROWS:INVENTORY_CID ... --seq=N --manifest=CID --bundle=CID
+;;   (--out=DIR | --put-cmd="... {key} ... {file}" [--staging=DIR])
+;;
+;; Writing to a production bucket is an owner decision; nothing defaults to it.
+;; Exit codes: 0 projected; 1 an input refused its check; 3 a write failed.
+
+(ns project-lake-log
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def nc (js/require "node:crypto"))
+
+(def page-rows 200)
+
+(defn- refuse [msg] (throw (ex-info msg {:kind :refused})))
+(defn- sha256-file [p] (-> (.createHash nc "sha256") (.update (.readFileSync fs p)) (.digest "hex")))
+
+(defn parse-epoch
+  "EPOCH:INVENTORY:SHA256:ROWS:INVENTORY_CID"
+  [spec]
+  (let [[epoch p sha rows cid] (str/split spec #":" 5)]
+    {"epoch" (js/parseInt epoch 10) "path" p "sha256" sha "rows" (js/parseInt rows 10) "inventory" cid}))
+
+(defn build
+  "-> vector of [key Buffer], head.json last."
+  ([epochs head] (build epochs head page-rows))
+  ([epochs head per-page]
+   (let [{:keys [objects listed total]}
+         (reduce (fn [acc e]
+                   (when-not (= (get e "sha256") (sha256-file (get e "path")))
+                     (refuse (str "epoch " (get e "epoch") ": inventory sha256 differs from the manifest")))
+                   (let [rows (->> (str/split (.readFileSync fs (get e "path") "utf8") #"\n")
+                                   (remove str/blank?) (mapv #(js/JSON.parse %)))
+                         prefix (str "lake-log/pages/" (get e "sha256") "/")]
+                     (when-not (= (count rows) (get e "rows"))
+                       (refuse (str "epoch " (get e "epoch") ": " (count rows) " rows, manifest says " (get e "rows"))))
+                     (-> acc
+                         (update :objects into
+                                 (map-indexed (fn [n page]
+                                                [(str prefix n ".json")
+                                                 (js/Buffer.from (str "[" (str/join "," (map #(str "{\"cid\":" (js/JSON.stringify (.-cid %))
+                                                                                                   ",\"bytes\":" (.-bytes %) "}")
+                                                                                             page))
+                                                                      "]"))])
+                                              (partition-all per-page rows)))
+                         (update :listed conj {"epoch" (get e "epoch") "inventory" (get e "inventory") "sha256" (get e "sha256")
+                                               "rows" (get e "rows") "page_rows" per-page "prefix" prefix})
+                         (update :total + (get e "rows")))))
+                 {:objects [] :listed [] :total 0} epochs)]
+     (when-not (= (map #(get % "epoch") listed) (range (count listed)))
+       (refuse "epochs must be given in log order from 0 without gaps"))
+     (when-not (= (get head "seq") (dec (count listed)))
+       (refuse (str "head seq " (get head "seq") " does not match " (count listed) " epochs")))
+     (conj objects ["lake-log/head.json" (g/canonical (assoc head "rows" total "epochs" listed))]))))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))
+        out (one "--out") put-cmd (one "--put-cmd")
+        root (or out (one "--staging") "/tmp/lake-log-projection")
+        epochs (mapv parse-epoch (flags "--epoch"))]
+    (when-not (= 1 (count (filter some? [out put-cmd]))) (println "REFUSE give exactly one of --out and --put-cmd") (js/process.exit 1))
+    (let [objects (try (build epochs {"seq" (js/parseInt (one "--seq") 10) "manifest" (one "--manifest") "bundle" (one "--bundle")})
+                       (catch :default e (println "REFUSE" (g/message e)) (js/process.exit 1)))]
+      (doseq [[k data] objects]
+        (let [f (.join path root k)]
+          (.mkdirSync fs (.dirname path f) #js {:recursive true})
+          (.writeFileSync fs f data)
+          (when put-cmd
+            (let [r (g/run! (g/words (-> put-cmd (str/replace "{key}" k) (str/replace "{file}" f))) nil 300)]
+              (when-not (zero? (:code r))
+                (println "UNMEASURED put" k (subs (:err r) (max 0 (- (count (:err r)) 200))))
+                (js/process.exit 3))))))
+      (println (str "PROJECTED seq " (one "--seq") " objects " (count objects) " rows " (reduce + 0 (map #(get % "rows") epochs))
+                    " " (if out (str "to " out) "via put-cmd"))))))
+
+(when (some #(str/ends-with? % "project_lake_log.cljk") (array-seq (aget js/process "argv")))
+  (main))

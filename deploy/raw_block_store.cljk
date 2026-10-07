@@ -1,0 +1,143 @@
+;; deploy/raw_block_store.cljk — durable, CID-checked raw blocks for bytes
+;; Kubo cannot decode and pin. Ported from raw_block_store.py; same layout and
+;; byte-identical metadata, so both read and write the same store.
+;;
+;;   <root>/<sha256(cid)[0:2]>/<cid>.block   the bytes
+;;   <root>/<sha256(cid)[0:2]>/<cid>.json    {"bytes": n, "cid": .., "schema": 1, "sha256": ..}
+;;
+;; A block is only ever written after its bytes hash to the CID (sha2-256
+;; CIDs only), data first, then metadata, each through a synced temp file.
+
+(ns raw-block-store
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def nc (js/require "node:crypto"))
+
+(def max-block 256000000)
+(def cid-v0 #"Qm[1-9A-HJ-NP-Za-km-z]{44}")
+(def cid-v1 #"b[a-z2-7]{20,200}")
+(def ^:private b32 "abcdefghijklmnopqrstuvwxyz234567")
+
+(defn- refuse [msg] (throw (ex-info msg {:kind :raw-block-store})))
+
+(defn- varint
+  "-> [value next-offset]."
+  [buf offset]
+  (loop [shift 0 value 0 o offset]
+    (cond
+      (>= shift 70) (refuse "oversized CID varint")
+      (>= o (.-length buf)) (refuse "truncated CID varint")
+      :else (let [b (aget buf o) v (+ value (* (bit-and b 0x7f) (js/Math.pow 2 shift)))]
+              (if (zero? (bit-and b 0x80)) [v (inc o)] (recur (+ shift 7) v (inc o)))))))
+
+(defn- b32-decode [text]
+  (let [idx (map #(.indexOf b32 %) text)]
+    (when (some neg? idx) (refuse "invalid CID base32"))
+    (let [bits (apply str (map #(.padStart (.toString % 2) 5 "0") idx))]
+      (js/Buffer.from (clj->js (map #(js/parseInt (apply str %) 2) (partition 8 bits)))))))
+
+(defn sha256-digest
+  "The sha2-256 digest a CID names, or refuse."
+  [cid]
+  (let [encoded (cond
+                  (re-matches cid-v0 cid) (g/b58-decode cid)
+                  (re-matches cid-v1 cid) (let [raw (b32-decode (subs cid 1))
+                                                [version o] (varint raw 0)]
+                                            (when-not (= 1 version) (refuse "unsupported CID version"))
+                                            (.subarray raw (second (varint raw o))))
+                  :else (refuse "invalid CID syntax"))
+        [code o] (varint encoded 0)
+        [length o] (varint encoded o)]
+    (when-not (and (= code 0x12) (= length 32) (= 32 (- (.-length encoded) o)))
+      (refuse "raw store requires a sha2-256 CID"))
+    (.subarray encoded o)))
+
+(defn- sha256 [buf] (-> (.createHash nc "sha256") (.update buf) (.digest)))
+
+(defn verify-cid [cid data]
+  (when-not (.equals (sha256 data) (sha256-digest cid)) (refuse "raw block CID differs from bytes")))
+
+(defn- sync-dir [d] (let [fd (.openSync fs d "r")] (try (.fsyncSync fs fd) (finally (.closeSync fs fd)))))
+
+(defn paths [root cid]
+  (sha256-digest cid)
+  (let [shard (.join path root (subs (-> (.createHash nc "sha256") (.update cid "ascii") (.digest "hex")) 0 2))]
+    [(.join path shard (str cid ".block")) (.join path shard (str cid ".json"))]))
+
+(defn cids [root]
+  (if-not (.existsSync fs root)
+    #{}
+    (set (for [shard (array-seq (.readdirSync fs root))
+               :let [d (.join path root shard)]
+               :when (.isDirectory (.statSync fs d))
+               f (array-seq (.readdirSync fs d))
+               :when (and (str/ends-with? f ".json") (not (str/includes? f ".tmp")))
+               :let [cid (subs f 0 (- (count f) 5))]]
+           (do (when-not (= (.join path d f) (second (paths root cid))) (refuse "raw block metadata path differs"))
+               cid)))))
+
+(defn read-block
+  "-> Buffer, or nil when the store does not hold `cid`."
+  ([root cid] (read-block root cid max-block))
+  ([root cid max-bytes]
+   (let [[data-path meta-path] (paths root cid)]
+     (when (or (.existsSync fs data-path) (.existsSync fs meta-path))
+       (when-not (and (.existsSync fs data-path) (.existsSync fs meta-path)
+                      (.isFile (.lstatSync fs data-path)) (.isFile (.lstatSync fs meta-path)))
+         (refuse "raw block data or metadata missing"))
+       (let [meta (try (g/parse-json (.readFileSync fs meta-path "utf8")) (catch :default _ (refuse "raw block metadata unreadable")))]
+         (when-not (and (= 1 (get meta "schema")) (= cid (get meta "cid")) (js/Number.isInteger (get meta "bytes"))
+                        (<= 1 (get meta "bytes") max-bytes) (string? (get meta "sha256"))
+                        (re-matches #"[0-9a-f]{64}" (get meta "sha256")))
+           (refuse "raw block metadata differs"))
+         (let [data (.readFileSync fs data-path)]
+           (when-not (and (= (.-length data) (get meta "bytes")) (= (get meta "sha256") (.toString (sha256 data) "hex")))
+             (refuse "raw block data differs from metadata"))
+           (verify-cid cid data)
+           data))))))
+
+(defn- write-synced! [target data]
+  (let [tmp (str target "." (.replace (.randomUUID nc) (js/RegExp. "-" "g") "") ".tmp")]
+    (try
+      (let [fd (.openSync fs tmp "wx")]
+        (try (.writeSync fs fd data) (.fsyncSync fs fd) (finally (.closeSync fs fd))))
+      (.renameSync fs tmp target)
+      (sync-dir (.dirname path target))
+      (finally (try (.unlinkSync fs tmp) (catch :default _ nil))))))
+
+(defn put! [root cid data]
+  (when (or (zero? (.-length data)) (> (.-length data) max-block)) (refuse "raw block size exceeds bound"))
+  (verify-cid cid data)
+  (let [[data-path meta-path] (paths root cid)]
+    (if (.existsSync fs meta-path)
+      (when-not (.equals (read-block root cid) data) (refuse "existing raw block differs"))
+      (do
+        (when (and (.existsSync fs data-path) (not (.equals (.readFileSync fs data-path) data)))
+          (refuse "incomplete raw block differs"))
+        (let [root-existed (.existsSync fs root)]
+          (.mkdirSync fs root #js {:recursive true})
+          (when-not root-existed (sync-dir (.dirname path root))))
+        (.mkdirSync fs (.dirname path data-path) #js {:recursive true})
+        (sync-dir root)
+        (when-not (.existsSync fs data-path) (write-synced! data-path data))
+        (write-synced! meta-path (str (g/py-json-str {"schema" 1 "cid" cid "bytes" (.-length data)
+                                                      "sha256" (.toString (sha256 data) "hex")})
+                                      "\n"))))))
+
+;; CLI: `verify ROOT CID BYTES` exits 0 only when the store holds CID with
+;; exactly BYTES verified bytes (the shipper's check on the receiving host).
+(defn main []
+  (let [args (vec (drop-while #(not (str/ends-with? % "raw_block_store.cljk")) (array-seq (aget js/process "argv"))))
+        [_ cmd root cid n] args]
+    (if (not= "verify" cmd)
+      (do (println "REFUSE usage: raw_block_store.cljk verify ROOT CID BYTES") (js/process.exit 2))
+      (let [data (try (read-block root cid (js/parseInt n 10)) (catch :default e (println "REFUSE" (.-message e)) nil))]
+        (if (and data (= (js/parseInt n 10) (.-length data)))
+          (do (println "VERIFIED" cid (.-length data)) (js/process.exit 0))
+          (do (println "REFUSE" cid "is not held with" n "verified bytes") (js/process.exit 2)))))))
+
+(when (some #(str/ends-with? % "raw_block_store.cljk") (array-seq (aget js/process "argv")))
+  (main))

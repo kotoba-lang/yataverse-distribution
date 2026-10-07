@@ -1,0 +1,73 @@
+;; deploy/lake_inventory.cljk — one dated lake inventory, indexed and pinned
+;; to its declared digest (ADR-2610062000). Ported from serve_lake.Inventory;
+;; shared by the readers, the leaf readback and the audits.
+;;
+;; The file is read once: every line must be a {cid, bytes} row with a valid
+;; CID, no CID twice, and the whole must hash to the declared sha256 with the
+;; declared row count. Rows are then served by offset; a file changed since
+;; the index was built is refused.
+
+(ns lake-inventory
+  (:require [clojure.string :as str]))
+
+(def fs (js/require "node:fs"))
+(def nc (js/require "node:crypto"))
+
+(def page-size 200)
+(def cid-re #"[a-zA-Z0-9]{46,100}")   ; serve_lake.CID, deliberately as permissive
+
+(defn- refuse [msg] (throw (ex-info msg {:kind :inventory})))
+
+(defn open-inventory
+  "-> {:path :sha256 :offsets (JS array) :sizes (JS Map) :positions (JS Map) :total-bytes :identity}."
+  [p expected-sha256 expected-count]
+  (let [buf (.readFileSync fs p)
+        digest (-> (.createHash nc "sha256") (.update buf) (.digest "hex"))
+        offsets #js [] sizes (js/Map.) positions (js/Map.)
+        total (loop [start 0 total 0]
+                (if (>= start (.-length buf))
+                  total
+                  (let [nl (.indexOf buf 10 start)
+                        end (if (neg? nl) (.-length buf) (inc nl))
+                        line (.toString buf "utf8" start end)
+                        row (try (js/JSON.parse line) (catch :default _ (refuse (str "invalid inventory row at offset " start))))
+                        cid (.-cid row) size (.-bytes row)]
+                    (when-not (and (string? cid) (re-matches cid-re cid) (js/Number.isInteger size) (pos? size))
+                      (refuse (str "invalid CID or size at offset " start)))
+                    (when (.has sizes cid) (refuse (str "duplicate CID in inventory: " cid)))
+                    (.set positions cid (.-length offsets))
+                    (.push offsets start)
+                    (.set sizes cid size)
+                    (recur end (+ total size)))))]
+    (when-not (and (= digest expected-sha256) (= (.-length offsets) expected-count))
+      (refuse "inventory digest or row count differs from declared snapshot"))
+    (let [st (.statSync fs p #js {:bigint true})]
+      {:path p :sha256 expected-sha256 :offsets offsets :sizes sizes :positions positions
+       :total-bytes total :identity [(str (.-ino st)) (str (.-size st)) (str (.-mtimeNs st))]})))
+
+(defn row-count [inv] (.-length (:offsets inv)))
+
+(defn rows
+  "-> [rows end]: rows are {\"cid\" \"size\"} maps from `offset`, at most `limit`."
+  [inv offset limit]
+  (let [st (.statSync fs (:path inv) #js {:bigint true})]
+    (when-not (= (:identity inv) [(str (.-ino st)) (str (.-size st)) (str (.-mtimeNs st))])
+      (refuse "inventory file changed since startup")))
+  (when (or (neg? offset) (>= offset (row-count inv))) (refuse "cursor outside inventory"))
+  (when-not (<= 1 limit 1000) (refuse "inventory row limit must be within 1..1000"))
+  (let [end (min (+ offset limit) (row-count inv))
+        fd (.openSync fs (:path inv) "r")]
+    (try
+      (let [from (aget (:offsets inv) offset)
+            to (if (< end (row-count inv)) (aget (:offsets inv) end) (.-size (.fstatSync fs fd)))
+            buf (js/Buffer.alloc (- to from))]
+        (.readSync fs fd buf 0 (.-length buf) from)
+        [(mapv (fn [line] (let [r (js/JSON.parse line)] {"cid" (.-cid r) "size" (.-bytes r)}))
+               (remove str/blank? (str/split (.toString buf "utf8") #"\n")))
+         end])
+      (finally (.closeSync fs fd)))))
+
+(defn page [inv offset]
+  (let [[rs end] (rows inv offset page-size)]
+    {"ok" true "inventory-sha256" (:sha256 inv) "blocks" rs
+     "cursor" (when (< end (row-count inv)) (str end)) "truncated?" (< end (row-count inv))}))

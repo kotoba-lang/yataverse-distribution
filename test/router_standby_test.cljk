@@ -1,0 +1,45 @@
+;; Gate for deploy/router_standby.cljk (ported from test_router_standby.py).
+(ns router-standby-test
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [router-standby :as s]))
+(def fs (js/require "node:fs"))
+(def os (js/require "node:os"))
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+(defn refusal [f] (try (f) nil (catch :default e (g/message e))))
+(defn listing [mapping]
+  (str "ExternalIPAddress = " s/public-ip "\n" (when mapping (str "15 TCP  8443->" mapping ":443   'libminiupnpc' '' 615\n"))))
+(println "router-standby gate:")
+(check "only an expected mapping is accepted"
+       (and (= s/xavier-ip (s/router-mapping (listing s/xavier-ip))) (= s/gad-ip (s/router-mapping (listing s/gad-ip)))
+            (nil? (s/router-mapping (listing nil)))
+            (str/includes? (refusal #(s/router-mapping (listing "192.168.1.99"))) "unexpected owner")
+            (str/includes? (refusal #(s/router-mapping "ExternalIPAddress = 203.0.113.1\n")) "public IPv4 differs")))
+(check "three failed checks are required to take over"
+       (and (every? #(= "wait-for-confirmation" (s/decide false nil % s/xavier-ip false)) [1 2])
+            (= "take-over" (s/decide false true 3 s/xavier-ip false))
+            (= "renew-standby" (s/decide false true 3 s/gad-ip false))
+            (str/includes? (refusal #(s/decide false false 3 s/xavier-ip false)) "standby gateway failed")
+            (str/includes? (refusal #(s/decide false true 3 s/xavier-ip true)) "renewal may contend")))
+(check "primary recovery restores its mapping"
+       (and (= "restore-primary" (s/decide true nil 0 s/gad-ip false)) (= "keep-primary" (s/decide true nil 0 s/xavier-ip false))))
+(check "a timer cannot delete a mapping during an unsupervised cutover"
+       (and (every? #(str/includes? (refusal (fn [] (s/require-cutover-opt-in % false))) "cutover disabled") ["take-over" "restore-primary"])
+            (every? #(nil? (refusal (fn [] (s/require-cutover-opt-in % true)))) ["take-over" "restore-primary"])
+            (nil? (refusal #(s/require-cutover-opt-in "keep-primary" false)))
+            (nil? (refusal #(s/require-cutover-opt-in "renew-standby" false)))))
+(let [mapping (atom s/xavier-ip) calls (atom [])
+      run! (fn [argv] (swap! calls conj argv)
+             (case (vec (take 2 argv))
+               ["upnpc" "-l"] (listing @mapping)
+               ["upnpc" "-d"] (do (reset! mapping nil) "")
+               ["upnpc" "-a"] (if (= s/gad-ip (nth argv 2)) (throw (ex-info "new mapping failed" {:kind :refused})) (do (reset! mapping (nth argv 2)) ""))))]
+  (check "a failed switch attempts a rollback"
+         (and (str/includes? (str (refusal #(s/set-mapping! run! s/gad-ip s/xavier-ip))) "new mapping failed")
+              (= s/xavier-ip @mapping) (= 2 (count (filter #(= ["upnpc" "-a"] (vec (take 2 %))) @calls))))))
+(let [p (str (.mkdtempSync fs (str (.tmpdir os) "/rs-")) "/state.json")]
+  (check "the failure counter is checked and persisted"
+         (and (zero? (s/load-failures p)) (do (s/save-failures p 2) (= 2 (s/load-failures p)))
+              (do (.writeFileSync fs p "{\"consecutive-primary-failures\":-1}") (str/includes? (refusal #(s/load-failures p)) "invalid failure count")))))
+(if (zero? @failures) (println "router-standby gate: ok") (do (println "router-standby gate:" @failures "failed") (js/process.exit 1)))
