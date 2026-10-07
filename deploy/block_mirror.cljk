@@ -1,0 +1,131 @@
+;; deploy/block_mirror.cljk — a second custodian for block-ingest: hold what
+;; the source entrance holds, per signer, on this host's own Kubo.
+;;
+;; The copy travels over libp2p, not HTTP: this Kubo already keeps a Peering
+;; connection to the source's Kubo (main-2 -> xavier), so `ipfs block stat
+;; --timeout` fetches each missing block by bitswap through it, and `files cp`
+;; holds it at /block-ingest/<signer>/<cid> -- the same layout block_ingest.cljk
+;; uses, so this host could serve as an entrance as it stands. Only the
+;; listings (/v1/holds, /v1/heads) are read over HTTP from the source.
+;;
+;; Releases follow the source, but only from a complete listing: an
+;; unreachable or failing source releases nothing. A free-space reserve stops
+;; new copies before the disk fills (main-2 shares its disk with other work).
+;; Heads are copied when their seq is higher than the local one.
+;;
+;; usage (node <release>/engine/cli.js --classpath deploy deploy/block_mirror.cljk ...):
+;;   --source=http://host:18140 --signer=did:key:... ... --ipfs-bin=PATH --ipfs-path=DIR
+;;   --state-dir=DIR [--source-peer=/ip4/.../p2p/<id> ...] [--min-free-bytes=30000000000]
+;;   [--fetch-timeout=120] [--loop=300]
+;; Exit codes: 0 a round completed (without --loop); 2 refused.
+
+(ns block-mirror
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [block-ingest :as b]))
+
+(def fs (js/require "node:fs"))
+
+(defn- fetch-json [url]
+  (-> (js/fetch url #js {:signal (.timeout js/AbortSignal 30000)})
+      (.then (fn [^js r]
+               (when-not (= 200 (.-status r)) (throw (g/unmeasured (str url " answered " (.-status r)))))
+               (.json r)))
+      (.then #(js->clj %))))
+
+(defn- free-bytes [dir]
+  (let [st (.statfsSync fs dir)] (* (.-bavail st) (.-bsize st))))
+
+(defn plan
+  "What one round does for one signer: {:copy [cids] :release [cids]}. `source`
+   is the source's complete listing, `local` this host's."
+  [source local]
+  (let [s (set source) l (set local)]
+    {:copy (vec (sort (remove l s))) :release (vec (sort (remove s l)))}))
+
+(defn- redial!
+  "Drop and re-dial the source's Kubo. A half-open connection (seen 2026-10-07:
+   main-2 listed xavier, xavier did not list main-2) answers no bitswap wants
+   and every fetch times out until it is replaced."
+  [{:keys [ipfs source-peers]}]
+  (js/Promise.all
+   (clj->js (map (fn [addr]
+                   (let [id (last (str/split addr #"/p2p/"))]
+                     (-> (ipfs ["swarm" "disconnect" (str "/p2p/" id)])
+                         (.then (fn [_] (ipfs ["swarm" "connect" addr]))))))
+                 source-peers))))
+
+(defn- copy-all!
+  "Hold each of `cids` in turn; stop at the free-space reserve. A failed copy
+   re-dials the source once and is retried. Promise<count>."
+  [{:keys [ipfs-path min-free-bytes fetch-timeout] :as opts} store signer cids]
+  (letfn [(step [[cid & more] n]
+            (cond
+              (nil? cid) (js/Promise.resolve n)
+              (< (free-bytes ipfs-path) min-free-bytes)
+              (do (println "reserve reached; stopping with" (inc (count more)) "left")
+                  (js/Promise.resolve n))
+              :else
+              (-> ((:hold-remote! store) (b/hold-path signer cid) cid fetch-timeout)
+                  (.catch (fn [_]
+                            (-> (redial! opts)
+                                (.then (fn [_] ((:hold-remote! store) (b/hold-path signer cid) cid fetch-timeout))))))
+                  (.then (fn [_] (step more (inc n))))
+                  (.catch (fn [e] (println "copy failed" cid (g/message e)) (step more n))))))]
+    (step cids 0)))
+
+(defn- mirror-heads! [{:keys [source]} store suffix]
+  (-> (js/Promise.all #js [(fetch-json (str source "/v1/heads/" suffix)) ((:heads store) suffix)])
+      (.then (fn [[remote local]]
+               (let [newer (filter (fn [[name rec]] (> (get rec "seq") (get-in local [name "seq"] 0)))
+                                   (get remote "heads"))]
+                 (.then (js/Promise.all (clj->js (map (fn [[name rec]] ((:put-head! store) suffix name rec)) newer)))
+                        (fn [_] (count newer))))))))
+
+(defn- mirror-signer! [{:keys [source] :as opts} store signer]
+  (let [suffix (subs signer 8)
+        summary (atom {:signer signer})]
+    (-> (js/Promise.all #js [(fetch-json (str source "/v1/holds/" suffix)) ((:holds store) suffix)])
+        (.then (fn [[listing local]]
+                 (let [{:keys [copy release]} (plan (get listing "cids") local)]
+                   (swap! summary assoc :held (count (get listing "cids")) :released (count release))
+                   (-> (copy-all! opts store signer copy)
+                       (.then (fn [copied]
+                                (swap! summary assoc :copied copied)
+                                (js/Promise.all (clj->js (map #((:release! store) (b/hold-path signer %)) release)))))))))
+        (.then (fn [_] (mirror-heads! opts store suffix)))
+        (.then (fn [n] (swap! summary assoc :heads n) @summary)))))
+
+(defn round! [opts store]
+  (-> (js/Promise.all (clj->js (map #(-> (mirror-signer! opts store %)
+                                         (.catch (fn [e] {:signer % :error (g/message e)})))
+                                    (:signers opts))))
+      (.then (fn [results]
+               (doseq [r results] (println (js/JSON.stringify (clj->js r))))
+               results))))
+
+(defn- flags [k] (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k)))) (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))
+        opts {:source (some-> (one "--source") (str/replace #"/+$" ""))
+              :signers (vec (flags "--signer"))
+              :ipfs-path (one "--ipfs-path")
+              :min-free-bytes (js/parseInt (or (one "--min-free-bytes") "30000000000") 10)
+              :fetch-timeout (js/parseInt (or (one "--fetch-timeout") "120") 10)
+              :source-peers (vec (flags "--source-peer"))}
+        loop-s (some-> (one "--loop") (js/parseInt 10))]
+    (when-not (and (:source opts) (seq (:signers opts)) (:ipfs-path opts) (one "--ipfs-bin") (one "--state-dir"))
+      (println "REFUSED: --source, --signer, --ipfs-bin, --ipfs-path and --state-dir are required") (js/process.exit 2))
+    (doseq [d (:signers opts)] (g/ed25519-pub-of-did d))
+    (let [store (b/kubo-store (one "--ipfs-bin") (:ipfs-path opts) (one "--state-dir"))
+          env (doto (js/Object.assign #js {} (aget js/process "env")) (aset "IPFS_PATH" (:ipfs-path opts)))
+          opts (assoc opts :ipfs (fn [args] (.then (js/Promise.resolve nil)
+                                                   (fn [_] (.spawnSync (js/require "node:child_process") (one "--ipfs-bin") (clj->js args)
+                                                                       #js {:env env :timeout 30000})))))]
+      (if loop-s
+        (letfn [(tick [] (-> (round! opts store) (.finally #(js/setTimeout tick (* 1000 loop-s)))))] (tick))
+        (.then (round! opts store) #(js/process.exit 0))))))
+
+(when (some #(str/ends-with? % "block_mirror.cljk") (array-seq (aget js/process "argv")))
+  (main))

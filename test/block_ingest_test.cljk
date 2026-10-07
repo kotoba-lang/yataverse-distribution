@@ -115,4 +115,5 @@
                  (println (if (zero? @failures) "block-ingest gate: passed" (str "block-ingest gate: " @failures " failure(s)")))
                  (js/process.exit (if (zero? @failures) 0 1)))))))
 
-(run)
+(when (some #(str/ends-with? % "block_ingest_test.cljk") (array-seq (aget js/process "argv")))
+  (run))

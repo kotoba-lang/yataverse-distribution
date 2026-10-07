@@ -36,7 +36,7 @@
 ;; usage (node <release>/engine/cli.js --classpath deploy deploy/block_ingest.cljk ...):
 ;;   --allow=did:key:... ... --ipfs-bin=PATH --ipfs-path=DIR
 ;;   [--host=127.0.0.1] [--port=18140] [--max-block-bytes=16777216]
-;;   [--max-skew=300] [--max-concurrent-puts=4] [--rate=20] [--burst=40]
+;;   [--max-skew=300] [--max-concurrent-puts=4] [--rate=20] [--burst=40] [--state-dir=DIR (heads)]
 ;;
 ;; Exposure (2026-10-07): xavier has no root for nginx, so the service listens
 ;; on 0.0.0.0:18140 and the router forwards that port (UPnP, xavier user; see
@@ -100,12 +100,32 @@
                                                :err (str (js/Buffer.concat err))})))
        (if stdin (.end (.-stdin child) stdin) (.end (.-stdin child)))))))
 
+(def fs (js/require "node:fs"))
+(def path-mod (js/require "node:path"))
+
+(defn file-heads
+  "Heads kept as one JSON file per signer under `state-dir`:
+   {:head (fn [suffix name]) :heads (fn [suffix]) :put-head! (fn [suffix name rec])}."
+  [state-dir]
+  (let [file #(.join path-mod state-dir "heads" (str % ".json"))
+        read-all (fn [suffix] (try (g/parse-json (.readFileSync fs (file suffix) "utf8")) (catch :default _ {})))]
+    {:heads (fn [suffix] (js/Promise.resolve (read-all suffix)))
+     :head (fn [suffix name] (js/Promise.resolve (get (read-all suffix) name)))
+     :put-head! (fn [suffix name rec]
+                  (let [f (file suffix) tmp (str f ".tmp")]
+                    (.mkdirSync fs (.dirname path-mod f) #js {:recursive true})
+                    (.writeFileSync fs tmp (g/canonical-str (assoc (read-all suffix) name rec)))
+                    (.renameSync fs tmp f)
+                    (js/Promise.resolve nil)))}))
+
 (defn kubo-store
   "The store over a Kubo CLI: put the block, hold it in MFS, release, read
-   offline. Every function returns a Promise."
-  [ipfs-bin ipfs-path]
+   offline, list a signer's holds; heads live in `state-dir`. Every function
+   returns a Promise."
+  [ipfs-bin ipfs-path & [state-dir]]
   (let [env (doto (js/Object.assign #js {} (aget js/process "env")) (aset "IPFS_PATH" ipfs-path))
         ipfs (fn [args & [stdin]] (run ipfs-bin env args stdin))]
+    (merge
     {:put! (fn [buf]
              (-> (ipfs ["block" "put" "--cid-codec=raw" "--mhtype=sha2-256" "--allow-big-block"] buf)
                  (.then (fn [{:keys [code out err]}]
@@ -118,7 +138,24 @@
                            (when-not (or (zero? code) (str/includes? err "already has entry"))
                              (throw (g/unmeasured (str "files cp: " (str/trim err)))))))))
      :release! (fn [p] (.then (ipfs ["files" "rm" p]) #(zero? (:code %))))
-     :get (fn [cid] (.then (ipfs ["block" "get" "--offline" cid]) #(when (zero? (:code %)) (:out %))))}))
+     :get (fn [cid] (.then (ipfs ["block" "get" "--offline" cid]) #(when (zero? (:code %)) (:out %))))
+     :holds (fn [suffix]
+              (.then (ipfs ["files" "ls" (str "/block-ingest/" suffix)])
+                     (fn [{:keys [code out]}]
+                       (if (zero? code)
+                         (vec (sort (filter #(re-matches raw-cid-re %) (str/split-lines (str out)))))
+                         []))))
+     ;; mirror helpers: hold a block that is (or will be, via bitswap) in Kubo
+     :hold-remote! (fn [p cid timeout-s]
+                     (-> (ipfs ["files" "mkdir" "-p" (subs p 0 (str/last-index-of p "/"))])
+                         (.then (fn [_] (ipfs ["block" "stat" (str "--timeout=" timeout-s "s") cid])))
+                         (.then (fn [{:keys [code err]}]
+                                  (when-not (zero? code) (throw (g/unmeasured (str "fetch " cid ": " (str/trim err)))))
+                                  (ipfs ["files" "cp" (str "/ipfs/" cid) p])))
+                         (.then (fn [{:keys [code err]}]
+                                  (when-not (or (zero? code) (str/includes? err "already has entry"))
+                                    (throw (g/unmeasured (str "files cp: " (str/trim err)))))))))}
+    (when state-dir (file-heads state-dir)))))
 
 ;; ── requests ────────────────────────────────────────────────────────────────
 
@@ -185,6 +222,63 @@
         (swap! buckets assoc addr {:tokens (if ok (dec tokens) tokens) :at now-ms})
         ok))))
 
+;; ── heads and holds ─────────────────────────────────────────────────────────
+;; A head is a signer's mutable name for one of its own held blocks -- what R2
+;; keys like `statement` were. PUT carries {"cid", "seq"} and is signed with the
+;; cid slot "head/<name>/<seq>/<cid>"; seq must grow, and the block must be held
+;; by the same signer, so a head never points at bytes the fleet lacks and can
+;; never be rolled back. GETs are public. /v1/holds/<signer> lists the CIDs a
+;; signer holds (ciphertext addresses; what block_mirror.cljk copies).
+
+(def head-name-re #"[a-z0-9][a-z0-9._-]{0,63}")
+(def signer-suffix-re #"z6Mk[1-9A-HJ-NP-Za-km-z]{40,60}")
+
+(defn- head-message-slot [name seq cid] (str "head/" name "/" seq "/" cid))
+
+(defn handle-heads
+  "nil when `path` is not a heads/holds route, else Promise<response>."
+  [opts store now {:keys [method path headers body]}]
+  (let [holds (re-matches #"/v1/holds/([^/]+)" path)
+        heads (re-matches #"/v1/heads/([^/]+)" path)
+        head (re-matches #"/v1/heads/([^/]+)/([^/]+)" path)]
+    (cond
+      (and holds (= method "GET"))
+      (let [suffix (second holds)]
+        (if-not (re-matches signer-suffix-re suffix)
+          (js/Promise.resolve (json 400 {"refused" "not a did:key suffix"}))
+          (.then ((:holds store) suffix) #(json 200 {"signer" (str "did:key:" suffix) "cids" %}))))
+
+      (and head (= method "GET"))
+      (let [[_ suffix name] head]
+        (if-not (and (re-matches signer-suffix-re suffix) (re-matches head-name-re name))
+          (js/Promise.resolve (json 400 {"refused" "bad signer or head name"}))
+          (.then ((:head store) suffix name) #(if % (json 200 %) (json 404 {"refused" "no such head"})))))
+
+      (and heads (= method "GET") (re-matches signer-suffix-re (second heads)))
+      (.then ((:heads store) (second heads)) #(json 200 {"signer" (str "did:key:" (second heads)) "heads" %}))
+
+      (and heads (= method "PUT"))
+      (let [name (second heads)
+            rec (try (g/parse-json (str body)) (catch :default _ nil))
+            cid (get rec "cid") seq (get rec "seq")]
+        (cond
+          (not (re-matches head-name-re name)) (js/Promise.resolve (json 400 {"refused" "bad head name"}))
+          (not (and (string? cid) (re-matches raw-cid-re cid) (js/Number.isInteger seq) (pos? seq)))
+          (js/Promise.resolve (json 400 {"refused" "body must be {\"cid\": raw cid, \"seq\": positive integer}"}))
+          :else
+          (if-let [[status reason] (authorize opts "PUT" (head-message-slot name seq cid) headers now)]
+            (js/Promise.resolve (json status {"refused" reason}))
+            (let [signer (get headers "x-kotoba-signer") suffix (subs signer 8)]
+              (-> (js/Promise.all #js [((:held? store) (hold-path signer cid)) ((:head store) suffix name)])
+                  (.then (fn [[held current]]
+                           (cond
+                             (not held) (json 409 {"refused" "the head must name a block this signer holds"})
+                             (and current (<= seq (get current "seq"))) (json 409 {"refused" "seq must grow" "current" current})
+                             :else (let [r {"cid" cid "seq" seq "at" now}]
+                                     (.then ((:put-head! store) suffix name r) (fn [_] (json 200 r))))))))))))
+
+      :else nil)))
+
 ;; ── server ──────────────────────────────────────────────────────────────────
 
 (defn- headers-of [^js req]
@@ -223,7 +317,8 @@
               addr (str (.. req -socket -remoteAddress))
               now (js/Math.floor (/ (js/Date.now) 1000))
               go (fn [body]
-                   (-> (handle opts store now {:method method :path path :headers (headers-of req) :body body})
+                   (-> (let [r {:method method :path path :headers (headers-of req) :body body}]
+                         (or (handle-heads opts store now r) (handle opts store now r)))
                        (.catch (fn [e] {:status (if (= :unmeasured (g/kind e)) 503 500) :json {"unmeasured" (g/message e)}}))
                        (.then #(reply res %))))]
           (cond
@@ -253,7 +348,7 @@
               :burst (js/parseFloat (or (one "--burst") "40"))}]
     (when (empty? (:allow opts)) (println "REFUSED: at least one --allow=did:key:... is required") (js/process.exit 2))
     (doseq [d (:allow opts)] (g/ed25519-pub-of-did d))
-    (serve! opts (kubo-store (one "--ipfs-bin") (one "--ipfs-path")))
+    (serve! opts (kubo-store (one "--ipfs-bin") (one "--ipfs-path") (or (one "--state-dir") ".")))
     (println (str "block-ingest on " (:host opts) ":" (:port opts) ", " (count (:allow opts)) " signer(s)"))))
 
 (when (some #(str/ends-with? % "block_ingest.cljk") (array-seq (aget js/process "argv")))
