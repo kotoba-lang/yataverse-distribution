@@ -239,8 +239,10 @@ def handler(writer):
             try:
                 return self.reply(200, {"committed": writer.write(graph, expected, head)})
             except Conflict as c:
+                sys.stderr.write(f"CONFLICT {graph[:14]} expected {expected} head {head.get('sequence')} current {c.current}\n")
                 return self.reply(409, {"conflict": c.current})
             except gm.Refused as e:
+                sys.stderr.write(f"REFUSED {graph[:14]} expected {expected} head {head.get('sequence') if isinstance(head, dict) else '?'}: {e}\n")
                 return self.reply(403, {"refused": str(e)[:200]})
             except Exception as e:
                 return self.reply(503, {"unmeasured": str(e)[:200]})
