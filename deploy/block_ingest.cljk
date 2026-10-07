@@ -36,7 +36,13 @@
 ;; usage (node <release>/engine/cli.js --classpath deploy deploy/block_ingest.cljk ...):
 ;;   --allow=did:key:... ... --ipfs-bin=PATH --ipfs-path=DIR
 ;;   [--host=127.0.0.1] [--port=18140] [--max-block-bytes=16777216]
-;;   [--max-skew=300] [--max-concurrent-puts=4]
+;;   [--max-skew=300] [--max-concurrent-puts=4] [--rate=20] [--burst=40]
+;;
+;; Exposure (2026-10-07): xavier has no root for nginx, so the service listens
+;; on 0.0.0.0:18140 and the router forwards that port (UPnP, xavier user; see
+;; xavier-block-ingest-upnp.*). Plain HTTP is enough for this protocol: writes
+;; are signed and bound to their CID, reads are checked against the CID, and
+;; murakumo encrypts every part before it is written.
 
 (ns block-ingest
   (:require [clojure.string :as str]
@@ -164,6 +170,21 @@
 
       :else (js/Promise.resolve (json 405 {"refused" "method not allowed"})))))
 
+;; ── rate limit ──────────────────────────────────────────────────────────────
+;; Served directly on a router port (UPnP) rather than behind nginx, so the
+;; per-address limit nginx gave the writer lives here: a token bucket of
+;; --burst requests refilled at --rate per second, per remote address.
+
+(defn limiter [rate burst]
+  (let [buckets (atom {})]
+    (fn [addr now-ms]
+      (let [{:keys [tokens at]} (get @buckets addr {:tokens burst :at now-ms})
+            tokens (min burst (+ tokens (* rate (/ (- now-ms at) 1000))))
+            ok (>= tokens 1)]
+        (when (> (count @buckets) 10000) (reset! buckets {}))
+        (swap! buckets assoc addr {:tokens (if ok (dec tokens) tokens) :at now-ms})
+        ok))))
+
 ;; ── server ──────────────────────────────────────────────────────────────────
 
 (defn- headers-of [^js req]
@@ -191,26 +212,31 @@
       (.end res s))))
 
 (defn serve! [opts store]
-  (let [inflight (atom 0)]
+  (let [inflight (atom 0)
+        allow? (limiter (:rate opts) (:burst opts))]
     (.listen
      (.createServer
       http
       (fn [^js req ^js res]
         (let [method (.-method req)
               path (first (str/split (.-url req) #"\?"))
+              addr (str (.. req -socket -remoteAddress))
               now (js/Math.floor (/ (js/Date.now) 1000))
               go (fn [body]
                    (-> (handle opts store now {:method method :path path :headers (headers-of req) :body body})
                        (.catch (fn [e] {:status (if (= :unmeasured (g/kind e)) 503 500) :json {"unmeasured" (g/message e)}}))
                        (.then #(reply res %))))]
-          (if (= method "PUT")
+          (cond
+            (not (allow? addr (js/Date.now)))
+            (reply res {:status 429 :json {"refused" "rate limited"}})
+            (= method "PUT")
             (if (>= @inflight (:max-concurrent-puts opts))
               (reply res {:status 503 :json {"unmeasured" "too many concurrent writes"}})
               (do (swap! inflight inc)
                   (-> (read-body req (:max-block-bytes opts))
                       (.then (fn [b] (if (= b :too-large) (reply res {:status 413 :json {"refused" "block too large"}}) (go b))))
                       (.finally #(swap! inflight dec)))))
-            (go nil)))))
+            :else (go nil)))))
      (:port opts) (:host opts))))
 
 (defn- flags [k] (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k)))) (array-seq (aget js/process "argv"))))
@@ -222,7 +248,9 @@
               :port (js/parseInt (or (one "--port") "18140") 10)
               :max-block-bytes (js/parseInt (or (one "--max-block-bytes") (str default-max-block-bytes)) 10)
               :max-skew (js/parseInt (or (one "--max-skew") "300") 10)
-              :max-concurrent-puts (js/parseInt (or (one "--max-concurrent-puts") "4") 10)}]
+              :max-concurrent-puts (js/parseInt (or (one "--max-concurrent-puts") "4") 10)
+              :rate (js/parseFloat (or (one "--rate") "20"))
+              :burst (js/parseFloat (or (one "--burst") "40"))}]
     (when (empty? (:allow opts)) (println "REFUSED: at least one --allow=did:key:... is required") (js/process.exit 2))
     (doseq [d (:allow opts)] (g/ed25519-pub-of-did d))
     (serve! opts (kubo-store (one "--ipfs-bin") (one "--ipfs-path")))
