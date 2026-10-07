@@ -1,0 +1,171 @@
+;; deploy/export_lake_car_from_kubo.cljk — export exact inventory blocks from
+;; a local Kubo repository as a bounded CARv1 (ADR-2610062000). Ported from
+;; export_lake_car_from_kubo.py; the CAR bytes are identical.
+;;
+;; The header names every block's CID as a root (dag-cbor {roots, version:1};
+;; CIDv0 inventory rows are carried as CIDv1 dag-pb). Each block is read
+;; offline (RPC or CLI), checked against the CID digest and the inventory size,
+;; and the CAR is written through a temp file and linked into place only when
+;; complete; a receipt records its sha256.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> export_lake_car_from_kubo.cljk ...):
+;;   --inventory=F --sha256=HEX --count=N --start-row=N --max-blocks=N --max-bytes=N
+;;   --ipfs-bin=PATH --ipfs-path=DIR [--rpc-url=http://127.0.0.1:PORT] --output=F --receipt=F [--min-free-bytes=50000000000]
+;; Exit codes: 0 exported (the receipt is printed); 2 refused.
+
+(ns export-lake-car-from-kubo
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [lake-kubo :as k]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def nc (js/require "node:crypto"))
+(def cp (js/require "node:child_process"))
+
+(def ^:private b32 "abcdefghijklmnopqrstuvwxyz234567")
+(defn- refuse [msg] (throw (ex-info msg {:kind :export})))
+
+(defn varint [n]
+  (loop [n n out []]
+    (if (>= n 128) (recur (js/Math.floor (/ n 128)) (conj out (bit-or (mod n 128) 128))) (js/Buffer.from (clj->js (conj out n))))))
+
+(defn- read-varint [buf o]
+  (loop [o o v 0 shift 0]
+    (when (or (>= o (.-length buf)) (> shift 63)) (refuse "invalid CID varint"))
+    (let [b (aget buf o) v (+ v (* (bit-and b 127) (js/Math.pow 2 shift)))]
+      (if (< b 128) [v (inc o)] (recur (inc o) v (+ shift 7))))))
+
+(defn cid-bytes
+  "-> [binary CIDv1 bytes, sha2-256 digest]. CIDv0 becomes CIDv1 dag-pb."
+  [cid]
+  (when-not (re-matches k/cid-re cid) (refuse "invalid inventory CID"))
+  (let [data (if (str/starts-with? cid "Qm")
+               (js/Buffer.concat #js [(js/Buffer.from #js [0x01 0x70]) (g/b58-decode cid)])
+               (let [bits (apply str (map #(.padStart (.toString (.indexOf b32 %) 2) 5 "0") (subs cid 1)))]
+                 (js/Buffer.from (clj->js (map #(js/parseInt (apply str %) 2) (partition 8 bits))))))
+        [version o] (read-varint data 0)
+        [codec o] (read-varint data o)
+        [hcode o] (read-varint data o)
+        [hlen o] (read-varint data o)]
+    (when-not (and (= 1 version) (#{0x55 0x70 0x71 0x129} codec) (= 0x12 hcode) (= 32 hlen) (= (.-length data) (+ o 32)))
+      (refuse "unsupported inventory CID"))
+    [data (.subarray data o)]))
+
+(defn- cbor-length [major n]
+  (cond (< n 24) [(bit-or (bit-shift-left major 5) n)]
+        (< n 256) [(bit-or (bit-shift-left major 5) 24) n]
+        (< n 65536) [(bit-or (bit-shift-left major 5) 25) (bit-shift-right n 8) (bit-and n 255)]
+        :else [(bit-or (bit-shift-left major 5) 26) (bit-and (js/Math.floor (/ n 16777216)) 255)
+               (bit-and (bit-shift-right n 16) 255) (bit-and (bit-shift-right n 8) 255) (bit-and n 255)]))
+
+(defn- root-link
+  "A dag-cbor CID link: tag 42 over the bytes 0x00 ++ binary CID."
+  [cid]
+  (js/Buffer.concat (clj->js [(js/Buffer.from (clj->js (concat [0xd8 0x2a] (cbor-length 2 (inc (.-length cid))) [0]))) cid])))
+
+(defn car-header
+  "DAG-CBOR {\"roots\": [CID links], \"version\": 1}, length-prefixed."
+  [cids]
+  (let [header (js/Buffer.concat (clj->js [(js/Buffer.from (clj->js [0xa2 0x65])) (js/Buffer.from "roots")
+                                           (js/Buffer.from (clj->js (cbor-length 4 (count cids))))
+                                           (js/Buffer.concat (clj->js (map root-link cids)))
+                                           (js/Buffer.from (clj->js [0x67])) (js/Buffer.from "version") (js/Buffer.from (clj->js [0x01]))]))]
+    (js/Buffer.concat (clj->js [(varint (.-length header)) header]))))
+
+(defn selected-rows
+  "Contiguous rows from `start` within the block and byte bounds (each block
+   counts 1 KiB of CAR overhead); the whole file must match its identity."
+  [p expected-sha expected-count start max-blocks max-bytes]
+  (let [buf (.readFileSync fs p)
+        lines (vec (remove str/blank? (str/split (.toString buf "utf8") #"\n")))]
+    (when-not (and (= expected-sha (-> (.createHash nc "sha256") (.update buf) (.digest "hex"))) (= expected-count (count lines)))
+      (refuse "inventory identity differs from dated snapshot"))
+    (let [rows (loop [i start rows [] total 0]
+                 (if (or (>= i (min (count lines) (+ start max-blocks)))) rows
+                     (let [row (try (js/JSON.parse (nth lines i)) (catch :default _ (refuse "invalid inventory row")))
+                           cid (.-cid row) size (.-bytes row)]
+                       (when-not (and (string? cid) (re-matches k/cid-re cid) (js/Number.isInteger size)) (refuse "invalid inventory CID or size"))
+                       (if (or (> size 8000000) (< size 1) (> (+ total size (* 1024 (inc (count rows)))) max-bytes))
+                         (if (empty? rows) (refuse "first block exceeds CAR bounds") rows)
+                         (recur (inc i) (conj rows [cid size]) (+ total size))))))]
+      (when (empty? rows) (refuse "empty inventory range"))
+      rows)))
+
+(defn- rpc-block [rpc-url cid size]
+  (let [u (js/URL. rpc-url)
+        r (.spawnSync cp "curl" (clj->js ["-s" "-X" "POST" "--max-time" "60"
+                                          (str (.-origin u) "/api/v0/block/get?arg=" (js/encodeURIComponent cid) "&offline=true")])
+                      #js {:maxBuffer (+ size 2)})]
+    (when-not (and (zero? (.-status r)) (= size (.-length (.-stdout r)))) (refuse (str "local Kubo RPC block unavailable or wrong size: " cid)))
+    (.-stdout r)))
+
+(defn export! [{:keys [inventory sha256 count start-row max-blocks max-bytes ipfs-bin ipfs-path rpc-url output receipt min-free-bytes]}]
+  (when-not (and (re-matches k/sha256-re (str sha256)) (>= count 1) (>= start-row 0) (<= 1 max-blocks 1000) (<= 1 max-bytes 536870912))
+    (refuse "invalid inventory identity or bounds"))
+  (when-not (and (.existsSync fs ipfs-bin) (.existsSync fs ipfs-path)) (refuse "Kubo binary or repository is absent"))
+  (let [rows (selected-rows inventory sha256 count start-row max-blocks max-bytes)]
+    (.mkdirSync fs (.dirname path output) #js {:recursive true})
+    (.mkdirSync fs (.dirname path receipt) #js {:recursive true})
+    (if (.existsSync fs receipt)
+      (let [saved (g/parse-json (.readFileSync fs receipt "utf8"))]
+        (when-not (and (.existsSync fs output) (= "complete" (get saved "status")) (= sha256 (get saved "inventory-sha256"))
+                       (= start-row (get saved "start-row")) (= (+ start-row (clojure.core/count rows)) (get saved "end-row"))
+                       (= (clojure.core/count rows) (get saved "blocks")) (= (get saved "sha256") (k/sha256-file output)))
+          (refuse "saved CAR differs from receipt"))
+        saved)
+      (do
+        (when (.existsSync fs output) (refuse "CAR exists without receipt"))
+        (when (< (k/free-bytes (.dirname path output)) (+ (* 2 max-bytes) min-free-bytes)) (refuse "physical disk reserve would be crossed"))
+        (let [env (doto (js/Object.assign #js {} (aget js/process "env")) (aset "IPFS_PATH" (.resolve path ipfs-path)))
+              stat (k/kubo! ipfs-bin env ["repo" "stat"] :timeout-s 30)
+              repo-path (some #(when (str/starts-with? % "RepoPath:") (str/trim (subs % 9))) (str/split-lines stat))]
+          (when-not (and repo-path (= (.resolve path repo-path) (.resolve path ipfs-path))) (refuse "Kubo daemon uses a different repository"))
+          (let [encoded (mapv (comp cid-bytes first) rows)
+                tmp (str output "." (.replace (.randomUUID nc) (js/RegExp. "-" "g") "") ".partial")
+                fd (.openSync fs tmp "wx")
+                h (.createHash nc "sha256")
+                written (atom 0)
+                write! (fn [b] (swap! written + (.-length b))
+                         (when (> @written max-bytes) (refuse "CAR exceeds byte budget"))
+                         (.writeSync fs fd b) (.update h b))]
+            (try
+              (write! (car-header (map first encoded)))
+              (doseq [[[cid size] [bin digest]] (map vector rows encoded)]
+                (let [data (if rpc-url (rpc-block rpc-url cid size)
+                               (let [r (.spawnSync cp ipfs-bin #js ["--offline" "block" "get" cid] #js {:env env :timeout 60000 :maxBuffer (+ size 2)})]
+                                 (when-not (zero? (.-status r)) (refuse (str "local Kubo block unavailable: " cid)))
+                                 (.-stdout r)))]
+                  (when-not (and (= size (.-length data)) (.equals (-> (.createHash nc "sha256") (.update data) (.digest)) digest))
+                    (refuse "local block differs from inventory CID or size"))
+                  (write! (varint (+ (.-length bin) (.-length data))))
+                  (write! bin)
+                  (write! data)))
+              (.fsyncSync fs fd)
+              (.closeSync fs fd)
+              (.linkSync fs tmp output)
+              (let [rec {"status" "complete" "inventory-sha256" sha256 "start-row" start-row "end-row" (+ start-row (clojure.core/count rows))
+                         "blocks" (clojure.core/count rows) "bytes" @written "sha256" (.digest h "hex")
+                         "source" (if rpc-url "local-kubo-offline-rpc" "local-kubo-offline")}]
+                (k/write-receipt! receipt rec)
+                rec)
+              (finally
+                (try (.closeSync fs fd) (catch :default _ nil))
+                (try (.unlinkSync fs tmp) (catch :default _ nil))))))))))
+
+(defn- flag [kk] (some #(when (str/starts-with? % (str kk "=")) (subs % (inc (clojure.core/count kk)))) (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (try
+    (println (g/py-json-str
+              (export! {:inventory (flag "--inventory") :sha256 (flag "--sha256") :count (js/parseInt (flag "--count") 10)
+                        :start-row (js/parseInt (flag "--start-row") 10) :max-blocks (js/parseInt (flag "--max-blocks") 10)
+                        :max-bytes (js/parseInt (flag "--max-bytes") 10) :ipfs-bin (flag "--ipfs-bin") :ipfs-path (flag "--ipfs-path")
+                        :rpc-url (flag "--rpc-url") :output (flag "--output") :receipt (flag "--receipt")
+                        :min-free-bytes (js/parseInt (or (flag "--min-free-bytes") "50000000000") 10)})))
+    (catch :default e
+      (.write js/process.stderr (str "REFUSED: " (g/message e) "\n"))
+      (js/process.exit 2))))
+
+(when (some #(str/ends-with? % "export_lake_car_from_kubo.cljk") (array-seq (aget js/process "argv")))
+  (main))

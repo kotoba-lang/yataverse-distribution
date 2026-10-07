@@ -1,0 +1,176 @@
+;; deploy/audit_lake.cljk — count durable local lake pins against an
+;; immutable inventory snapshot (ADR-2610062000). Ported from audit_lake.py;
+;; the report has the same fields and values.
+;;
+;; A coverage audit, not a content readback (verify_lake_leaves does that).
+;;
+;; Receipt mode (--car-receipts, --large-receipts, --ipfs-path): a row counts
+;; when a CAR / native / large-recovery receipt binds it to the inventory and
+;; that receipt's root is still recursively pinned and still reads back as the
+;; exact batch record; or when the row's CID is itself pinned direct or
+;; recursive; or when the raw block store holds it with the inventory size.
+;; Receipt names are frozen before pins are listed: a receipt written after
+;; the pin snapshot would otherwise look unpinned.
+;;
+;; Inventory mode: a row counts when its CID is pinned (direct, recursive or
+;; indirect) or held in the raw store.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> audit_lake.cljk ...):
+;;   --inventory=F --sha256=HEX --count=N --ipfs-bin=PATH [--raw-block-store=DIR]
+;;   [--car-receipts=DIR --large-receipts=DIR [--native-receipts=DIR ...] --ipfs-path=DIR] [--require-complete]
+;; Exit codes: 0 audited (the report is printed); 1 --require-complete and partial; 2 refused.
+
+(ns audit-lake
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [lake-inventory :as li]
+            [lake-kubo :as k]
+            [raw-block-store :as r]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+
+(defn- refuse [msg] (throw (ex-info msg {:kind :audit})))
+
+(defn pins-of-type [bin env pin-type]
+  (let [r (.spawnSync cp bin #js ["pin" "ls" (str "--type=" pin-type)] #js {:env env :timeout 600000 :maxBuffer (* 2 1024 1024 1024) :encoding "utf8"})]
+    (when (.-error r) (refuse (str "Kubo pin listing could not run: " pin-type)))
+    (when-not (zero? (.-status r)) (refuse (str "Kubo pin listing failed: " pin-type)))
+    (let [pins (js/Set.)]
+      (doseq [line (str/split-lines (str (.-stdout r))) :when (seq line)]
+        (let [[cid t & more] (str/split line #"\s+")]
+          (when-not (and (nil? more) (re-matches k/cid-re (str cid)) (= pin-type t)) (refuse "Kubo pin listing has invalid line"))
+          (.add pins cid)))
+      pins)))
+
+(defn- receipt-paths [dir re]
+  (if-not dir [] (vec (sort (filter #(re-matches re %) (array-seq (.readdirSync fs dir)))))))
+
+(defn- expected-root [sha start end rows]
+  {"schema" 1 "inventory-sha256" sha "start-row" start "end-row" end "links" (mapv (fn [row] {"/" (get row "cid")}) rows)})
+
+(defn audit-receipts
+  [inv car-dir large-dir native-dirs ipfs-path recursive direct raw-root root-reader [car-files large-files native-files]]
+  (let [n (li/row-count inv)
+        covered (js/Uint8Array. n)
+        repo (.resolve path ipfs-path)
+        tally (atom {:car 0 :native 0 :large 0 :direct 0 :raw 0 :unpinned-car 0 :unpinned-native 0 :unpinned-large 0})
+        bound (fn [kind dir f re extra-ok]
+                (let [m (re-matches re f)
+                      start (js/parseInt (nth m 1) 10) end (inc (js/parseInt (nth m 2) 10))]
+                  (when-not (and (<= 0 start) (< start end) (<= end n) (<= (- end start) 1000)) (refuse (str (name kind) " receipt range is invalid")))
+                  (let [[rows actual-end] (li/rows inv start (- end start))
+                        rec (g/parse-json (.readFileSync fs (.join path dir f) "utf8"))
+                        root (get rec "root")]
+                    (when-not (and (= end actual-end) (= "complete" (get rec "status")) (= (:sha256 inv) (get rec "inventory_sha256"))
+                                   (= start (get rec "start_row")) (= end (get rec "end_row")) (= (count rows) (get rec "blocks"))
+                                   (= (reduce + 0 (map #(get % "size") rows)) (get rec "bytes")) (= repo (get rec "repository"))
+                                   (string? root) (re-matches k/cid-re root) (extra-ok rec))
+                      (refuse (str (name kind) " receipt differs from inventory: " f)))
+                    (if-not (.has recursive root)
+                      (swap! tally update (keyword (str "unpinned-" (name kind))) inc)
+                      (do (when-not (= (root-reader root) (expected-root (:sha256 inv) start end rows))
+                            (refuse (str "pinned " (name kind) " root differs from inventory: " root)))
+                          (doseq [i (range start end)] (aset covered i 1))
+                          (swap! tally update kind + (count rows)))))))]
+    (doseq [f car-files]
+      (bound :car car-dir f #"row-(\d+)-(\d+)-import\.json"
+             #(and (string? (get % "car_sha256")) (re-matches #"[0-9a-f]{64}" (get % "car_sha256")))))
+    (doseq [[dir f] native-files]
+      (bound :native dir f #"row-(\d+)-(\d+)-native\.json" #(and (string? (get % "source_peer")) (seq (get % "source_peer")))))
+    (doseq [f large-files]
+      (let [row (js/parseInt (second (re-matches #"row-(\d+)-jacob-import\.json" f)) 10)]
+        (when-not (and (<= 0 row) (< row n)) (refuse "large recovery row is invalid"))
+        (let [item (first (first (li/rows inv row 1)))
+              rec (g/parse-json (.readFileSync fs (.join path large-dir f) "utf8"))
+              root (get rec "recovery_root")]
+          (when-not (and (= "complete" (get rec "status")) (= row (get rec "row")) (= (:sha256 inv) (get rec "inventory_sha256"))
+                         (= (get item "cid") (get rec "original_cid")) (= (get item "size") (get rec "original_bytes"))
+                         (= (.toString (r/sha256-digest (get item "cid")) "hex") (get rec "original_sha256"))
+                         (= repo (get rec "repository")) (string? root) (re-matches k/cid-re root)
+                         (string? (get rec "car_sha256")) (re-matches #"[0-9a-f]{64}" (get rec "car_sha256")))
+            (refuse (str "large recovery receipt differs from inventory: " f)))
+          (if-not (.has recursive root)
+            (swap! tally update :unpinned-large inc)
+            (when (or (.has direct (get item "cid")) (.has recursive (get item "cid")))
+              (aset covered row 1)
+              (swap! tally update :large inc))))))
+    ;; over the union (Python's direct | recursive): a CID pinned both ways counts once
+    (doseq [cid (array-seq (js/Array.from (js/Set. (js/Array.prototype.concat.call (js/Array.from direct) (js/Array.from recursive)))))]
+      (when-let [row (.get (:positions inv) cid)]
+        (aset covered row 1)
+        (swap! tally update :direct inc)))
+    (when raw-root
+      (doseq [cid (r/cids raw-root)]
+        (when-let [row (.get (:positions inv) cid)]
+          (let [size (.get (:sizes inv) cid)
+                body (r/read-block raw-root cid size)]
+            (when-not (and body (= size (.-length body))) (refuse (str "raw block differs from inventory: " cid)))
+            (aset covered row 1)
+            (swap! tally update :raw inc)))))
+    (let [cov (atom [0 0]) missing (atom [])]
+      (.forEach (:positions inv) (fn [row cid]
+                                   (if (= 1 (aget covered row))
+                                     (swap! cov (fn [[r b]] [(inc r) (+ b (.get (:sizes inv) cid))]))
+                                     (when (< (count @missing) 3) (swap! missing conj cid)))))
+      (let [[rows bytes] @cov t @tally]
+        {"status" (if (= rows n) "complete" "partial") "inventory_rows" n "inventory_bytes" (:total-bytes inv)
+         "covered_rows" rows "covered_bytes" bytes "missing_rows" (- n rows) "missing_bytes" (- (:total-bytes inv) bytes)
+         "car_root_rows" (:car t) "native_root_rows" (:native t) "large_receipt_rows" (:large t)
+         "direct_pin_rows" (:direct t) "raw_rows" (:raw t) "unpinned_car_roots" (:unpinned-car t)
+         "unpinned_native_roots" (:unpinned-native t) "unpinned_large_roots" (:unpinned-large t)
+         "missing_sample" @missing "inventory_sha256" (:sha256 inv)
+         "scope" "receipt-and-current-root-pin-lower-bound-not-leaf-readback"}))))
+
+(defn audit-inventory [inventory sha count pins raw-root]
+  (let [inv (li/open-inventory inventory sha count)
+        raw (if raw-root (r/cids raw-root) #{})
+        t (atom {:pinned 0 :pinned-bytes 0 :raw 0 :raw-bytes 0}) missing (atom [])]
+    (doseq [i (range (li/row-count inv))]
+      (let [[[row] _] (li/rows inv i 1) cid (get row "cid") size (get row "size")]
+        (cond
+          (.has pins cid) (swap! t #(-> % (update :pinned inc) (update :pinned-bytes + size)))
+          (contains? raw cid) (let [b (r/read-block raw-root cid size)]
+                                (when-not (and b (= size (.-length b))) (refuse (str "raw block size differs from inventory: " cid)))
+                                (swap! t #(-> % (update :raw inc) (update :raw-bytes + size))))
+          (< (clojure.core/count @missing) 3) (swap! missing conj cid))))
+    (let [{:keys [pinned pinned-bytes raw raw-bytes]} @t miss (- (li/row-count inv) pinned raw)]
+      {"status" (if (zero? miss) "complete" "partial") "inventory_rows" (li/row-count inv) "inventory_bytes" (:total-bytes inv)
+       "pinned_rows" pinned "pinned_bytes" pinned-bytes "raw_rows" raw "raw_bytes" raw-bytes
+       "missing_rows" miss "missing_bytes" (- (:total-bytes inv) pinned-bytes raw-bytes)
+       "missing_sample" @missing "inventory_sha256" sha "scope" "durable-pins-plus-cid-verified-raw-blocks"})))
+
+(defn- flags [kk] (keep #(when (str/starts-with? % (str kk "=")) (subs % (inc (clojure.core/count kk)))) (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))
+        require-complete? (some #{"--require-complete"} (array-seq (aget js/process "argv")))
+        bin (one "--ipfs-bin") raw (one "--raw-block-store")
+        car (one "--car-receipts") large (one "--large-receipts") natives (vec (flags "--native-receipts")) ipfs-path (one "--ipfs-path")]
+    (try
+      (let [report
+            (if (or car large (seq natives) ipfs-path)
+              (do (when-not (and car large ipfs-path) (refuse "receipt audit requires both directories and Kubo repository"))
+                  (when-not (and (.existsSync fs car) (.existsSync fs large)) (refuse "receipt directory is absent"))
+                  (when (some #(not (.existsSync fs %)) natives) (refuse "native receipt directory is absent"))
+                  (let [env (k/verify-repo bin ipfs-path)
+                        inv (li/open-inventory (one "--inventory") (one "--sha256") (js/parseInt (one "--count") 10))
+                        files [(receipt-paths car #"row-\d+-\d+-import\.json")
+                               (receipt-paths large #"row-\d+-jacob-import\.json")
+                               (vec (for [d natives f (receipt-paths d #"row-\d+-\d+-native\.json")] [d f]))]]
+                    (audit-receipts inv car large natives ipfs-path (pins-of-type bin env "recursive") (pins-of-type bin env "direct") raw
+                                    (fn [root] (js->clj (js/JSON.parse (k/kubo! bin env ["--offline" "dag" "get" root] :timeout-s 60))))
+                                    files)))
+              (let [env (doto (js/Object.assign #js {} (aget js/process "env")))
+                    pins (js/Set.)]
+                (doseq [t ["direct" "recursive" "indirect"]] (.forEach (pins-of-type bin env t) #(.add pins %)))
+                (audit-inventory (one "--inventory") (one "--sha256") (js/parseInt (one "--count") 10) pins raw)))]
+        (println (g/py-json-str report))
+        (js/process.exit (if (and require-complete? (not= "complete" (get report "status"))) 1 0)))
+      (catch :default e
+        (.write js/process.stderr (str "REFUSED: " (g/message e) "\n"))
+        (js/process.exit 2)))))
+
+(when (some #(str/ends-with? % "audit_lake.cljk") (array-seq (aget js/process "argv")))
+  (main))

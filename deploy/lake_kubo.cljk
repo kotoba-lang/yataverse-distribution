@@ -1,0 +1,77 @@
+;; deploy/lake_kubo.cljk — the Kubo calls the lake's custody tools share
+;; (ADR-2610062000). Ported from import_lake_car.py's helpers.
+;;
+;;   kubo!          run `ipfs ...` against one repository; refuse on failure
+;;   verify-repo    the repository's own daemon answers (no block walk), -> env
+;;   verified-root  the batch root Kubo returns is exactly the expected record
+;;   batch-root     the dag-json record that pins a range of inventory CIDs
+;;                  under one durable root (CAR roots are CIDv1; inventories
+;;                  hold CIDv0 aliases, so the original links are pinned)
+
+(ns lake-kubo
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def nc (js/require "node:crypto"))
+
+(def cid-re #"(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,200})")
+(def sha256-re #"[0-9a-f]{64}")
+
+(defn refuse [msg] (throw (ex-info msg {:kind :kubo})))
+
+(defn kubo!
+  "-> stdout string; refuses on a non-zero exit or a timeout."
+  [bin env args & {:keys [input timeout-s] :or {timeout-s 300}}]
+  (let [r (.spawnSync cp bin (clj->js args) (clj->js (cond-> {:env env :timeout (* 1000 timeout-s) :maxBuffer (* 512 1024 1024)}
+                                                       input (assoc :input input))))]
+    (when (.-error r) (refuse (str "Kubo command failed: " (str/join " " (take 2 args)))))
+    (when-not (zero? (.-status r))
+      (refuse (str "Kubo refused " (str/join " " (take 2 args)) ": " (subs (str (.-stderr r)) 0 (min 300 (count (str (.-stderr r))))))))
+    (str (.-stdout r))))
+
+(defn verify-repo
+  "Match the selected repository to its running daemon. -> the env to use."
+  [bin repo-path]
+  (let [repo (.resolve path repo-path)
+        [peer api] (try [(.. (js/JSON.parse (.readFileSync fs (.join path repo "config") "utf8")) -Identity -PeerID)
+                         (str/trim (.readFileSync fs (.join path repo "api") "utf8"))]
+                        (catch :default _ (refuse "Kubo repository identity is unavailable")))]
+    (when-not (and (string? peer) (seq peer) (seq api)) (refuse "Kubo repository identity is invalid"))
+    (let [env (doto (js/Object.assign #js {} (aget js/process "env")) (aset "IPFS_PATH" repo))]
+      (when-not (= peer (str/trim (kubo! bin env ["id" "-f" "<id>"] :timeout-s 10)))
+        (refuse "Kubo daemon uses a different repository"))
+      env)))
+
+(defn batch-root
+  "The root record for inventory rows [start, start+count): key order as the
+   Python tools wrote it (dag put stores it canonically either way)."
+  [sha256 start cids]
+  (str "{\"schema\":1,\"inventory-sha256\":\"" sha256 "\",\"start-row\":" start ",\"end-row\":" (+ start (count cids))
+       ",\"links\":[" (str/join "," (map #(str "{\"/\":\"" % "\"}") cids)) "]}"))
+
+(defn verified-root [output expected-json]
+  (let [actual (try (js->clj (js/JSON.parse output)) (catch :default _ (refuse "Kubo returned invalid batch root JSON")))]
+    (when-not (= actual (js->clj (js/JSON.parse expected-json)))
+      (refuse "Kubo batch root differs from inventory links"))))
+
+(defn pin-root!
+  "dag put --pin the record, check it is recursively pinned and reads back. -> root CID."
+  [bin env record-json]
+  (let [root (str/trim (kubo! bin env ["dag" "put" "--pin"] :input record-json :timeout-s 600))]
+    (when-not (re-matches cid-re root) (refuse "Kubo returned an invalid batch root"))
+    (when-not (= (str root " recursive") (str/trim (kubo! bin env ["pin" "ls" "--type=recursive" root] :timeout-s 60)))
+      (refuse "batch root is not recursively pinned"))
+    (verified-root (kubo! bin env ["dag" "get" root] :timeout-s 60) record-json)
+    root))
+
+(defn free-bytes [p] (let [s (.statfsSync fs p)] (* (.-bavail s) (.-bsize s))))
+
+(defn sha256-file [p] (-> (.createHash nc "sha256") (.update (.readFileSync fs p)) (.digest "hex")))
+
+(defn write-receipt! [p record]
+  (.mkdirSync fs (.dirname path p) #js {:recursive true})
+  (.writeFileSync fs (str p ".partial") (str (g/py-json-str record) "\n") #js {:flag "wx"})
+  (.renameSync fs (str p ".partial") p))

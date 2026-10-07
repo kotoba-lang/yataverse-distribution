@@ -1475,3 +1475,18 @@ One difference: a non-GET request gets 405 where Python answered 501.
 **Side by side on main-2:** `/healthz` returned 200 from both, 5/5 R2 blocks were identical, and an unlisted CID got 404 from both. The live LaunchAgent (`cloud.yataverse.r2-bootstrap-bridge`, used by xavier's replicator through the reverse tunnel) now runs the cljk version, and `/healthz` verifies an R2 block end to end.
 
 This bridge is itself a Cloudflare dependency, kept until the replicas no longer bootstrap from R2. The Python file stays until `replicate_lake` is ported, because its test file covers both.
+
+### CAR lane in kotoba (2026-10-07)
+
+- **`deploy/lake_kubo.cljk`** holds the shared Kubo calls: run against one repository, match the daemon to its repository, and build, pin and verify the batch root.
+- **`deploy/import_lake_car.cljk`** and **`deploy/export_lake_car_from_kubo.cljk`** write the CARv1 header and blocks byte for byte as Python did.
+
+**Gates on real data:**
+
+- **Export on xavier** of epoch 4's 24 blocks: the kotoba CAR is byte-identical to Python's (sha256 `b5099ad9…`), through both the offline CLI and the RPC path, and the receipts are equal.
+- **Round trip, kotoba on both ends:** the kotoba CAR shipped to jacob and imported by the kotoba importer pinned root `bafyreibc43h…`, which is epoch 4's receipt root.
+- **Root alone:** rebuilding epoch 4's batch root from its rows through the cljk code on jacob also gives `bafyreibc43h…`.
+- **`deploy/ship_lake_car.cljk`** uses the remote-Kubo mode the cycle uses. Each end runs as kotoba: `--source-runner` and `--remote-runner` give the hosts' engine prefixes, and the raw-store check is `raw_block_store.cljk verify`.
+  - **End to end:** epoch 4's range was exported on xavier, carried through main-2 and imported on jacob, all in kotoba. The result was `shipped` with root `bafyreibc43h…` (epoch 4's), and the transient CARs were removed on both ends, leaving only the import receipt.
+- **`deploy/audit_lake.cljk`** provides the receipt audit and the inventory audit. Receipt names are frozen before pins are listed, and `direct_pin_rows` counts over the direct ∪ recursive union, as Python did. **On jacob**, over epoch 4's receipts, its report is byte-identical to Python's: 24/24 covered through the CAR root.
+- **`deploy/router_standby.cljk`** keeps the same guarded decision: three confirmed failures; no takeover while the primary still listens; no deletion of a working mapping without `--allow-router-cutover`; rollback when a replacement fails. `test/router_standby_test.cljk` ports the 6 Python cases. It runs on gad, which has been offline since 2026-10-02, so it is not deployed yet.

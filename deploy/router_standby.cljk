@@ -1,0 +1,139 @@
+;; deploy/router_standby.cljk — check the shared public HTTPS lease and
+;; perform explicitly enabled cutovers (ADR-2610062000). Ported from
+;; router_standby.py; runs on gad (the standby).
+;;
+;; The router returned 718 after removing 8443 during a 2026-09-26 drill and
+;; rejected both takeover and rollback for several minutes, so a timer never
+;; deletes a working mapping without --allow-router-cutover (supervised
+;; maintenance only). Takeover needs three consecutive primary failures, a
+;; standby that passes its own content check, and a primary that no longer
+;; accepts TCP on 443.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> router_standby.cljk ...):
+;;   [--apply] [--allow-router-cutover] [--state-dir=DIR]
+;; Exit codes: 0 checked (the decision is printed); 2 refused.
+
+(ns router-standby
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def nc (js/require "node:crypto"))
+(def net (js/require "node:net"))
+
+(def public-ip "220.146.170.114")
+(def xavier-ip "192.168.1.28")
+(def gad-ip "192.168.1.16")
+(def sites {"yataverse-data.220-146-170-114.sslip.io" "2fd28ac84111bd181090f4ea712f8988c80dbad9162edf52c108865a3b636e97"
+            "isekai-static.220-146-170-114.sslip.io" "5e3fc8703c96bbdb308974cb96559185bbd23748aa3a060ad973d5ca6385fe83"
+            "itonami-static.220-146-170-114.sslip.io" "1c1232c376f79e7e53af01ec7d85cfbfb2f4b9ee0691d4b2c1e600fcfbaa4539"})
+
+(defn- refuse [msg] (throw (ex-info msg {:kind :refused})))
+
+(defn command! [argv timeout-s]
+  (let [r (.spawnSync cp (first argv) (clj->js (rest argv)) #js {:timeout (* 1000 timeout-s)})]
+    (when (.-error r) (refuse (str "command unavailable: " (first argv))))
+    (when-not (zero? (.-status r)) (refuse (str "command failed: " (first argv))))
+    (.-stdout r)))
+
+(defn gateway-healthy? [ip]
+  (every? (fn [[host expected]]
+            (try (= expected (-> (.createHash nc "sha256")
+                                 (.update (command! ["curl" "-fLsS" "--noproxy" "*" "--connect-timeout" "2" "--max-time" "7"
+                                                     "--proto" "=https" "--resolve" (str host ":443:" ip) (str "https://" host "/")] 9))
+                                 (.digest "hex")))
+                 (catch :default _ false)))
+          sites))
+
+(defn router-mapping
+  "Pure. `upnpc -l` output -> the 8443 mapping's LAN target, or nil."
+  [text]
+  (let [ext (second (re-find #"(?m)^ExternalIPAddress\s*=\s*(\S+)\s*$" text))]
+    (when-not (= public-ip ext) (refuse "router public IPv4 differs from configured address"))
+    (let [ms (re-seq #"(?m)^\s*\d+\s+TCP\s+8443->([0-9.]+):(\d+)\b" text)]
+      (when (> (count ms) 1) (refuse "router has multiple HTTPS mappings"))
+      (when-let [[_ target port] (first ms)]
+        (when-not (and (#{xavier-ip gad-ip} target) (= "443" port)) (refuse "router HTTPS mapping has unexpected owner"))
+        target))))
+
+(defn decide
+  "Pure. -> the action."
+  [primary-healthy? standby-healthy? failures mapping primary-listener-active?]
+  (cond
+    primary-healthy? (if (not= mapping xavier-ip) "restore-primary" "keep-primary")
+    (< failures 3) "wait-for-confirmation"
+    primary-listener-active? (refuse "primary HTTPS listener is still active; renewal may contend")
+    (not standby-healthy?) (refuse "standby gateway failed its own content check")
+    :else (if (not= mapping gad-ip) "take-over" "renew-standby")))
+
+(defn require-cutover-opt-in [action allowed?]
+  (when (and (#{"restore-primary" "take-over"} action) (not allowed?))
+    (refuse "router cutover disabled after 8443 conflict; use --allow-router-cutover only during supervised maintenance")))
+
+(defn load-failures [p]
+  (if-not (.existsSync fs p)
+    0
+    (let [n (try (get (g/parse-json (.readFileSync fs p "utf8")) "consecutive-primary-failures") (catch :default _ (refuse "standby state unreadable")))]
+      (when-not (and (js/Number.isInteger n) (>= n 0)) (refuse "standby state has invalid failure count"))
+      n)))
+
+(defn save-failures [p n]
+  (.writeFileSync fs (str p ".tmp") (str (js/JSON.stringify #js {"consecutive-primary-failures" n}) "\n"))
+  (.renameSync fs (str p ".tmp") p))
+
+(defn set-mapping!
+  "Replace the 8443 mapping; a failed replacement restores the previous one."
+  [run! target current]
+  (when (and current (not= current target))
+    (run! ["upnpc" "-d" "8443" "TCP"])
+    (when (some? (router-mapping (str (run! ["upnpc" "-l"])))) (refuse "router refused to remove old HTTPS mapping")))
+  (try
+    (run! ["upnpc" "-a" target "443" "8443" "TCP" "900"])
+    (when-not (= target (router-mapping (str (run! ["upnpc" "-l"])))) (refuse "router did not confirm new HTTPS mapping"))
+    (catch :default e
+      (when (and current (not= current target))
+        (try (run! ["upnpc" "-a" current "443" "8443" "TCP" "900"]) (catch :default _ nil)))
+      (throw e))))
+
+(defn- tcp-accepts? [ip]
+  ;; synchronous connect probe through a child, keeping the check sequential
+  (zero? (.-status (.spawnSync cp "nc" #js ["-z" "-w" "2" ip "443"]))))
+
+(defn- flag [k] (some #(when (str/starts-with? % (str k "=")) (subs % (inc (count k)))) (array-seq (aget js/process "argv"))))
+(defn- has? [k] (some #{k} (array-seq (aget js/process "argv"))))
+
+(defn check!
+  "One check, holding the state dir's lock. -> the printed decision map."
+  [sd]
+  (let [run! #(command! % 20)
+        mapping (router-mapping (str (run! ["upnpc" "-l"])))
+        primary? (gateway-healthy? xavier-ip)
+        failures (if primary? 0 (inc (load-failures (.join path sd "state.json"))))
+        standby? (when (and (not primary?) (>= failures 3)) (gateway-healthy? gad-ip))
+        listener? (and (not primary?) (>= failures 3) (tcp-accepts? xavier-ip))
+        action (decide primary? standby? failures mapping listener?)]
+    (when (has? "--apply")
+      (require-cutover-opt-in action (has? "--allow-router-cutover"))
+      (save-failures (.join path sd "state.json") failures)
+      (when (#{"restore-primary" "take-over" "renew-standby"} action)
+        (set-mapping! run! (if (= "restore-primary" action) xavier-ip gad-ip) mapping)))
+    {"action" action "primary_healthy" primary? "standby_healthy" standby? "failures" failures
+     "mapping" mapping "applied" (boolean (has? "--apply"))}))
+
+(defn main []
+  (let [sd (or (flag "--state-dir") (str (aget js/process "env" "HOME") "/.local/state/yataverse-router-standby"))
+        lock (.join path sd "check.lock.pid")]
+    (try
+      (.mkdirSync fs sd #js {:recursive true})
+      (try (.writeFileSync fs lock (str (.-pid js/process)) #js {:flag "wx"})
+           (catch :default _ (refuse "a check is already running")))
+      (let [result (try (check! sd) (finally (try (.unlinkSync fs lock) (catch :default _ nil))))]
+        (println (g/py-json-str result)))
+      (catch :default e
+        (.write js/process.stderr (str "REFUSED: " (g/message e) "\n"))
+        (js/process.exit 2)))))
+
+(when (some #(str/ends-with? % "router_standby.cljk") (array-seq (aget js/process "argv")))
+  (main))
