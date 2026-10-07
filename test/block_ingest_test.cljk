@@ -1,0 +1,112 @@
+;; Gate for deploy/block_ingest.cljk: signatures, CID binding, holds that only
+;; their signer can release. The store is an in-memory stand-in for Kubo + MFS;
+;; the keys are real Ed25519 (node:crypto).
+(ns block-ingest-test
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [block-ingest :as b]))
+
+(def nc (js/require "node:crypto"))
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+
+(def b58 "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+(defn b58-encode [bs]
+  (let [zeros (count (take-while zero? bs))
+        digits (reduce (fn [acc byte]
+                         (loop [i (dec (count acc)) carry byte acc acc]
+                           (if (neg? i)
+                             (if (zero? carry) acc (recur i (quot carry 58) (into [(mod carry 58)] acc)))
+                             (let [x (+ (* 256 (nth acc i)) carry)]
+                               (recur (dec i) (quot x 58) (assoc acc i (mod x 58)))))))
+                       [] (drop zeros bs))]
+    (apply str (concat (repeat zeros "1") (map #(nth b58 %) digits)))))
+
+(defn keypair []
+  (let [kp (.generateKeyPairSync nc "ed25519")
+        x (.-x (.export (.-publicKey kp) #js {:format "jwk"}))]
+    {:did (str "did:key:z" (b58-encode (into [0xed 0x01] (array-seq (js/Buffer.from x "base64url")))))
+     :priv (.-privateKey kp)}))
+
+(defn signed [{:keys [did priv]} method cid t]
+  {"x-kotoba-signer" did "x-kotoba-time" (str t)
+   "x-kotoba-signature" (.toString (.sign nc nil (js/Buffer.from (b/signed-message method cid (str t)) "utf8") priv) "base64url")})
+
+(defn fake-store []
+  (let [blocks (atom {}) holds (atom #{}) puts (atom 0)]
+    {:state {:blocks blocks :holds holds :puts puts}
+     :put! (fn [buf] (swap! puts inc) (let [c (g/raw-cid buf)] (swap! blocks assoc c buf) (js/Promise.resolve c)))
+     :held? (fn [p] (js/Promise.resolve (contains? @holds p)))
+     :hold! (fn [p] (swap! holds conj p) (js/Promise.resolve nil))
+     :release! (fn [p] (swap! holds disj p) (js/Promise.resolve true))
+     :get (fn [cid] (js/Promise.resolve (get @blocks cid)))}))
+
+(def now 1790000000)
+(def murakumo (keypair))
+(def other (keypair))
+(def stranger (keypair))
+(def opts {:allow #{(:did murakumo) (:did other)} :max-skew 300 :max-block-bytes 1024})
+(def block (js/Buffer.from "model shard 0001" "utf8"))
+(def cid (g/raw-cid block))
+
+(defn req [method path headers body] {:method method :path path :headers headers :body body})
+
+(defn run []
+  (let [store (fake-store)
+        h #(b/handle opts store now %)]
+    (println "block-ingest gate:")
+    (-> (js/Promise.all
+         #js [(h (req "PUT" (str "/v1/blocks/" cid) {} block))
+              (h (req "PUT" (str "/v1/blocks/" cid) (signed stranger "PUT" cid now) block))
+              (h (req "PUT" (str "/v1/blocks/" cid) (signed murakumo "PUT" cid (- now 301)) block))
+              (h (req "PUT" (str "/v1/blocks/" cid) (assoc (signed murakumo "PUT" cid now) "x-kotoba-signature" (.toString (js/Buffer.alloc 64) "base64url")) block))
+              (h (req "PUT" (str "/v1/blocks/" cid) (signed murakumo "DELETE" cid now) block))
+              (h (req "PUT" (str "/v1/blocks/" cid) (signed murakumo "PUT" cid now) (js/Buffer.from "other bytes")))
+              (h (req "PUT" "/v1/blocks/QmNotRaw" (signed murakumo "PUT" "QmNotRaw" now) block))])
+        (.then (fn [rs]
+                 (let [[unsigned strange skewed forged wrong-method wrong-bytes bad-cid] (map :status rs)]
+                   (check "an unsigned write is refused (401)" (= 401 unsigned))
+                   (check "a key not on --allow is refused (403)" (= 403 strange))
+                   (check "a signature outside the skew window is refused" (= 401 skewed))
+                   (check "a forged signature is refused" (= 401 forged))
+                   (check "a DELETE signature does not authorise a PUT" (= 401 wrong-method))
+                   (check "bytes that do not hash to the CID are refused (400)" (= 400 wrong-bytes))
+                   (check "only raw CIDv1 sha2-256 addresses are accepted" (= 400 bad-cid))
+                   (check "nothing reached the store" (zero? @(get-in store [:state :puts]))))))
+        (.then #(h (req "PUT" (str "/v1/blocks/" cid) (signed murakumo "PUT" cid now) block)))
+        (.then (fn [r]
+                 (check "a signed write is stored and held under its signer (201)"
+                        (and (= 201 (:status r)) (= cid (get-in r [:json "cid"]))
+                             (contains? @(get-in store [:state :holds]) (b/hold-path (:did murakumo) cid))))
+                 (h (req "PUT" (str "/v1/blocks/" cid) (signed murakumo "PUT" cid now) block))))
+        (.then (fn [r]
+                 (check "writing it again is idempotent (200, no second put)"
+                        (and (= 200 (:status r)) (= 1 @(get-in store [:state :puts]))))
+                 (h (req "PUT" (str "/v1/blocks/" cid) (signed other "PUT" cid now) block))))
+        (.then (fn [_] (h (req "GET" (str "/v1/blocks/" cid) {} nil))))
+        (.then (fn [r]
+                 (check "anyone reads the bytes back, checked against the CID"
+                        (and (= 200 (:status r)) (.equals (:bytes r) block)))
+                 (h (req "DELETE" (str "/v1/blocks/" cid) (signed stranger "DELETE" cid now) nil))))
+        (.then (fn [r]
+                 (check "a stranger cannot release it" (= 403 (:status r)))
+                 (h (req "DELETE" (str "/v1/blocks/" cid) (signed murakumo "DELETE" cid now) nil))))
+        (.then (fn [r]
+                 (let [holds @(get-in store [:state :holds])]
+                   (check "its signer releases only its own hold; the other signer's stays"
+                          (and (= 200 (:status r))
+                               (not (contains? holds (b/hold-path (:did murakumo) cid)))
+                               (contains? holds (b/hold-path (:did other) cid)))))
+                 (h (req "DELETE" (str "/v1/blocks/" cid) (signed murakumo "DELETE" cid now) nil))))
+        (.then (fn [r]
+                 (check "releasing twice answers 404" (= 404 (:status r)))
+                 (h (req "PUT" (str "/v1/blocks/" (g/raw-cid (js/Buffer.alloc 2048))) (signed murakumo "PUT" (g/raw-cid (js/Buffer.alloc 2048)) now) (js/Buffer.alloc 2048)))))
+        (.then (fn [r]
+                 (check "a block above --max-block-bytes is refused (413)" (= 413 (:status r)))
+                 (h (req "GET" "/v1/blocks/bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy" {} nil))))
+        (.then (fn [r]
+                 (check "an unknown block is 404" (= 404 (:status r)))
+                 (println (if (zero? @failures) "block-ingest gate: passed" (str "block-ingest gate: " @failures " failure(s)")))
+                 (js/process.exit (if (zero? @failures) 0 1)))))))
+
+(run)

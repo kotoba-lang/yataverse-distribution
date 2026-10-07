@@ -1533,3 +1533,31 @@ The kotoba cycle ran on the production runs directory from `head` to `reader` an
 **Schedule.** The 04:30 LaunchAgent now runs the cljk cycle, which has a run lock. The Python cycle schedule was paused during this run so that it could not resume the same run beside it.
 
 **Retired.** `lake_epoch_cycle.py`, `capture_lake_inventory.py`, `diff_lake_inventory.py` and `lake_epoch.py`. The cycle still calls the remote Python tools on xavier and jacob (replicate, temporary reader, CAR export/import, audit, large lane) until they switch to their verified kotoba ports.
+
+## block-ingest: Worker block writes into the fleet Kubo, without R2 (2026-10-07)
+
+Owner direction: murakumo must not depend on R2. Nothing outside the fleet could put a block on a fleet Kubo until now. yataverse-writer accepts only 16 KB graph heads, and kotobase.net's `PUT /ipfs/:cid` stores into Backblaze B2. `deploy/block_ingest.cljk` is that missing write path:
+
+- **Endpoints:**
+  - `PUT /v1/blocks/<cid>` stores the bytes and holds them. It answers 201, or 200 when the block was already held.
+  - `DELETE /v1/blocks/<cid>` releases the signer's own hold.
+  - `GET /v1/blocks/<cid>` is public and checks the bytes against the CID.
+  - `GET /health`.
+- **Addresses are hashes.** Only raw CIDv1 sha2-256 is accepted, and the body must hash to the CID. Nobody can store bytes under someone else's name.
+- **Writes are signed.** The headers are `x-kotoba-signer` (a did:key on `--allow`), `x-kotoba-time` (within `--max-skew`) and `x-kotoba-signature`. The signature is base64url Ed25519 over `kotoba/block-ingest/v1\n<METHOD>\n<cid>\n<time>`. The body is not signed, because the CID already binds it.
+- **Holds, not pins.** A block is held as the MFS entry `/block-ingest/<signer>/<cid>`, which keeps it from GC. `DELETE` removes only that entry, so a signer cannot unpin the lake, the writer's documents or another signer's blocks.
+- **Deployment:** `xavier-block-ingest.service` listens on loopback :18140, behind `xavier-block-ingest.conf` (nginx, 16 MiB bodies).
+
+Tests:
+- `test/block_ingest_test.cljk` (16 checks, real Ed25519, in-memory store) covers:
+  - refusals: unsigned, unknown key, skewed, forged, a DELETE signature reused for PUT, wrong bytes, a non-raw CID, oversize;
+  - idempotent re-put;
+  - release only by the signer;
+  - one signer's release leaving another's hold in place.
+- End to end on a throwaway Kubo 0.41 repo, through the real service:
+  - a 3 MiB block was stored, read back byte for byte, released, and refused at 17 MiB;
+  - after `ipfs repo gc` the held block was still served and the released one was gone.
+
+```
+node <release>/engine/cli.js --classpath deploy:test test/block_ingest_test.cljk
+```

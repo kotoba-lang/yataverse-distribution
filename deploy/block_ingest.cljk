@@ -1,0 +1,232 @@
+;; deploy/block_ingest.cljk — signed, content-checked block writes into the
+;; fleet's own Kubo, for Workers that stop using R2 (owner direction
+;; 2026-10-07; com-junkawasaki/root ADR-2610071530).
+;;
+;; Until now nothing outside the fleet could put a block on a fleet Kubo: the
+;; only public writer is yataverse-writer (16 KB graph heads) and kotobase.net's
+;; PUT /ipfs/:cid stores into Backblaze B2. This service is that missing
+;; write path, and nothing more:
+;;
+;;   PUT    /v1/blocks/<cid>   body = the block's bytes          signed
+;;     201 {"cid", "size", "held"}  stored and held (200 when it already was)
+;;     400 bad CID / bytes do not hash to the CID   401/403 signature   413 too large
+;;   DELETE /v1/blocks/<cid>                                       signed
+;;     200 {"released"}  the signer's hold on the block is gone   404 not held by this signer
+;;   GET    /v1/blocks/<cid>   the bytes, read offline and checked against the CID   404
+;;   GET    /health
+;;
+;; CIDs are raw CIDv1 sha2-256 (base32 "b..."): the address IS the hash, so a
+;; writer cannot store bytes under someone else's name, and a reader checks
+;; what it gets.
+;;
+;; Holds, not pins. A held block is an MFS entry /block-ingest/<signer>/<cid>,
+;; which keeps it from Kubo's GC. DELETE removes only that entry, so a signer
+;; can release what it stored and nothing else: the lake's pins, other
+;; signers' holds and the writer's documents are untouched.
+;;
+;; Signature. Every PUT and DELETE carries
+;;   x-kotoba-signer:    did:key (Ed25519) on --allow
+;;   x-kotoba-time:      unix seconds, within --max-skew of now
+;;   x-kotoba-signature: base64url Ed25519 over
+;;                       "kotoba/block-ingest/v1\n" METHOD "\n" cid "\n" time
+;; The body is not signed: it is bound by the CID. A replayed PUT stores the
+;; same bytes again (idempotent); a replayed DELETE inside the skew window
+;; releases a block the signer already released.
+;;
+;; usage (node <release>/engine/cli.js --classpath deploy deploy/block_ingest.cljk ...):
+;;   --allow=did:key:... ... --ipfs-bin=PATH --ipfs-path=DIR
+;;   [--host=127.0.0.1] [--port=18140] [--max-block-bytes=16777216]
+;;   [--max-skew=300] [--max-concurrent-puts=4]
+
+(ns block-ingest
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def http (js/require "node:http"))
+(def cp (js/require "node:child_process"))
+(def nc (js/require "node:crypto"))
+
+(def domain-tag "kotoba/block-ingest/v1\n")
+(def raw-cid-re #"b[a-z2-7]{58}")
+(def default-max-block-bytes (* 16 1024 1024))
+
+;; ── signature ───────────────────────────────────────────────────────────────
+
+(defn signed-message [method cid time]
+  (str domain-tag method "\n" cid "\n" time))
+
+(defn- spki [pub]
+  (.createPublicKey nc #js {:key (js/Buffer.concat #js [(js/Buffer.from #js [0x30 0x2a 0x30 0x05 0x06 0x03 0x2b 0x65 0x70 0x03 0x21 0x00]) pub])
+                            :format "der" :type "spki"}))
+
+(defn authorize
+  "nil when the request is signed by an allowed key within the skew window,
+   else [status reason]."
+  [{:keys [allow max-skew]} method cid headers now]
+  (let [signer (get headers "x-kotoba-signer")
+        time-s (get headers "x-kotoba-time")
+        sig (get headers "x-kotoba-signature")
+        t (when (and (string? time-s) (re-matches #"[0-9]{1,12}" time-s)) (js/parseInt time-s 10))]
+    (cond
+      (not (and signer time-s sig)) [401 "signature required"]
+      (not (contains? allow signer)) [403 "signer is not allowed"]
+      (or (nil? t) (> (js/Math.abs (- now t)) max-skew)) [401 "signature time outside the allowed skew"]
+      :else
+      (let [ok (try (.verify nc nil (js/Buffer.from (signed-message method cid time-s) "utf8")
+                             (spki (g/ed25519-pub-of-did signer))
+                             (js/Buffer.from sig "base64url"))
+                    (catch :default _ false))]
+        (when-not ok [401 "signature does not verify"])))))
+
+;; ── the store ───────────────────────────────────────────────────────────────
+
+(defn hold-path [signer cid] (str "/block-ingest/" (subs signer 8) "/" cid))
+
+(defn- run [bin env args stdin]
+  (js/Promise.
+   (fn [resolve]
+     (let [child (.spawn cp bin (clj->js args) #js {:env env})
+           out #js [] err #js []]
+       (.on (.-stdout child) "data" #(.push out %))
+       (.on (.-stderr child) "data" #(.push err %))
+       (.on child "error" (fn [e] (resolve {:code -1 :out (js/Buffer.alloc 0) :err (str e)})))
+       (.on child "close" (fn [code] (resolve {:code code :out (js/Buffer.concat out)
+                                               :err (str (js/Buffer.concat err))})))
+       (if stdin (.end (.-stdin child) stdin) (.end (.-stdin child)))))))
+
+(defn kubo-store
+  "The store over a Kubo CLI: put the block, hold it in MFS, release, read
+   offline. Every function returns a Promise."
+  [ipfs-bin ipfs-path]
+  (let [env (doto (js/Object.assign #js {} (aget js/process "env")) (aset "IPFS_PATH" ipfs-path))
+        ipfs (fn [args & [stdin]] (run ipfs-bin env args stdin))]
+    {:put! (fn [buf]
+             (-> (ipfs ["block" "put" "--cid-codec=raw" "--mhtype=sha2-256" "--allow-big-block"] buf)
+                 (.then (fn [{:keys [code out err]}]
+                          (if (zero? code) (str/trim (str out)) (throw (g/unmeasured (str "block put: " (str/trim err)))))))))
+     :held? (fn [p] (.then (ipfs ["files" "stat" "--hash" p]) #(zero? (:code %))))
+     :hold! (fn [p]
+              (-> (ipfs ["files" "mkdir" "-p" (subs p 0 (str/last-index-of p "/"))])
+                  (.then (fn [_] (ipfs ["files" "cp" (str "/ipfs/" (last (str/split p #"/"))) p])))
+                  (.then (fn [{:keys [code err]}]
+                           (when-not (or (zero? code) (str/includes? err "already has entry"))
+                             (throw (g/unmeasured (str "files cp: " (str/trim err)))))))))
+     :release! (fn [p] (.then (ipfs ["files" "rm" p]) #(zero? (:code %))))
+     :get (fn [cid] (.then (ipfs ["block" "get" "--offline" cid]) #(when (zero? (:code %)) (:out %))))}))
+
+;; ── requests ────────────────────────────────────────────────────────────────
+
+(defn- json [status body] {:status status :json body})
+
+(defn handle
+  "One request -> Promise<{:status, :json | :bytes}>. `req` is
+   {:method :path :headers :body (Buffer, for PUT)}; `store` is `kubo-store`
+   or a stand-in."
+  [opts store now {:keys [method path headers body]}]
+  (let [[_ cid] (re-matches #"/v1/blocks/(.+)" path)]
+    (cond
+      (and (= method "GET") (= path "/health")) (js/Promise.resolve (json 200 {"ok" true}))
+      (nil? cid) (js/Promise.resolve (json 404 {"refused" "not found"}))
+      (not (re-matches raw-cid-re cid)) (js/Promise.resolve (json 400 {"refused" "not a raw CIDv1 sha2-256"}))
+
+      (= method "GET")
+      (.then ((:get store) cid)
+             (fn [buf]
+               (cond
+                 (nil? buf) (json 404 {"refused" "block is not held here"})
+                 (not= cid (g/raw-cid buf)) (json 500 {"unmeasured" "stored bytes do not hash to the CID"})
+                 :else {:status 200 :bytes buf})))
+
+      (#{"PUT" "DELETE"} method)
+      (if-let [[status reason] (authorize opts method cid headers now)]
+        (js/Promise.resolve (json status {"refused" reason}))
+        (let [signer (get headers "x-kotoba-signer") p (hold-path signer cid)]
+          (if (= method "DELETE")
+            (.then ((:held? store) p)
+                   (fn [held]
+                     (if-not held
+                       (json 404 {"refused" "not held by this signer"})
+                       (.then ((:release! store) p) (fn [_] (json 200 {"released" cid}))))))
+            (cond
+              (nil? body) (js/Promise.resolve (json 400 {"refused" "body required"}))
+              (> (.-length body) (:max-block-bytes opts)) (js/Promise.resolve (json 413 {"refused" "block too large"}))
+              (not= cid (g/raw-cid body)) (js/Promise.resolve (json 400 {"refused" "bytes do not hash to the CID"}))
+              :else
+              (-> ((:held? store) p)
+                  (.then (fn [already]
+                           (if already
+                             (json 200 {"cid" cid "size" (.-length body) "held" p})
+                             (-> ((:put! store) body)
+                                 (.then (fn [got]
+                                          (when-not (= got cid) (throw (g/unmeasured (str "Kubo stored " got " for " cid))))
+                                          ((:hold! store) p)))
+                                 (.then (fn [_] (json 201 {"cid" cid "size" (.-length body) "held" p}))))))))))))
+
+      :else (js/Promise.resolve (json 405 {"refused" "method not allowed"})))))
+
+;; ── server ──────────────────────────────────────────────────────────────────
+
+(defn- headers-of [^js req]
+  (into {} (map (fn [k] [k (aget (.-headers req) k)]) ["x-kotoba-signer" "x-kotoba-time" "x-kotoba-signature"])))
+
+(defn- read-body
+  "Promise<Buffer|:too-large>. Stops reading past `limit` bytes."
+  [^js req limit]
+  (js/Promise.
+   (fn [resolve]
+     (let [chunks #js [] n (atom 0) over (atom false)]
+       (.on req "data" (fn [c] (swap! n + (.-length c))
+                         (if (> @n limit) (when-not @over (reset! over true) (resolve :too-large) (.pause req))
+                             (.push chunks c))))
+       (.on req "end" #(when-not @over (resolve (js/Buffer.concat chunks))))
+       (.on req "error" #(resolve nil))))))
+
+(defn- reply [^js res {:keys [status json bytes]}]
+  (if bytes
+    (do (.writeHead res status #js {"content-type" "application/vnd.ipld.raw" "content-length" (.-length bytes)
+                                    "cache-control" "public, max-age=31536000, immutable"})
+        (.end res bytes))
+    (let [s (g/canonical-str json)]
+      (.writeHead res status #js {"content-type" "application/json"})
+      (.end res s))))
+
+(defn serve! [opts store]
+  (let [inflight (atom 0)]
+    (.listen
+     (.createServer
+      http
+      (fn [^js req ^js res]
+        (let [method (.-method req)
+              path (first (str/split (.-url req) #"\?"))
+              now (js/Math.floor (/ (js/Date.now) 1000))
+              go (fn [body]
+                   (-> (handle opts store now {:method method :path path :headers (headers-of req) :body body})
+                       (.catch (fn [e] {:status (if (= :unmeasured (g/kind e)) 503 500) :json {"unmeasured" (g/message e)}}))
+                       (.then #(reply res %))))]
+          (if (= method "PUT")
+            (if (>= @inflight (:max-concurrent-puts opts))
+              (reply res {:status 503 :json {"unmeasured" "too many concurrent writes"}})
+              (do (swap! inflight inc)
+                  (-> (read-body req (:max-block-bytes opts))
+                      (.then (fn [b] (if (= b :too-large) (reply res {:status 413 :json {"refused" "block too large"}}) (go b))))
+                      (.finally #(swap! inflight dec)))))
+            (go nil)))))
+     (:port opts) (:host opts))))
+
+(defn- flags [k] (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k)))) (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))
+        opts {:allow (set (flags "--allow"))
+              :host (or (one "--host") "127.0.0.1")
+              :port (js/parseInt (or (one "--port") "18140") 10)
+              :max-block-bytes (js/parseInt (or (one "--max-block-bytes") (str default-max-block-bytes)) 10)
+              :max-skew (js/parseInt (or (one "--max-skew") "300") 10)
+              :max-concurrent-puts (js/parseInt (or (one "--max-concurrent-puts") "4") 10)}]
+    (when (empty? (:allow opts)) (println "REFUSED: at least one --allow=did:key:... is required") (js/process.exit 2))
+    (doseq [d (:allow opts)] (g/ed25519-pub-of-did d))
+    (serve! opts (kubo-store (one "--ipfs-bin") (one "--ipfs-path")))
+    (println (str "block-ingest on " (:host opts) ":" (:port opts) ", " (count (:allow opts)) " signer(s)"))))
+
+(when (some #(str/ends-with? % "block_ingest.cljk") (array-seq (aget js/process "argv")))
+  (main))
