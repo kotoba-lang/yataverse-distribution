@@ -1,0 +1,93 @@
+;; deploy/recover_graph_heads.cljk — rebuild yataverse's R2 graph heads from
+;; inga alone (ADR-2610062000 D5, P5 drill C). Ported from recover_graph_heads.py.
+;;
+;; After the P5 cutover R2's heads/yataverse/ipns/<graph>.json is a copy. It is
+;; only a projection if it can be thrown away and rebuilt without R2, without
+;; Cloudflare and without the writer hosts. From any fleet node:
+;;
+;;   1. ask every witness for the committed head of yataverse/graph/<graph>
+;;      and require --min of them to agree on [seq cid];
+;;   2. read the document by CID from this node's own Kubo, offline, and
+;;      check its bytes hash to that CID;
+;;   3. check it is the seq-th document of the graph and that its head is
+;;      signed by the pinned namespace signer;
+;;   4. write the head to --out-dir/heads/yataverse/ipns/<graph>.json, the
+;;      shape and key R2 uses, byte for byte as the document holds it.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> recover_graph_heads.cljk ...):
+;;   --graph=G ... --witness=http://ip:port ... [--min=5]
+;;   --ipfs="<ipfs command for this node, offline reads>" --signer=did:key:... --out-dir=DIR
+;;
+;; Exit codes: 0 every graph rebuilt; 1 a graph refused; 3 a graph could not be measured.
+
+(ns recover-graph-heads
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+
+(defn agreed
+  "Pure. The [seq cid] that at least `minimum` answers name, or nil."
+  [answers minimum]
+  (let [[top n] (first (sort-by (comp - val) (frequencies (remove nil? answers))))]
+    (when (and top (>= n minimum)) top)))
+
+(defn- committed [witness ref]
+  (-> (js/fetch (str (str/replace witness #"/+$" "") "/committed?ref=" (js/encodeURIComponent ref))
+                #js {:signal (js/AbortSignal.timeout 8000)})
+      (.then (fn [r] (when (.-ok r) (.json r))))
+      (.then (fn [j] (when-let [h (and j (.-head j))] [(.-seq h) (.-cid h)])))
+      (.catch (fn [_] nil))))
+
+(defn rebuild!
+  "-> Promise of [seq sequence value]; rejects with a refusal or unmeasured error."
+  [{:keys [witnesses minimum ipfs signers out-dir]} graph]
+  (let [ref (str "yataverse/graph/" graph)]
+    (-> (js/Promise.all (clj->js (map #(committed % ref) witnesses)))
+        (.then (fn [answers]
+                 (let [answers (vec (array-seq answers))
+                       got (agreed answers minimum)]
+                   (when-not got
+                     (throw (g/unmeasured (str "fewer than " minimum " witnesses agree: " (pr-str answers)))))
+                   (let [[seq cid] got
+                         {:keys [code out]} (g/run! (into ipfs ["--offline" "cat" cid]) nil 60)]
+                     (when-not (zero? code) (throw (g/unmeasured (str "document " cid " is not held by this node"))))
+                     (when-not (= cid (g/raw-cid out)) (throw (g/refused (str "bytes do not hash to " cid))))
+                     (let [doc (g/parse-json out)]
+                       (when-not (and (= g/schema (get doc "schema")) (= graph (get doc "graph")) (= seq (get doc "seq")))
+                         (throw (g/refused (str "document " cid " is not the seq " seq " mirror of " graph))))
+                       (g/verify-head (get doc "head") graph signers)
+                       ;; the head exactly as the document holds it (key order kept)
+                       (let [js-head (.-head (js/JSON.parse (str out)))
+                             f (.join path out-dir "heads" "yataverse" "ipns" (str graph ".json"))]
+                         (.mkdirSync fs (.dirname path f) #js {:recursive true})
+                         (.writeFileSync fs f (js/JSON.stringify js-head))
+                         [seq (get-in doc ["head" "sequence"]) (get-in doc ["head" "value"])])))))))))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))
+        opts {:graphs (vec (flags "--graph")) :witnesses (vec (flags "--witness"))
+              :minimum (js/parseInt (or (one "--min") "5") 10) :ipfs (g/words (or (one "--ipfs") ""))
+              :signers (vec (flags "--signer")) :out-dir (one "--out-dir")}]
+    (when-not (and (seq (:graphs opts)) (seq (:witnesses opts)) (seq (:ipfs opts)) (seq (:signers opts)) (:out-dir opts))
+      (println "REFUSE need --graph --witness --ipfs --signer --out-dir") (js/process.exit 1))
+    (-> (reduce (fn [p graph]
+                  (.then p (fn [worst]
+                             (-> (rebuild! opts graph)
+                                 (.then (fn [[seq sequence value]]
+                                          (println (str "REBUILT " graph " inga-seq " seq " r2-sequence " sequence " value " value))
+                                          worst))
+                                 (.catch (fn [e]
+                                           (if (= :refused (g/kind e))
+                                             (do (println (str "REFUSE " graph ": " (g/message e))) (if (= 3 worst) 3 1))
+                                             (do (println (str "UNMEASURED " graph ": " (g/message e))) 3))))))))
+                (js/Promise.resolve 0) (:graphs opts))
+        (.then (fn [worst] (js/process.exit worst))))))
+
+(when (some #(str/ends-with? % "recover_graph_heads.cljk") (array-seq (aget js/process "argv")))
+  (main))

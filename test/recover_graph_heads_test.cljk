@@ -1,0 +1,12 @@
+;; Gate for deploy/recover_graph_heads.cljk (ported from test_recover_graph_heads.py).
+(ns recover-graph-heads-test
+  (:require [recover-graph-heads :as r]))
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+(println "recover-graph-heads gate:")
+(let [a [5 "c5"]]
+  (check "five agreeing answers are a quorum" (= a (r/agreed (concat (repeat 5 a) [nil [4 "c4"]]) 5)))
+  (check "four is not five" (nil? (r/agreed (concat (repeat 4 a) (repeat 3 [4 "c4"])) 5)))
+  (check "nobody answered" (nil? (r/agreed (repeat 7 nil) 5))))
+(if (zero? @failures) (println "recover-graph-heads gate: ok")
+    (do (println "recover-graph-heads gate:" @failures "failed") (js/process.exit 1)))
