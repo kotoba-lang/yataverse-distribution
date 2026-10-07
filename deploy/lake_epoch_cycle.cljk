@@ -1,0 +1,467 @@
+;; deploy/lake_epoch_cycle.cljk — cut the next lake epoch end to end
+;; (ADR-2610062000 P2). Ported from lake_epoch_cycle.py. The run's state file
+;; (cycle-state.json) is the same, so a run either version started can be
+;; resumed by the other; a step that completed is not repeated.
+;;
+;; Steps, each refusing to continue unless its check passes:
+;;
+;;   head      the verified log head, which must be seq N-1
+;;   capture   two listing walks at one cutoff; both must complete
+;;   diff      the two walks must agree
+;;   resolve   the log's current membership, from the witnesses and a custodian
+;;   delta     the rows the log does not hold; zero rows ends the run
+;;   xavier    replicate the delta into xavier's Kubo, then full leaf readback
+;;   jacob     CAR ship, the large-block recovery lane, receipt audit and a full
+;;             offline leaf readback, all on jacob
+;;   cids      the inventory's CID must be equal on xavier and jacob
+;;   manifest  the manifest, pinned on both with equal CIDs
+;;   submit    lake_head submit, signed with --writer-seed, verified 5 of 7
+;;   bundle    the proof bundle, pinned on both
+;;   check     the log now resolves to exactly the union of the walk and the log
+;;   reader    jacob's lake-log reader (onion port 82) gains the epoch; its
+;;             /health must then report exactly the log's sha256 and rows
+;;
+;; Publishing the directory stays a reviewed step and is printed as a follow-up.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> lake_epoch_cycle.cljk ...):
+;;   --config=JSON (--work=DIR | --work-root=DIR) [--until=STEP]
+;;
+;; Exit codes: 0 epoch committed, or nothing to commit; 1 a check refused;
+;; 3 a step could not run.
+
+(ns lake-epoch-cycle
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def nc (js/require "node:crypto"))
+
+(def steps ["head" "capture" "diff" "resolve" "delta" "xavier" "jacob"
+            "cids" "manifest" "submit" "bundle" "check" "reader"])
+
+(def here (some #(when (str/ends-with? % "lake_epoch_cycle.cljk") (.dirname path %)) (array-seq (aget js/process "argv"))))
+
+(defn refused [msg] (ex-info msg {:kind :refused}))
+(defn unmeasured [msg] (ex-info msg {:kind :unmeasured}))
+(defn- tail [s n] (let [s (str/trim (str s))] (subs s (max 0 (- (count s) n)))))
+
+;; ── processes (a batch job: synchronous, like the Python cycle) ──────────────
+
+(defn sh!
+  "argv vector, or a string for a remote pipeline (bash -c). -> stdout string."
+  ([cmd] (sh! cmd {}))
+  ([cmd {:keys [timeout-s check? input] :or {check? true}}]
+   (let [[bin args] (if (string? cmd) ["/bin/bash" ["-c" cmd]] [(first cmd) (rest cmd)])
+         r (.spawnSync cp bin (clj->js args)
+                       (clj->js (cond-> {:encoding "utf8" :maxBuffer (* 256 1024 1024)}
+                                  timeout-s (assoc :timeout (* 1000 timeout-s))
+                                  input (assoc :input input))))
+         out (or (.-stdout r) "")]
+     (when (and check? (not= 0 (.-status r)))
+       (throw (unmeasured (str (subs (if (string? cmd) cmd (str/join " " cmd)) 0 120) " exited " (.-status r) ": "
+                               (tail (if (seq (.-stderr r)) (.-stderr r) out) 400)))))
+     out)))
+
+(defn ssh!
+  ([host remote] (ssh! host remote {}))
+  ([host remote opts] (sh! ["ssh" "-o" "BatchMode=yes" "-o" "ConnectTimeout=20" host remote] opts)))
+
+(defn- sleep-sync [ms] (js/Atomics.wait (js/Int32Array. (js/SharedArrayBuffer. 4)) 0 0 ms))
+
+(defn- sha256-file [p] (-> (.createHash nc "sha256") (.update (.readFileSync fs p)) (.digest "hex")))
+
+(defn rows-of [p]
+  (->> (str/split (.readFileSync fs p "utf8") #"\n") (remove str/blank?) (mapv #(js/JSON.parse %))))
+
+(defn last-json
+  "The last line of `text` that parses as a JSON object, as Clojure data."
+  [text]
+  (some (fn [line] (let [l (str/trim line)]
+                     (when (str/starts-with? l "{") (try (g/parse-json l) (catch :default _ nil)))))
+        (reverse (str/split-lines (str text)))))
+
+;; ── the run ─────────────────────────────────────────────────────────────────
+
+(defn make-cycle [cfg work]
+  (.mkdirSync fs work #js {:recursive true})
+  (let [sp (.join path work "cycle-state.json")]
+    {:c cfg :work work :state-path sp
+     :s (atom (if (.existsSync fs sp) (g/parse-json (.readFileSync fs sp "utf8")) {"done" []}))}))
+
+(defn save! [{:keys [s state-path]}]
+  (.writeFileSync fs (str state-path ".tmp") (js/JSON.stringify (clj->js @s) nil 1))
+  (.renameSync fs (str state-path ".tmp") state-path))
+
+(defn p [{:keys [work]} n] (.join path work n))
+(defn say [& xs] (println (str/join " " xs)))
+
+(defn- engine [{:keys [c]}] (vec (take 2 (g/words (get-in c ["lake_head" "runner"])))))
+
+(defn tool!
+  "Run one of this directory's kotoba tools. -> stdout."
+  [cyc tool args opts]
+  (sh! (into (engine cyc) (concat ["--classpath" here (.join path here tool)] args)) opts))
+
+(defn lake-head
+  "-> [code stdout] of lake_head.cljk with the config's runner and extra flags."
+  [{:keys [c]} args timeout-s]
+  (let [cmd (concat (g/words (get-in c ["lake_head" "runner"])) [(.join path here "lake_head.cljk")] args
+                    (get-in c ["lake_head" "extra"] []))
+        r (.spawnSync cp (first cmd) (clj->js (rest cmd))
+                      #js {:encoding "utf8" :timeout (* 1000 (or timeout-s 900)) :maxBuffer (* 64 1024 1024)})]
+    [(.-status r) (or (.-stdout r) "")]))
+
+(defn add-both!
+  "Add a local file on xavier and jacob; their CIDs must be equal. -> CID."
+  [{:keys [c] :as cyc} local name]
+  (let [x (get c "xavier") j (get c "jacob")]
+    (sh! ["scp" "-q" local (str (get x "host") ":" (get x "state") "/" name)])
+    (sh! ["scp" "-q" local (str (get j "host") ":" (get j "bulk") "/lake-state/" name)])
+    (let [a (str/trim (ssh! (get x "host") (str "IPFS_PATH=" (get x "ipfs_path") " " (get x "ipfs_bin")
+                                                 " add -Q --cid-version=1 --raw-leaves " (get x "state") "/" name)))
+          b (str/trim (ssh! (get j "host") (str "IPFS_PATH=" (get j "ipfs_path") " " (get j "ipfs_bin")
+                                                 " add -Q --cid-version=1 --raw-leaves " (get j "bulk") "/lake-state/" name)))]
+      (when-not (= a b) (throw (refused (str name ": xavier " a " != jacob " b))))
+      a)))
+
+;; ── steps ───────────────────────────────────────────────────────────────────
+
+(defn step-head [{:keys [c s] :as cyc}]
+  (let [[code out] (lake-head cyc ["verify" (get c "ledger")] 900)
+        m (re-find #"VERIFIED yataverse/lake seq (\d+) cid (\S+)" out)]
+    (when-not (and (zero? code) m) (throw (unmeasured (str "lake head not verified: " (tail out 200)))))
+    (swap! s assoc "prev_seq" (js/parseInt (nth m 1) 10) "prev_cid" (nth m 2) "epoch" (inc (js/parseInt (nth m 1) 10)))
+    (say (str "head seq " (get @s "prev_seq") " " (get @s "prev_cid") "; cutting epoch " (get @s "epoch")))))
+
+(defn step-capture [{:keys [c s] :as cyc}]
+  (when-not (get @s "cutoff")
+    ;; the previous whole hour, UTC
+    (let [now (js/Date.)]
+      (.setUTCMinutes now 0 0 0)
+      (swap! s assoc "cutoff" (str (subs (.toISOString (js/Date. (- (.getTime now) 3600000))) 0 19) "Z"))
+      (save! cyc)))
+  (let [base (get c "epoch0")]
+    (doseq [k ["a" "b"]]
+      (let [done (p cyc (str "candidate-" k ".done"))]
+        (when-not (.existsSync fs done)
+          (let [out (tool! cyc "capture_lake_inventory.cljk"
+                           [(str "--old-inventory=" (get base "inventory")) (str "--old-sha256=" (get base "sha256"))
+                            (str "--cutoff-utc=" (get @s "cutoff")) (str "--output=" (p cyc (str "candidate-" k ".jsonl")))
+                            (str "--state=" (p cyc (str "candidate-" k ".state.json")))]
+                           {:timeout-s (* 4 3600)})
+                j (last-json out)]
+            (when-not (= "complete" (get j "status"))
+              (throw (unmeasured (str "walk " k " did not complete: " (tail out 200)))))
+            (.writeFileSync fs done (js/JSON.stringify (clj->js j)))))))
+    (say (str "two walks complete at cutoff " (get @s "cutoff")))))
+
+(defn step-diff [{:keys [c s] :as cyc}]
+  (let [base (get c "epoch0")]
+    (tool! cyc "diff_lake_inventory.cljk"
+           [(str "--old-inventory=" (get base "inventory")) (str "--old-sha256=" (get base "sha256"))
+            (str "--candidate-a=" (p cyc "candidate-a.jsonl")) (str "--candidate-a-state=" (p cyc "candidate-a.state.json"))
+            (str "--candidate-b=" (p cyc "candidate-b.jsonl")) (str "--candidate-b-state=" (p cyc "candidate-b.state.json"))
+            (str "--output=" (p cyc "diff-since-epoch0.jsonl")) (str "--receipt=" (p cyc "diff.receipt.json"))]
+           {:check? false})
+    (when-not (.existsSync fs (p cyc "diff.receipt.json"))
+      (throw (refused "the two walks disagree, or the diff refused (see diff_lake_inventory)")))
+    (let [r (g/parse-json (.readFileSync fs (p cyc "diff.receipt.json") "utf8"))]
+      (swap! s assoc "listing" {"rows" (get r "candidate_rows") "bytes" (get r "candidate_bytes") "sha256" (get r "candidate_sha256")})
+      (say (str "walks agree: " (get r "candidate_rows") " rows; " (get r "delta_rows") " rows since epoch 0")))))
+
+(defn step-resolve
+  ([cyc] (step-resolve cyc nil))
+  ([{:keys [c s] :as cyc} epochs]
+   (let [j (get c "jacob")
+         tunnel (.spawn cp "ssh" (clj->js ["-o" "BatchMode=yes" "-N" "-L"
+                                           (str (get j "rpc_tunnel_port") ":127.0.0.1:" (get j "kubo_api_port")) (get j "host")])
+                        #js {:stdio "ignore"})]
+     (try
+       (sleep-sync 3000)
+       (let [[code out] (lake-head cyc ["resolve" (get c "ledger") (str "--rpc=http://127.0.0.1:" (get j "rpc_tunnel_port"))
+                                        (str "--out=" (p cyc "log-resolved.jsonl"))] 3600)
+             m (re-find #"RESOLVED yataverse/lake epochs (\d+) rows (\d+)" out)]
+         (when-not (and (zero? code) m (= (js/parseInt (nth m 1) 10) (or epochs (get @s "epoch"))))
+           (throw (unmeasured (str "resolve failed or saw a different head: " (tail out 200)))))
+         (say (str "log resolves to " (nth m 2) " rows over " (nth m 1) " epochs")))
+       (finally (.kill tunnel))))))
+
+(defn step-delta [{:keys [c s] :as cyc}]
+  (tool! cyc "lake_epoch.cljk" ["delta" (str "--log-resolved=" (p cyc "log-resolved.jsonl"))
+                                (str "--diff=" (p cyc "diff-since-epoch0.jsonl")) (str "--out=" (p cyc "inventory.jsonl"))] {})
+  (let [rows (rows-of (p cyc "inventory.jsonl"))]
+    (swap! s assoc "inv" {"rows" (count rows) "bytes" (reduce + 0 (map #(.-bytes %) rows))
+                          "sha256" (sha256-file (p cyc "inventory.jsonl"))
+                          "large_rows" (vec (keep-indexed (fn [i r] (when (> (.-bytes r) (get c "large_bytes")) i)) rows))})
+    (say (str "delta: " (count rows) " rows, " (get-in @s ["inv" "bytes"]) " bytes, "
+              (count (get-in @s ["inv" "large_rows"])) " large"))))
+
+(defn step-xavier [{:keys [c s] :as cyc}]
+  (let [x (get c "xavier") inv (get @s "inv") e (get @s "epoch")
+        remote-inv (str (get x "state") "/inventory-epoch" e ".jsonl")
+        port (get x "temp_reader_port")
+        common (str "--ipfs-bin " (get x "ipfs_bin") " --ipfs-path " (get x "ipfs_path"))]
+    (sh! ["scp" "-q" (p cyc "inventory.jsonl") (str (get x "host") ":" remote-inv)])
+    (doseq [f ["verify_lake_leaves.py" "raw_block_store.py" "serve_lake.py"]]
+      (sh! ["scp" "-q" (.join path here f) (str (get x "host") ":" (get x "tools") "/" f)]))
+    ;; a temporary reader serves the delta as a listing: replicate_lake only
+    ;; honours --inventory-path when the listing comes from a local reader
+    (ssh! (get x "host") (str "cd " (get x "state") " && (nohup /usr/bin/python3 " (get x "reader_bin") " --inventory " remote-inv
+                              " --sha256 " (get inv "sha256") " --count " (get inv "rows") " " common " --host 127.0.0.1 --port " port
+                              " > epoch" e "-listing.log 2>&1 < /dev/null & echo $! > epoch" e "-reader.pid); "
+                              "for i in $(seq 1 30); do curl -s -m 2 http://127.0.0.1:" port "/health >/dev/null && break; sleep 1; done"))
+    (try
+      (ssh! (get x "host") (str "mkdir -p " (get x "state") "/epoch" e "-state && IPFS_PATH=" (get x "ipfs_path") " /usr/bin/python3 "
+                                (get x "replicate_bin") " --ipfs-bin " (get x "ipfs_bin") " --kubo-api-url http://127.0.0.1:5001 "
+                                "--raw-block-store " (get x "state") "/raw-blocks --state-dir " (get x "state") "/epoch" e "-state "
+                                "--api-url http://127.0.0.1:" port "/api/v1/lake/blocks --inventory-path " remote-inv
+                                " --inventory-sha256 " (get inv "sha256") " --block-url-base " (get x "block_url_base")
+                                " --max-pages 100000 --max-new-bytes 200000000000 --max-block-bytes 256000000 --fetch-workers 8")
+            {:timeout-s (* 12 3600)})
+      (finally
+        (ssh! (get x "host") (str "kill $(cat " (get x "state") "/epoch" e "-reader.pid) 2>/dev/null; rm -f " (get x "state") "/epoch" e "-reader.pid")
+              {:check? false})))
+    (let [leaves (loop [n 0]
+                   (let [out (ssh! (get x "host") (str "cd " (get x "tools") " && python3 verify_lake_leaves.py --inventory " remote-inv
+                                                        " --sha256 " (get inv "sha256") " --count " (get inv "rows") " " common
+                                                        " --rpc-url http://127.0.0.1:5001 --raw-block-store " (get x "state") "/raw-blocks"
+                                                        " --state " (get x "state") "/epoch" e "-leaves.json --max-rows 1000 --max-bytes 250000000")
+                                   {:timeout-s 3600 :check? false})
+                         l (last-json out)]
+                     (if (or (= "complete" (get l "status")) (>= n 999)) l (recur (inc n)))))]
+      (when-not (and (= "complete" (get leaves "status")) (zero? (get leaves "missing_rows" 0)) (= (get inv "rows") (get leaves "present_rows")))
+        (throw (refused (str "xavier leaf readback incomplete: " (pr-str leaves)))))
+      (swap! s assoc "xavier_leaves" {"present_rows" (get leaves "present_rows") "present_bytes" (get leaves "present_bytes")})
+      (say (str "xavier: leaf readback " (get leaves "present_rows") "/" (get inv "rows"))))))
+
+(defn step-jacob [{:keys [c s] :as cyc}]
+  (let [x (get c "xavier") j (get c "jacob") inv (get @s "inv") e (get @s "epoch")
+        remote-inv (str (get j "bulk") "/inventory/inventory-epoch" e ".jsonl")
+        archive (str (get j "archive_root") "/archive-epoch" e)
+        lake-state (str (get j "bulk") "/lake-state/epoch" e)
+        car-dir (str (get j "car_root") "/lake-car-epoch" e)
+        xinv (str (get x "state") "/inventory-epoch" e ".jsonl")]
+    (sh! ["scp" "-q" (p cyc "inventory.jsonl") (str (get j "host") ":" remote-inv)])
+    (ssh! (get j "host") (str "mkdir -p " archive " " lake-state " " car-dir))
+    ;; rows xavier holds as raw sidecar blocks rather than in Kubo
+    (sh! ["scp" "-q" (.join path here "raw_block_store.py") (str (get x "host") ":" (get x "tools") "/raw_block_store.py")])
+    (let [out (ssh! (get x "host") (str "cd " (get x "tools") " && python3 -c 'import json,sys; sys.path.insert(0,\".\")\n"
+                                        "from raw_block_store import RawBlockStore\n"
+                                        "st=RawBlockStore(\"" (get x "state") "/raw-blocks\"); raw=[]\n"
+                                        "for l in open(\"" xinv "\"):\n"
+                                        "    r=json.loads(l)\n"
+                                        "    try: b=st.read(r[\"cid\"], max_bytes=300000000)\n"
+                                        "    except Exception: b=None\n"
+                                        "    raw.append(r[\"cid\"]) if b is not None else None\n"
+                                        "print(json.dumps(raw))'"))]
+      (.writeFileSync fs (p cyc "raw-cids.json")
+                      (js/JSON.stringify (clj->js {"inventory_sha256" (get inv "sha256") "cids" (g/parse-json out)}) nil 2)))
+    ;; large blocks: export on xavier from its loopback gateway, relay, import on jacob
+    (sh! ["scp" "-q" (.join path here "export_large_lake_block.py") (str (get x "host") ":" (get x "tools") "/")])
+    (doseq [row (get inv "large_rows")]
+      (let [name (str "row-" row "-recovery.car")]
+        (when-not (= "yes" (str/trim (ssh! (get j "host") (str "test -f " archive "/row-" row "-jacob-import.json && echo yes") {:check? false})))
+          (ssh! (get x "host") (str "mkdir -p " (get x "state") "/epoch" e "-large && cd " (get x "state") "/epoch" e "-large && "
+                                    "( test -f " name ".json || TMPDIR=" (get x "state") "/epoch" e "-large python3 " (get x "tools")
+                                    "/export_large_lake_block.py --inventory " xinv " --sha256 " (get inv "sha256") " --count " (get inv "rows")
+                                    " --row " row " --base-url http://127.0.0.1:8080/ipfs/ --ipfs-bin " (get x "ipfs_bin") " --output " name " )")
+                {:timeout-s 3600})
+          (doseq [f [name (str name ".json")]]
+            (sh! ["scp" "-q" "-3" "-o" "BatchMode=yes" (str (get x "host") ":" (get x "state") "/epoch" e "-large/" f) (str (get j "host") ":" archive "/")]
+                 {:timeout-s 3600}))
+          (ssh! (get j "host") (str "TMPDIR=" (get j "car_root") " python3 " (get j "bulk") "/bin/import_large_lake_recovery.py --inventory " remote-inv
+                                    " --sha256 " (get inv "sha256") " --count " (get inv "rows") " --row " row " --car " archive "/" name
+                                    " --source-receipt " archive "/" name ".json --ipfs-bin " (get j "ipfs_bin") " --ipfs-path " (get j "ipfs_path")
+                                    " --output-receipt " archive "/row-" row "-jacob-import.json")
+                {:timeout-s (* 3 3600)}))))
+    ;; everything else by CAR; ship_lake_car refuses past a large row with no receipt
+    (loop [n 0]
+      (when (>= n 60) (throw (unmeasured "ship did not complete in 60 rounds")))
+      (let [out (sh! ["python3" (get c "ship_bin") "--inventory" (p cyc "inventory.jsonl") "--sha256" (get inv "sha256")
+                      "--count" (str (get inv "rows")) "--start-row" "0" "--stop-row" (str (get inv "rows"))
+                      "--max-blocks" "1000" "--max-bytes" "200000000" "--source-ssh-host" (get x "host")
+                      "--source-exporter" (get x "car_exporter") "--source-inventory" xinv "--source-ipfs-bin" (get x "ipfs_bin")
+                      "--source-ipfs-path" (get x "ipfs_path") "--source-rpc-url" "http://127.0.0.1:5001"
+                      "--source-output-dir" (str (get x "state") "/car-exports-jacob-epoch" e) "--raw-cids-file" (p cyc "raw-cids.json")
+                      "--state-dir" (p cyc "ship-state") "--ssh-host" (get j "host") "--remote-dir" lake-state
+                      "--remote-importer" (str (get j "bulk") "/bin/import_lake_car.py") "--remote-inventory" remote-inv
+                      "--remote-ipfs-bin" (get j "ipfs_bin") "--remote-ipfs-path" (get j "ipfs_path")
+                      "--remote-raw-block-store" (str (get j "bulk") "/lake-state/raw-blocks") "--remote-car-dir" car-dir
+                      "--remote-large-archive" archive]
+                     {:timeout-s (* 6 3600) :check? false})
+            last-line (or (last (str/split-lines (str/trim out))) "")]
+        (cond
+          (str/includes? last-line "\"status\": \"complete\"") nil
+          (str/includes? last-line "REFUSED") (throw (refused (str "ship: " (subs last-line 0 (min 200 (count last-line))))))
+          :else (recur (inc n)))))
+    (let [audit (last-json (ssh! (get j "host") (str "python3 " (get j "bulk") "/bin/audit_lake.py --inventory " remote-inv " --sha256 " (get inv "sha256")
+                                                     " --count " (get inv "rows") " --ipfs-bin " (get j "ipfs_bin") " --ipfs-path " (get j "ipfs_path")
+                                                     " --car-receipts " lake-state " --large-receipts " archive " --require-complete")
+                                 {:timeout-s (* 6 3600) :check? false}))]
+      (when-not (and (= "complete" (get audit "status")) (zero? (get audit "missing_rows" -1)))
+        (throw (refused (str "jacob receipt audit: " (pr-str audit)))))
+      ;; full offline readback, every block against its CID digest
+      (let [readback (last-json (ssh! (get j "host")
+                                      (str "python3 - <<'EOF'\n"
+                                           "import json,subprocess,hashlib,base64,os\n"
+                                           "env=dict(os.environ,IPFS_PATH='" (get j "ipfs_path") "')\n"
+                                           "def mh(c):\n"
+                                           "    b=base64.b32decode(c[1:].upper()+'='*(-len(c[1:])%8)); i=1\n"
+                                           "    while b[i]&0x80: i+=1\n"
+                                           "    i+=1; return b[i+2:i+34].hex() if b[i]==0x12 else None\n"
+                                           "ok=bad=0\n"
+                                           "for l in open('" remote-inv "'):\n"
+                                           "    r=json.loads(l)\n"
+                                           "    p=subprocess.run(['" (get j "ipfs_bin") "','--offline','block','get',r['cid']],env=env,capture_output=True)\n"
+                                           "    good=p.returncode==0 and len(p.stdout)==r['bytes'] and (not r['cid'].startswith('b') or hashlib.sha256(p.stdout).hexdigest()==mh(r['cid']))\n"
+                                           "    ok+=good; bad+=not good\n"
+                                           "print(json.dumps({'ok':ok,'bad':bad}))\n"
+                                           "EOF")
+                                      {:timeout-s (* 12 3600)}))]
+        (when-not (and readback (zero? (get readback "bad")) (= (get inv "rows") (get readback "ok")))
+          (throw (refused (str "jacob leaf readback: " (pr-str readback)))))
+        (swap! s assoc "jacob_custody" {"audit_rows" (get audit "covered_rows") "readback" (get readback "ok")
+                                        "large" (count (get inv "large_rows"))})
+        (say (str "jacob: audit complete, readback " (get readback "ok") "/" (get inv "rows")))))))
+
+(defn step-cids [{:keys [s] :as cyc}]
+  (let [e (get @s "epoch")
+        cid (add-both! cyc (p cyc "inventory.jsonl") (str "inventory-epoch" e ".jsonl"))]
+    (swap! s assoc-in ["inv" "cid"] cid)
+    (say (str "inventory CID " cid " on both custodians"))))
+
+(defn step-manifest [{:keys [c s] :as cyc}]
+  (let [e (get @s "epoch") inv (get @s "inv") w (get c "wan")
+        today (subs (.toISOString (js/Date.)) 0 10)]
+    (tool! cyc "lake_epoch.cljk"
+           ["manifest" (str "--epoch=" e) (str "--prev=" (get @s "prev_cid")) (str "--inventory-cid=" (get inv "cid"))
+            (str "--inventory=" (p cyc "inventory.jsonl")) (str "--captured=" (subs (get @s "cutoff") 0 10))
+            (str "--relation=delta over log epochs 0-" (dec e) ": two matching listing walks at cutoff " (get @s "cutoff") ", lake_epoch delta")
+            (str "--custody=" (js/JSON.stringify (clj->js {"node" "jacob" "wan" (get w "jacob") "evidence"
+                                                           (str "receipt audit complete " (get inv "rows") "/" (get inv "rows") " ("
+                                                                (count (get inv "large_rows")) " large via offline recovery CARs) "
+                                                                "and full offline leaf readback " (get inv "rows") "/" (get inv "rows")
+                                                                " with CID digest match, " today)})))
+            (str "--custody=" (js/JSON.stringify (clj->js {"node" "xavier" "wan" (get w "xavier") "evidence"
+                                                           (str "replicated and full leaf readback " (get inv "rows") "/" (get inv "rows") ", " today)})))
+            (str "--authority=" (get c "authority")) (str "--out=" (p cyc (str "epoch-" e ".json")))]
+           {})
+    (swap! s assoc "manifest_cid" (add-both! cyc (p cyc (str "epoch-" e ".json")) (str "epoch-" e "-manifest.json")))
+    (say (str "manifest " (get @s "manifest_cid")))))
+
+(defn step-submit [{:keys [c s] :as cyc}]
+  (let [[code out] (lake-head cyc ["submit" (get c "ledger") (str (get @s "epoch")) (get @s "manifest_cid")] 900)]
+    (when-not (zero? code)
+      (throw ((if (= 1 code) refused unmeasured) (str "submit: " (tail out 200)))))
+    (say (subs (last (str/split-lines (str/trim out))) 0 160))))
+
+(defn step-bundle [{:keys [c s] :as cyc}]
+  (let [e (get @s "epoch") f (p cyc (str "bundle-e" e ".json"))
+        [code out] (lake-head cyc ["bundle" (get c "ledger") (str "--out=" f)] 900)]
+    (when-not (zero? code) (throw (unmeasured (str "bundle: " (tail out 200)))))
+    (let [[code out] (lake-head cyc ["verify-bundle" (get c "ledger") f] 900)]
+      (when-not (zero? code) (throw (refused (str "verify-bundle: " (tail out 200))))))
+    (swap! s assoc "bundle_cid" (add-both! cyc f (str "bundle-e" e ".json")))
+    (say (str "bundle " (get @s "bundle_cid")))))
+
+(defn step-check [{:keys [s] :as cyc}]
+  (.renameSync fs (p cyc "log-resolved.jsonl") (p cyc "log-resolved-before.jsonl"))
+  (step-resolve cyc (inc (get @s "epoch")))
+  (let [key-set (fn [f] (set (map #(str (.-cid %) " " (.-bytes %)) (rows-of f))))
+        log (key-set (p cyc "log-resolved.jsonl"))
+        listing (key-set (p cyc "candidate-a.jsonl"))
+        missing (count (remove log listing))]
+    (when (pos? missing) (throw (refused (str missing " listing rows are still outside the log"))))
+    (swap! s assoc "log" {"rows" (count log) "sha256" (sha256-file (p cyc "log-resolved.jsonl"))
+                          "beyond_listing" (count (remove listing log))})
+    (say (str "log " (count log) " rows covers the listing at " (get @s "cutoff") " (" (count (remove listing log)) " rows only in the log)"))))
+
+(defn step-reader [{:keys [c s] :as cyc}]
+  (let [j (get c "jacob") e (get @s "epoch") inv (get @s "inv")
+        label (get j "reader_label")
+        plist (str "~/Library/LaunchAgents/" label ".plist")
+        spec (str (get j "bulk") "/inventory/inventory-epoch" e ".jsonl:" (get inv "sha256") ":" (get inv "rows") ":" (get j "bulk") "/lake-state/epoch" e)
+        pb "/usr/libexec/PlistBuddy"
+        lines (->> (str/split-lines (str/trim (ssh! (get j "host") (str pb " -c 'Print :ProgramArguments' " plist))))
+                   rest butlast (mapv str/trim))]
+    (when-not (some #{spec} lines)
+      ;; insert the new --epoch pair after the last one, and set the totals
+      (let [last-i (inc (apply max (keep-indexed (fn [i l] (when (= l "--epoch") i)) lines)))]
+        (ssh! (get j "host") (str "cp " plist " " (get j "bulk") "/lake-state/" label ".plist.pre-epoch" e " && "
+                                  pb " -c 'Set :ProgramArguments:" (inc (.indexOf (clj->js lines) "--sha256")) " " (get-in @s ["log" "sha256"]) "' "
+                                  "-c 'Set :ProgramArguments:" (inc (.indexOf (clj->js lines) "--count")) " " (get-in @s ["log" "rows"]) "' "
+                                  "-c 'Add :ProgramArguments:" (inc last-i) " string --epoch' "
+                                  "-c 'Add :ProgramArguments:" (+ 2 last-i) " string " spec "' " plist " && plutil -lint " plist " >/dev/null && "
+                                  "launchctl bootout gui/$(id -u)/" label "; sleep 2; launchctl bootstrap gui/$(id -u) " plist))))
+    (let [health (loop [n 0]
+                   (sleep-sync 5000)
+                   (let [h (last-json (ssh! (get j "host") (str "curl -s -m 30 http://127.0.0.1:" (get j "reader_port") "/health") {:check? false}))]
+                     (if (or (get h "ok") (>= n 29)) h (recur (inc n)))))]
+      (when-not (and health (= (get-in @s ["log" "sha256"]) (get health "inventory-sha256")) (= (get-in @s ["log" "rows"]) (get health "rows")))
+        (throw (refused (str "reader does not serve the log: " (pr-str health)))))
+      (say (str "reader serves " (get health "rows") " rows (" (subs (get health "inventory-sha256") 0 8) ")")))))
+
+(def step-fns {"head" step-head "capture" step-capture "diff" step-diff "resolve" step-resolve "delta" step-delta
+               "xavier" step-xavier "jacob" step-jacob "cids" step-cids "manifest" step-manifest "submit" step-submit
+               "bundle" step-bundle "check" step-check "reader" step-reader})
+
+(defn run! [{:keys [s] :as cyc} until]
+  (loop [[name & more] steps]
+    (cond
+      (nil? name)
+      (let [e (get @s "epoch")]
+        (say (str "COMMITTED epoch " e " manifest " (get @s "manifest_cid") " bundle " (get @s "bundle_cid")))
+        (say (str "follow-ups (reviewed): commit deploy/lake-manifests/epoch-" e ".json and the reader plist (sha256 "
+                  (get-in @s ["log" "sha256"]) ", rows " (get-in @s ["log" "rows"]) "); point the directory lake_log at bundle "
+                  (get @s "bundle_cid")))
+        0)
+      (some #{name} (get @s "done")) (recur more)
+      :else
+      (do (say (str "── " name))
+          ((step-fns name) cyc)
+          (swap! s update "done" conj name)
+          (save! cyc)
+          (cond
+            (and (= name "delta") (zero? (get-in @s ["inv" "rows"])))
+            (do (say "NOTHING the log already holds every listed block") 0)
+            (= name until) 0
+            :else (recur more))))))
+
+(defn finished? [work]
+  (let [s (try (g/parse-json (.readFileSync fs (.join path work "cycle-state.json") "utf8")) (catch :default _ nil))
+        done (set (get s "done"))]
+    (boolean (or (done "reader") (and (done "delta") (zero? (get-in s ["inv" "rows"] -1)))))))
+
+(defn pick-work
+  "The newest unfinished run under root, else a new dated one. Resuming
+   matters: a run stopped after `submit` has already committed its epoch."
+  [root]
+  (.mkdirSync fs root #js {:recursive true})
+  (let [runs (sort (filter #(str/starts-with? % "run-") (array-seq (.readdirSync fs root))))]
+    (if (and (seq runs) (not (finished? (.join path root (last runs)))))
+      (.join path root (last runs))
+      (let [iso (.toISOString (js/Date.))]
+        (.join path root (str "run-" (str/replace (subs iso 0 10) "-" "") "T" (subs iso 11 13) (subs iso 14 16) "Z"))))))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))
+        cfg (g/parse-json (.readFileSync fs (one "--config") "utf8"))
+        work (or (one "--work") (pick-work (one "--work-root")))]
+    (say "work" work)
+    (let [cyc (make-cycle cfg work)]
+      (js/process.exit
+       (try (run! cyc (one "--until"))
+            (catch :default e
+              (save! cyc)
+              (case (g/kind e)
+                :refused (do (say "REFUSE" (g/message e)) 1)
+                (do (say "UNMEASURED" (g/message e)) 3))))))))
+
+(when (some #(str/ends-with? % "lake_epoch_cycle.cljk") (array-seq (aget js/process "argv")))
+  (main))

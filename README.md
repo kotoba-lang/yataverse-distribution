@@ -1418,3 +1418,14 @@ Both are valid, because the namespace signature covers dag-cbor, which is order-
 - **`graph_head/py-json-str`** writes receipts in Python's default `json.dumps(sort_keys=True)` form, so receipts keep their bytes.
 
 The Python originals stay until `lake_epoch_cycle` (which calls them) is ported.
+
+### Capture and the epoch cycle in kotoba (2026-10-07)
+
+- **`deploy/capture_lake_inventory.cljk`** replaces the curl subprocess with `fetch` under the same rules: loopback HTTP or HTTPS only, a 2 MB page cap, a 45 s timeout, transport retries at the same cursor, and no retry on malformed data.
+  - **Cross-check, live.** Python walked 3 pages. kotoba walked 2 pages, stopped, and resumed for the third, at the same cutoff. The partial inventories were byte-identical (600 rows), and every checkpoint field matched except the output path. A walk either tool started can be resumed by the other.
+  - Python's `flock` became an exclusive lock file holding the pid, taken over when its holder is dead.
+- **`deploy/lake_epoch_cycle.cljk`** has the same steps, checks and `cycle-state.json`, so either version can resume a run the other started.
+  - It runs this directory's kotoba tools (capture, diff, delta, manifest).
+  - Until they are ported, it calls the remote Python tools on xavier and jacob exactly as before.
+  - `test/lake_epoch_cycle_test.cljk` covers the step order and run selection: a run stopped after `submit` is resumed, not restarted.
+- The manifest relation now says `lake_epoch delta`, the method rather than the Python file.

@@ -1,0 +1,272 @@
+;; deploy/capture_lake_inventory.cljk — capture a complete, resumable public
+;; lake listing without publishing a partial snapshot (ADR-2610062000 P2).
+;; Ported from capture_lake_inventory.py; inventory and checkpoint carry the
+;; same content, and a walk either tool started can be resumed by the other.
+;;
+;; The listing is ordered by CID but is not an atomic snapshot, so a completed
+;; walk is a dated candidate until a second walk agrees
+;; (diff_lake_inventory.cljk) and the old inventory is proved a subset.
+;;
+;; Every page is appended to <output>.partial and checkpointed (cursor, rows,
+;; bytes, sha256, last CID). On resume the partial file is truncated to the
+;; checkpoint (a crash may leave one uncheckpointed page) and re-hashed before
+;; the cursor is trusted. Transport failures are retried at the same cursor;
+;; malformed data never is.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> capture_lake_inventory.cljk ...):
+;;   --output=F --state=F --old-inventory=F --old-sha256=HEX
+;;   [--api-url=https://yataverse.com/api/v1/lake/blocks] [--cutoff-utc=YYYY-MM-DDTHH:MM:SSZ] [--max-pages=N]
+;;
+;; Exit codes: 0 complete or in progress (the state is printed); 2 refused.
+
+(ns capture-lake-inventory
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [diff-lake-inventory :as d]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def nc (js/require "node:crypto"))
+
+(def default-api "https://yataverse.com/api/v1/lake/blocks")
+(def page-limit (* 2 1000 1000))
+
+(defn- refuse [msg] (throw (ex-info msg {:kind :refused})))
+(defn- transport [msg] (throw (ex-info msg {:kind :transport})))
+(defn- sha-file [p] (-> (.createHash nc "sha256") (.update (.readFileSync fs p)) (.digest "hex")))
+(def empty-sha (-> (.createHash nc "sha256") (.digest "hex")))
+
+;; ── time ────────────────────────────────────────────────────────────────────
+
+(defn parse-cutoff [s]
+  (when s
+    (when-not (re-matches #"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ" s) (refuse "cutoff must be a UTC timestamp ending in Z"))
+    (let [t (js/Date.parse s)]
+      (when (> t (js/Date.now)) (refuse "cutoff must not be in the future"))
+      t)))
+
+(def ^:private months {"Jan" 0 "Feb" 1 "Mar" 2 "Apr" 3 "May" 4 "Jun" 5 "Jul" 6 "Aug" 7 "Sep" 8 "Oct" 9 "Nov" 10 "Dec" 11})
+
+(defn uploaded-utc
+  "The listing's `uploaded` (JS Date#toString in UTC) -> epoch ms."
+  [s]
+  (let [m (re-matches #"\w{3} (\w{3}) (\d\d) (\d{4}) (\d\d):(\d\d):(\d\d) GMT\+0000 \(Coordinated Universal Time\)" (str s))]
+    (when-not (and m (contains? months (nth m 1))) (refuse "listing uploaded time is not the expected UTC form"))
+    (let [[_ mon day year h mi sec] m]
+      (js/Date.UTC (js/parseInt year 10) (months mon) (js/parseInt day 10)
+                   (js/parseInt h 10) (js/parseInt mi 10) (js/parseInt sec 10)))))
+
+;; ── files ───────────────────────────────────────────────────────────────────
+
+(defn atomic-json! [p v]
+  (let [tmp (str p "." (.randomUUID nc) ".partial")]
+    (.writeFileSync fs tmp (str (g/py-json-str v) "\n") #js {:flag "wx"})
+    (.renameSync fs tmp p)))
+
+(defn scan-partial!
+  "Truncate `p` to the checkpointed size and re-read it. -> {sha256 rows bytes last_cid}."
+  [p size]
+  (when (< (.-size (.statSync fs p)) size) (refuse "partial inventory is shorter than checkpoint"))
+  (.truncateSync fs p size)
+  (let [data (.readFileSync fs p)
+        rows (d/inventory-rows p)]
+    {"sha256" (-> (.createHash nc "sha256") (.update data) (.digest "hex"))
+     "rows" (count rows) "bytes" (reduce + 0 (map second rows))
+     "last_cid" (or (first (last rows)) "")}))
+
+(defn require-superset
+  "Every old row is in `new-path` with its size. -> the old row count."
+  [old-path new-path old-sha]
+  (when-not (= old-sha (sha-file old-path)) (refuse "old inventory digest differs"))
+  (let [old (d/inventory-rows old-path)
+        new (d/inventory-rows new-path)]
+    (loop [o old n new]
+      (if-let [[cid size] (first o)]
+        (let [n (drop-while #(< (compare (first %) cid) 0) n)]
+          (when-not (and (seq n) (= cid (ffirst n)) (= size (second (first n))))
+            (refuse (str "new inventory omits or changes old CID: " cid)))
+          (recur (rest o) n))
+        (count old)))))
+
+;; ── the listing ─────────────────────────────────────────────────────────────
+
+(defn- local-listing? [u]
+  (let [p (js/URL. u)]
+    (and (= "http:" (.-protocol p)) (= "127.0.0.1" (.-hostname p)) (= "/api/v1/lake/blocks" (.-pathname p)) (= "" (.-search p)))))
+
+(defn fetch-listing
+  "-> Promise of the listing page (JS object). Transport failures reject
+   with :transport; a malformed page with :refused."
+  [api-url cursor]
+  (let [u (js/URL. api-url)
+        loopback? (and (= "http:" (.-protocol u)) (= "127.0.0.1" (.-hostname u)))]
+    (when-not (or loopback? (= "https:" (.-protocol u))) (refuse "HTTP source must be loopback or HTTPS"))
+    (let [q (str (if (local-listing? api-url) "" "?limit=200")
+                 (when cursor (str (if (local-listing? api-url) "?" "&") "cursor=" (js/encodeURIComponent cursor))))]
+      (-> (js/fetch (str api-url q) #js {:signal (js/AbortSignal.timeout 45000)
+                                         ;; a loopback reader must not redirect outside its authority
+                                         :redirect (if loopback? "error" "follow")})
+          (.catch (fn [e] (transport (str "fetch failed: " (.-message e)))))
+          (.then (fn [r]
+                   (when-not (.-ok r) (transport (str "listing HTTP " (.-status r))))
+                   (.arrayBuffer r)))
+          (.then (fn [buf]
+                   (when (> (.-byteLength buf) page-limit) (refuse "lake listing page exceeds 2 MB"))
+                   (let [l (try (js/JSON.parse (.toString (js/Buffer.from buf) "utf8"))
+                                (catch :default e (refuse (str "lake listing is not JSON: " (.-message e)))))
+                         blocks (.-blocks l)]
+                     (when-not (true? (.-ok l)) (refuse "lake listing did not return ok=true"))
+                     (when-not (and (array? blocks) (pos? (.-length blocks)) (<= (.-length blocks) 200))
+                       (refuse "lake listing has no bounded block page"))
+                     (when-not (boolean? (aget l "truncated?")) (refuse "lake listing has no truncation verdict"))
+                     (when-not (or (nil? (.-cursor l)) (string? (.-cursor l))) (refuse "lake listing cursor is not a string"))
+                     (when (and (aget l "truncated?") (not (.-cursor l))) (refuse "truncated lake listing has no cursor"))
+                     (doseq [b (array-seq blocks)]
+                       (when-not (d/valid-cid? (.-cid b)) (refuse "lake listing contains an invalid CID"))
+                       (when-not (and (js/Number.isInteger (.-size b)) (pos? (.-size b)))
+                         (refuse "lake listing contains an invalid block size")))
+                     l)))))))
+
+(defn- sleep [ms] (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+
+(defn fetch-page
+  "Retry transport failures at the same cursor (6 tries, backoff to 16 s);
+   never retry malformed data."
+  [api-url cursor]
+  ((fn attempt [n]
+     (-> (js/Promise.resolve nil)
+         (.then (fn [_] (fetch-listing api-url cursor)))
+         (.catch (fn [e]
+                   (if (and (= :transport (g/kind e)) (< n 5))
+                     (.then (sleep (* 1000 (min (js/Math.pow 2 n) 16))) #(attempt (inc n)))
+                     (throw e))))))
+   0))
+
+;; ── the walk ────────────────────────────────────────────────────────────────
+
+(defn- complete-result [state old-rows]
+  {"status" "complete" "rows" (get state "rows") "bytes" (get state "bytes") "sha256" (get state "sha256")
+   "old_rows" old-rows "pages" (get state "pages")})
+
+(defn capture!
+  "-> Promise of the result map."
+  [{:keys [api-url output state-path old-inventory old-sha256 cutoff-utc max-pages]}]
+  (let [cutoff (parse-cutoff cutoff-utc)
+        output (.resolve path output)
+        partial (str output ".partial")
+        state-path (.resolve path state-path)
+        same-identity? (fn [s] (and (= 1 (get s "schema")) (= api-url (get s "api_url")) (= output (get s "output"))
+                                    (= cutoff-utc (get s "cutoff_utc"))))]
+    (when (or (contains? #{output partial} (.resolve path old-inventory)) (contains? #{output partial} state-path))
+      (refuse "capture paths overlap"))
+    (let [old-sha (sha-file old-inventory)]
+      (when-not (= old-sha old-sha256) (refuse "old inventory digest differs"))
+      (cond
+        ;; a completed output: report it, or finish its superset check
+        (.existsSync fs output)
+        (do (when (or (not (.existsSync fs state-path)) (.existsSync fs partial)) (refuse "completed output already exists"))
+            (let [s (g/parse-json (.readFileSync fs state-path "utf8"))]
+              (when-not (and (same-identity? s) (= old-sha (get s "old_sha256"))
+                             (= (.-size (.statSync fs output)) (get s "size")) (= (sha-file output) (get s "sha256")))
+                (refuse "completed output differs from checkpoint"))
+              (case (get s "status")
+                "complete" (js/Promise.resolve (complete-result s (get s "old_rows")))
+                "in-progress" (let [old-rows (require-superset old-inventory output old-sha)]
+                                (atomic-json! state-path (assoc s "status" "complete" "old_rows" old-rows))
+                                (js/Promise.resolve (complete-result s old-rows)))
+                (refuse "completed output has invalid checkpoint"))))
+        :else
+        (let [s0 (if (.existsSync fs state-path)
+                   (let [s (g/parse-json (.readFileSync fs state-path "utf8"))]
+                     (when-not (and (same-identity? s) (= old-sha (get s "old_sha256")) (= "in-progress" (get s "status")))
+                       (refuse "checkpoint identity differs"))
+                     (when-not (.existsSync fs partial) (refuse "checkpoint has no partial inventory"))
+                     s)
+                   (do (when (.existsSync fs partial) (refuse "uncheckpointed partial inventory exists"))
+                       (.mkdirSync fs (.dirname path partial) #js {:recursive true})
+                       (.writeFileSync fs partial "" #js {:flag "wx"})
+                       (let [s {"schema" 1 "api_url" api-url "output" output "cutoff_utc" cutoff-utc
+                                "old_sha256" old-sha "status" "in-progress" "cursor" nil "pages" 0 "size" 0
+                                "rows" 0 "bytes" 0 "last_cid" "" "last_seen_cid" "" "sha256" empty-sha}]
+                         (atomic-json! state-path s)
+                         s)))
+              scanned (scan-partial! partial (get s0 "size"))]
+          (when-not (every? #(= (get scanned %) (get s0 %)) ["sha256" "rows" "bytes" "last_cid"])
+            (refuse "partial inventory differs from checkpoint"))
+          (when (< (compare (get s0 "last_seen_cid" (get s0 "last_cid")) (get s0 "last_cid")) 0)
+            (refuse "checkpoint seen CID precedes stored CID"))
+          (let [running (doto (.createHash nc "sha256") (.update (.readFileSync fs partial)))]
+            ((fn page [state pages]
+               (if (and max-pages (>= pages max-pages))
+                 (js/Promise.resolve {"status" "in-progress" "rows" (get state "rows") "pages" (get state "pages")
+                                      "cursor" (get state "cursor")})
+                 (.then (fetch-page api-url (get state "cursor"))
+                        (fn [l]
+                          (let [cursor (.-cursor l) truncated? (aget l "truncated?")]
+                            (when (and truncated? (= cursor (get state "cursor"))) (refuse "listing cursor did not advance"))
+                            (let [{:keys [lines bytes last-included previous]}
+                                  (reduce (fn [acc b]
+                                            (let [cid (.-cid b) size (.-size b)]
+                                              (when (<= (compare cid (:previous acc)) 0) (refuse "listing order repeated or moved backward"))
+                                              (if (and cutoff (> (uploaded-utc (.-uploaded b)) cutoff))
+                                                (assoc acc :previous cid)
+                                                (-> acc (assoc :previous cid :last-included cid)
+                                                    (update :bytes + size)
+                                                    (update :lines conj (str "{\"cid\":\"" cid "\",\"bytes\":" size "}\n"))))))
+                                          {:lines [] :bytes 0 :last-included (get state "last_cid")
+                                           :previous (get state "last_seen_cid" (get state "last_cid"))}
+                                          (array-seq (.-blocks l)))
+                                  payload (js/Buffer.from (apply str lines) "utf8")]
+                              (.appendFileSync fs partial payload)
+                              (.update running payload)
+                              (let [state (assoc state "cursor" cursor "pages" (inc (get state "pages"))
+                                                 "size" (+ (get state "size") (.-length payload))
+                                                 "rows" (+ (get state "rows") (count lines))
+                                                 "bytes" (+ (get state "bytes") bytes)
+                                                 "last_cid" last-included "last_seen_cid" previous
+                                                 ;; a copy: digest() would end the running hash
+                                                 "sha256" (.digest (.copy running) "hex"))]
+                                (atomic-json! state-path state)
+                                (if truncated?
+                                  (page state (inc pages))
+                                  (let [old-rows (require-superset old-inventory partial old-sha)]
+                                    (.renameSync fs partial output)
+                                    (atomic-json! state-path (assoc state "status" "complete" "old_rows" old-rows))
+                                    (complete-result state old-rows))))))))))
+             s0 0)))))))
+
+;; ── lock and main ───────────────────────────────────────────────────────────
+
+(defn- alive? [pid] (try (.kill js/process pid 0) true (catch :default _ false)))
+
+(defn take-lock!
+  "An exclusive lock file holding this pid; a stale one (dead holder) is taken over."
+  [lock]
+  (try (.writeFileSync fs lock (str (.-pid js/process)) #js {:flag "wx"})
+       (catch :default _
+         (let [holder (js/parseInt (str (.readFileSync fs lock "utf8")) 10)]
+           (when (and (pos? holder) (alive? holder)) (refuse "inventory capture already running"))
+           (.writeFileSync fs lock (str (.-pid js/process)))))))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))
+        opts {:api-url (or (one "--api-url") default-api) :output (one "--output") :state-path (one "--state")
+              :old-inventory (one "--old-inventory") :old-sha256 (one "--old-sha256") :cutoff-utc (one "--cutoff-utc")
+              :max-pages (some-> (one "--max-pages") (js/parseInt 10))}
+        die (fn [e] (.write js/process.stderr (str "REFUSED: " (g/message e) "\n")) (js/process.exit 2))]
+    (when (and (:max-pages opts) (< (:max-pages opts) 1)) (die (js/Error. "max-pages must be positive")))
+    (try
+      (.mkdirSync fs (.dirname path (:state-path opts)) #js {:recursive true})
+      (let [lock (str (:state-path opts) ".lock")]
+        (take-lock! lock)
+        (-> (capture! opts)
+            (.then (fn [r] (println (g/py-json-str r)) (.rmSync fs lock #js {:force true}) (js/process.exit 0)))
+            (.catch (fn [e] (.rmSync fs lock #js {:force true}) (die e)))))
+      (catch :default e (die e)))))
+
+(when (some #(str/ends-with? % "capture_lake_inventory.cljk") (array-seq (aget js/process "argv")))
+  (main))
