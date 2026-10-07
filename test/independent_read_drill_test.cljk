@@ -1,0 +1,14 @@
+;; Gate for deploy/independent_read_drill.cljk digest-of (the trust root of the block check).
+(ns independent-read-drill-test
+  (:require [independent-read-drill :as d]))
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+(println "independent-read-drill gate:")
+(check "CIDv1 raw: digest from the CID text (the P6 action block)"
+       (= "ce6e414e6b067918a7067af47fe557e815838c0ce2f0094c96e5e35dddb52e31"
+          (.toString (d/digest-of "bafkreigonzau42ygpemkobt26r76kv7icwbyydhc6aeuzfxf4no53njoge") "hex")))
+(check "CIDv0: sha256 of the empty unixfs directory (0a020801)"
+       (= (.toString (d/sha256 (js/Buffer.from "0a020801" "hex")) "hex")
+          (.toString (d/digest-of "QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn") "hex")))
+(if (zero? @failures) (println "independent-read-drill gate: ok")
+    (do (println "independent-read-drill gate:" @failures "failed") (js/process.exit 1)))
