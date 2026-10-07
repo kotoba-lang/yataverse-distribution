@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>cloud.yataverse.main2-writer-p2p-mount</string>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/python3</string>
+		<string>-u</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-writer/bin/p2p_mount.py</string>
+		<string>--ipfs</string>
+		<string>/opt/homebrew/bin/ipfs</string>
+		<string>--target</string>
+		<string>/ip4/127.0.0.1/tcp/18130</string>
+		<string>--loop</string>
+		<string>30</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/junkawasaki/.local/share/yataverse-writer/logs/p2p-mount.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/junkawasaki/.local/share/yataverse-writer/logs/p2p-mount.out.log</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+</dict>
+</plist>

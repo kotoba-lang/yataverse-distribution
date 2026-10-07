@@ -262,7 +262,9 @@ def handler(writer):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--host", action="append",
+                   help="address to listen on; repeat for several (default 127.0.0.1). The libp2p mount "
+                        "(p2p_mount.py) targets loopback, so that path never depends on the tailnet")
     p.add_argument("--port", type=int, default=18130)
     p.add_argument("--signer", action="append", required=True, help="pinned namespace head-signer did:key")
     p.add_argument("--verifier", required=True, help="command prefix running lake_head.cljk (with --writer-seed)")
@@ -282,9 +284,13 @@ def main(argv=None):
         p.error("each document needs two custodians: --pin-cmd twice, or --pin-cmd and --pulled-by")
     if not 1 <= a.sync_pins <= len(a.pin_cmd):
         p.error("--sync-pins must be between 1 and the number of --pin-cmd")
-    srv = ThreadingHTTPServer((a.host, a.port), handler(Writer(a)))
-    print(f"yataverse-writer on {a.host}:{a.port}", flush=True)
-    srv.serve_forever()
+    hosts = a.host or ["127.0.0.1"]
+    w = Writer(a)
+    servers = [ThreadingHTTPServer((h, a.port), handler(w)) for h in hosts]
+    for srv in servers[1:]:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"yataverse-writer on {', '.join(f'{h}:{a.port}' for h in hosts)}", flush=True)
+    servers[0].serve_forever()
 
 
 if __name__ == "__main__":
