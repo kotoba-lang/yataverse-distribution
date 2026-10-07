@@ -1141,3 +1141,21 @@ Seven unit tests cover the decision.
 - The writer listens on main-2's tailnet address (100.108.223.94:18130), and the mirror uses that address.
 
 **Measured.** A real write with `expected {sequence: 3665}` committed R2 head 3666 as seq 24 in 18.7 s, end to end. Most of that is a cold node start for each verification and the two pins over ssh. Those are the next things to cut.
+
+**The Worker's entrance and the follower (2026-10-07, P5 step 3).**
+
+**Public entrance.** The Worker reaches the writer at `https://yataverse-writer.220-146-170-114.sslip.io`. That is xavier's nginx (`deploy/xavier-yataverse-writer*.conf`), proxying over the tailnet to main-2:18130.
+
+| Probe | Result |
+|---|---|
+| Forged signer | 403 (refused by the writer) |
+| `PUT` | 403 |
+| 20 KB body | 413 |
+| Other paths | 404 |
+| 20 concurrent requests | 9 rejected with 503 |
+
+The entrance is rate-limited at 2 r/s per address with a burst of 10, takes bodies up to 16 KB, and allows GET and POST only. It has its own Let's Encrypt certificate (webroot). The read-only lake site keeps refusing non-GET.
+
+**Worker side.** cloud-kotoba/kotobase-control-plane#775 adds `KOTOBASE_HEAD_INGA=writer`. It is off until the yataverse env sets it and is deployed; that is the cutover.
+
+**Follower.** `deploy/main2-r2-head-follower.plist` runs `r2_head_follower.py` in check mode every 10 minutes. The first run reported three graphs `AGREE` and one `R2-AHEAD` by one sequence, which is normal while R2 is still the authority.

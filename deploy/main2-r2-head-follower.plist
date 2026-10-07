@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/junkawasaki</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>Label</key>
+	<string>cloud.yataverse.main2-r2-head-follower</string>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/python3</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-writer/bin/r2_head_follower.py</string>
+		<string>--graph</string>
+		<string>bafyreiha3q2g6ghjzjtydkvsudnixlbpbf6dlw6b7etd2l3ch4mbruv54e</string>
+		<string>--graph</string>
+		<string>bafyreicdx5lzw5bqgxgek4gqtoh3tuivdjglmqax6tqjo734wpx3lfo3sq</string>
+		<string>--graph</string>
+		<string>bafyreidnpq2mwo6ood7xdvu2nztpz6azag233kateilpboddthp4ybpyh4</string>
+		<string>--graph</string>
+		<string>bafyreig6tog2dqujgwgmmzu2gycl2m4nhetgwsbp3thlxk6lteqj5bdjr4</string>
+		<string>--writer-url</string>
+		<string>http://100.108.223.94:18130</string>
+		<string>--r2-get-cmd</string>
+		<string>/opt/homebrew/bin/wrangler r2 object get kotobase-graph-database-production/heads/yataverse/ipns/{graph}.json --remote --pipe</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/junkawasaki/.local/share/yataverse-writer/logs/follower.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/junkawasaki/.local/share/yataverse-writer/logs/follower.out.log</string>
+	<key>StartInterval</key>
+	<integer>600</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/junkawasaki/.local/share/yataverse-writer</string>
+</dict>
+</plist>
