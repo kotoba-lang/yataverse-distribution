@@ -1,0 +1,191 @@
+;; deploy/verify_lake_leaves.cljk — resume an offline, CID-checked readback of
+;; one dated lake inventory (ADR-2610062000). Ported from
+;; verify_lake_leaves.py; the checkpoint is the same, so a readback either
+;; tool started can be resumed by the other.
+;;
+;; Each round reads up to --max-rows / --max-bytes blocks from the raw block
+;; store or, offline, from this host's Kubo, checks size and CID, and folds
+;; the result into a running scan hash:
+;;   sha256(prev || cursor u64 || cid || size u64 || "present"|"missing" || sha256(bytes) or 0^32)
+;; A missing block stops the round ("waiting") unless --scan-gaps.
+;; This measures bytes at scan time; pin coverage is audit_lake's question.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> verify_lake_leaves.cljk ...):
+;;   --inventory=F --sha256=HEX --count=N --ipfs-bin=PATH --ipfs-path=DIR
+;;   --rpc-url=http://127.0.0.1:PORT --raw-block-store=DIR --state=F
+;;   [--max-rows=200] [--max-bytes=256000000] [--scan-gaps]
+;;
+;; Exit codes: 0 a round ran (the state is printed); 2 refused.
+
+(ns verify-lake-leaves
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [lake-inventory :as li]
+            [raw-block-store :as r]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def nc (js/require "node:crypto"))
+(def http (js/require "node:http"))
+
+(def max-block 256000000)
+(defn- refuse [msg] (throw (ex-info msg {:kind :readback})))
+
+(defn verify-repository
+  "-> [peer port]. The RPC must be uncredentialed loopback HTTP, and the
+   daemon answering it must be the repository's own identity."
+  [ipfs-bin ipfs-path rpc-url]
+  (let [repo (.resolve path ipfs-path)
+        u (try (js/URL. rpc-url) (catch :default _ (refuse "Kubo RPC must be uncredentialed loopback HTTP")))]
+    (when-not (and (= "http:" (.-protocol u)) (= "127.0.0.1" (.-hostname u)) (seq (.-port u))
+                   (#{"" "/"} (.-pathname u)) (= "" (.-search u)) (= "" (.-hash u)) (= "" (.-username u)) (= "" (.-password u)))
+      (refuse "Kubo RPC must be uncredentialed loopback HTTP"))
+    (let [[peer api] (try [(.. (js/JSON.parse (.readFileSync fs (.join path repo "config") "utf8")) -Identity -PeerID)
+                           (str/trim (.readFileSync fs (.join path repo "api") "utf8"))]
+                          (catch :default _ (refuse "Kubo repository identity is unavailable")))]
+      (when-not (and (string? peer) (seq peer) (= api (str "/ip4/127.0.0.1/tcp/" (.-port u))))
+        (refuse "Kubo repository API or identity differs"))
+      (let [r (.spawnSync (js/require "node:child_process") ipfs-bin #js ["id" "-f" "<id>"]
+                          #js {:encoding "utf8" :timeout 10000
+                               :env (doto (js/Object.assign #js {} (aget js/process "env")) (aset "IPFS_PATH" repo))})]
+        (when-not (and (zero? (.-status r)) (= peer (str/trim (str (.-stdout r)))))
+          (refuse "Kubo daemon uses a different repository"))
+        [peer (js/parseInt (.-port u) 10)]))))
+
+(defn- rpc-block-get
+  "-> Promise of Buffer, nil when the block is not held locally, or reject."
+  [port cid size]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [req (.request http #js {:host "127.0.0.1" :port port :method "POST" :timeout 120000
+                                   :path (str "/api/v0/block/get?arg=" (js/encodeURIComponent cid) "&offline=true")}
+                         (fn [res]
+                           (let [chunks #js [] n (atom 0)]
+                             (.on res "data" (fn [c] (swap! n + (.-length c)) (.push chunks c)))
+                             (.on res "end"
+                                  (fn []
+                                    (let [body (js/Buffer.concat chunks)]
+                                      (cond
+                                        (= 200 (.-statusCode res))
+                                        (if (= size (.-length body)) (resolve body) (reject (ex-info (str "local block size differs for " cid) {:kind :readback})))
+                                        (and (= 500 (.-statusCode res))
+                                             (let [m (try (.-Message (js/JSON.parse (str body))) (catch :default _ nil))]
+                                               (and (string? m) (str/starts-with? m "block was not found locally (offline):") (str/includes? m cid))))
+                                        (resolve nil)
+                                        :else (reject (ex-info (str "Kubo RPC refused block read for " cid) {:kind :readback})))))))))]
+       (.on req "error" (fn [_] (reject (ex-info "Kubo RPC block read failed" {:kind :readback}))))
+       (.on req "timeout" (fn [] (.destroy req)))
+       (.end req)))))
+
+(defn read-block
+  "-> Promise of the bytes (raw store first, then Kubo offline) or nil."
+  [port raw-root cid size]
+  (when-not (<= 1 size max-block) (refuse "inventory block exceeds readback limit"))
+  (let [raw (try (r/read-block raw-root cid max-block) (catch :default _ (refuse (str "raw block store refused " cid))))]
+    (if raw (js/Promise.resolve raw) (rpc-block-get port cid size))))
+
+(defn fresh-state [inv repo peer]
+  {"schema" 1 "inventory_sha256" (:sha256 inv) "inventory_rows" (li/row-count inv) "repository" repo
+   "peer_id" peer "cursor" 0 "present_rows" 0 "present_bytes" 0 "missing_rows" 0 "missing_bytes" 0
+   "scan_sha256" (apply str (repeat 64 "0"))})
+
+(defn load-state [p inv repo peer]
+  (let [expected (fresh-state inv repo peer)]
+    (if-not (.existsSync fs p)
+      expected
+      (let [s (try (g/parse-json (.readFileSync fs p "utf8")) (catch :default _ (refuse "readback checkpoint is unreadable")))
+            ints ["cursor" "present_rows" "present_bytes" "missing_rows" "missing_bytes"]]
+        (when-not (and (map? s) (= (set (keys s)) (set (keys expected)))
+                       (every? #(= (get s %) (get expected %)) ["schema" "inventory_sha256" "inventory_rows" "repository" "peer_id"])
+                       (every? #(and (js/Number.isInteger (get s %)) (>= (get s %) 0)) ints)
+                       (<= (get s "cursor") (get expected "inventory_rows"))
+                       (= (get s "cursor") (+ (get s "present_rows") (get s "missing_rows")))
+                       (string? (get s "scan_sha256")) (re-matches #"[0-9a-f]{64}" (get s "scan_sha256")))
+          (refuse "readback checkpoint differs from repository or inventory"))
+        s))))
+
+(defn- u64 [n] (let [b (js/Buffer.alloc 8)] (.writeBigUInt64BE b (js/BigInt n)) b))
+
+(defn fold
+  "Pure. The next scan hash."
+  [scan-hex cursor cid size kind digest]
+  (-> (.createHash nc "sha256")
+      (.update (js/Buffer.concat #js [(js/Buffer.from scan-hex "hex") (u64 cursor) (js/Buffer.from cid "ascii")
+                                      (u64 size) (js/Buffer.from kind) digest]))
+      (.digest "hex")))
+
+(defn advance
+  "-> Promise of the next state with \"status\"."
+  [inv state reader max-rows max-bytes stop-at-missing?]
+  (if (= (get state "cursor") (li/row-count inv))
+    (js/Promise.resolve (assoc state "status" (if (zero? (get state "missing_rows")) "complete" "partial")))
+    (let [[rs _] (li/rows inv (get state "cursor") max-rows)]
+      ((fn step [rs cur added]
+         (let [[row & more] rs]
+           (if (nil? row)
+             (js/Promise.resolve (assoc cur "status" (if (and (= (get cur "cursor") (li/row-count inv)) (zero? (get cur "missing_rows"))) "complete" "partial")))
+             (let [cid (get row "cid") size (get row "size")]
+               (cond
+                 (and (pos? added) (> (+ added size) max-bytes))
+                 (js/Promise.resolve (assoc cur "status" "partial"))
+                 (> size max-bytes) (refuse "single inventory block exceeds batch byte limit")
+                 :else
+                 (.then (reader cid size)
+                        (fn [data]
+                          (if (and (nil? data) stop-at-missing?)
+                            (assoc cur "status" "waiting")
+                            (let [present? (some? data)]
+                              (when present?
+                                (when-not (= size (.-length data)) (refuse (str "local block size differs for " cid)))
+                                (try (r/verify-cid cid data) (catch :default _ (refuse (str "local block CID differs from bytes: " cid)))))
+                              (let [digest (if present? (-> (.createHash nc "sha256") (.update data) (.digest)) (js/Buffer.alloc 32))
+                                    cur (-> cur
+                                            (update (if present? "present_rows" "missing_rows") inc)
+                                            (update (if present? "present_bytes" "missing_bytes") + size)
+                                            (assoc "scan_sha256" (fold (get cur "scan_sha256") (get cur "cursor") cid size
+                                                                       (if present? "present" "missing") digest))
+                                            (update "cursor" inc))]
+                                (step more cur (+ added size))))))))))))
+       rs state 0))))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [one #(first (flags %))
+        argv (set (array-seq (aget js/process "argv")))
+        max-rows (js/parseInt (or (one "--max-rows") "200") 10)
+        max-bytes (js/parseInt (or (one "--max-bytes") "256000000") 10)
+        die (fn [e] (.write js/process.stderr (str "REFUSED: " (g/message e) "\n")) (js/process.exit 2))]
+    (when-not (and (re-matches #"[0-9a-f]{64}" (str (one "--sha256"))) (pos? (js/parseInt (one "--count") 10))
+                   (<= 1 max-rows 1000) (<= 1 max-bytes 512000000))
+      (die (js/Error. "invalid inventory or batch bound")))
+    (try
+      (let [inv (li/open-inventory (one "--inventory") (one "--sha256") (js/parseInt (one "--count") 10))
+            [peer port] (verify-repository (one "--ipfs-bin") (one "--ipfs-path") (one "--rpc-url"))
+            state-path (one "--state")
+            lock (str state-path ".lock")
+            repo (.resolve path (one "--ipfs-path"))]
+        (.mkdirSync fs (.dirname path state-path) #js {:recursive true})
+        (try (.writeFileSync fs lock (str (.-pid js/process)) #js {:flag "wx"})
+             (catch :default _
+               (let [holder (js/parseInt (str (.readFileSync fs lock "utf8")) 10)]
+                 (when (and (pos? holder) (try (.kill js/process holder 0) true (catch :default _ false)))
+                   (refuse "readback already running"))
+                 (.writeFileSync fs lock (str (.-pid js/process))))))
+        (let [state (load-state state-path inv repo peer)]
+          (-> (advance inv state #(read-block port (one "--raw-block-store") %1 %2) max-rows max-bytes (not (contains? argv "--scan-gaps")))
+              (.then (fn [result]
+                       (let [status (get result "status") result (dissoc result "status")]
+                         (when (not= result state)
+                           (.writeFileSync fs (str state-path ".partial") (str (g/py-json-str result) "\n"))
+                           (.renameSync fs (str state-path ".partial") state-path))
+                         (.rmSync fs lock #js {:force true})
+                         (println (g/py-json-str (assoc result "status" status "scope" "offline leaf size and CID at scan time; pin coverage separate")))
+                         (js/process.exit 0))))
+              (.catch (fn [e] (.rmSync fs lock #js {:force true}) (die e))))))
+      (catch :default e (die e)))))
+
+(when (some #(str/ends-with? % "verify_lake_leaves.cljk") (array-seq (aget js/process "argv")))
+  (main))

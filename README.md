@@ -1427,3 +1427,9 @@ The Python originals stay until `lake_epoch_cycle` (which calls them) is ported.
 - **Live.** On xavier's real store, 9/9 blocks read back and verified under node 18.
 
 The Python module stays while other Python tools import it.
+
+### Leaf readback in kotoba (2026-10-07)
+
+- **`deploy/lake_inventory.cljk`** is the inventory index from `serve_lake.Inventory`: declared digest and count, no duplicate CIDs, rows by offset, and a refusal when the file changes. It keeps Python's deliberately permissive CID check.
+- **`deploy/verify_lake_leaves.cljk`** reads blocks from the raw store first, then from Kubo offline. It checks size and CID, folds the same running scan hash, and keeps the same checkpoint.
+  - **Live on xavier** over epoch 4's 24 blocks: Python ran one round and kotoba two (10 rows, then the rest). The final checkpoints are byte-identical, scan hash included, so either tool resumes the other's readback.
