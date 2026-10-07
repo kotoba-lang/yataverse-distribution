@@ -1,0 +1,16 @@
+[Unit]
+Description=Mount yataverse-writer as libp2p protocol /x/yataverse/graph-head/1 on xavier's Kubo
+After=ipfs.service yataverse-writer.service
+Wants=ipfs.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /home/xavier/.local/share/yataverse-writer/bin/p2p_mount.py --ipfs "env IPFS_PATH=/mnt/nvme/ipfs-xavier/repo /mnt/nvme/ipfs-xavier/bin/ipfs" --target /ip4/127.0.0.1/tcp/18130 --loop 30
+StandardOutput=append:/home/xavier/.local/share/yataverse-writer/logs/p2p-mount.out.log
+StandardError=append:/home/xavier/.local/share/yataverse-writer/logs/p2p-mount.err.log
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

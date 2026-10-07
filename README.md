@@ -1294,3 +1294,47 @@ A document that fails validation is unpinned and reported as a `WARRANT` line wi
 - The entrance is xavier's nginx, and both writers sit behind it.
 - The Worker knows one URL.
 - main-2's writer still pushes to jacob over ssh, as well as the pull.
+
+## Writers over libp2p (2026-10-07, after Holochain)
+
+**Goal.** A writer should be reachable without an inbound address and without Tailscale, DNS or Cloudflare. In Holochain, nodes only dial out, and a replaceable relay carries traffic to peers behind NAT. Here every writer is also a libp2p protocol, `/x/yataverse/graph-head/1`. Kubo's `Experimental.Libp2pStreamMounting` maps that protocol onto the writer's HTTP port.
+
+**Pieces.**
+
+- `deploy/p2p_mount.py` keeps the mount in place. `ipfs p2p listen` does not survive a Kubo restart, so the script checks `ipfs p2p ls` every 30 s and re-registers when the mount is gone. After a main-2 Kubo restart it remounted in about 12 s.
+  - `--target` (listen) is used on both writer hosts, aimed at the writer on loopback.
+  - `--forward-to PEER --listen ADDR` is used on xavier. It opens main-2's writer at `127.0.0.1:18131`.
+- `deploy/p2p_writer_drill.py` reaches each writer over libp2p only. The client is an ephemeral Kubo with no bootstrap list, AutoConf off, no routing, and raw-IP multiaddrs only (`/dns` is refused). For each writer it sends:
+  - a GET of a graph head;
+  - a replay POST of that committed head. The writer answers 200 with the same document and submits nothing.
+
+  The receipt records whether the path was direct or relayed.
+- `yataverse_writer.py` takes `--host` more than once. main-2's writer now listens on its tailnet address and on `127.0.0.1`. The libp2p mount targets loopback, so that path does not need the tailnet interface to exist.
+
+**Live config.**
+
+- Both Kubos have `Experimental.Libp2pStreamMounting true`:
+  - main-2: `cloud.yataverse.third-site-ipfs`;
+  - xavier: `ipfs.service`.
+- main-2's Kubo peers with xavier (`Peering.Peers`). It already filtered tailnet addresses (`Swarm.AddrFilters`), so that connection runs over the public addresses: xavier sees main-2 at `219.104.136.140`.
+- Mount keepers:
+  - main-2: `deploy/main2-writer-p2p-mount.plist`;
+  - xavier: `deploy/xavier-yataverse-writer-p2p-mount.service`, and `deploy/xavier-yataverse-writer-p2p-forward-main2.service` for the forward to main-2.
+
+**What the drills found.**
+
+| Path | Result |
+|---|---|
+| main-2 client → xavier's writer, raw IP, direct | Passed repeatedly: read in 4.5 s, replay 200 |
+| xavier client → main-2's writer through a public circuit relay | Passed once, when DCUtR upgraded to direct in 6.7 s. Failed in the next 4 runs: the connection stayed relayed, or a stream was reset |
+| xavier client → main-2's public UPnP UDP ports, direct | Dial timeout. The mapping is not reachable from outside |
+| xavier's Kubo → main-2's writer, over main-2's outbound Peering connection | 200 in 1.8 s |
+| Public entrance with xavier's writer stopped | nginx fell back to `127.0.0.1:18131`; main-2's writer answered 200 in 3 s (`X-Yataverse-Writer: 127.0.0.1:18130, 127.0.0.1:18131`). No tailnet on that path |
+
+**Why relays alone do not work.** A circuit-relay v2 connection is *limited*, and Kubo opens no application stream over it. Hole punching between two NATed peers is unreliable. The arrangement that holds is Holochain's relay shape: the NATed writer keeps an outbound connection to a public peer, and that peer carries the protocol. xavier plays that role now. Any public host main-2 peers with could replace it.
+
+**Still dependent.**
+
+- **Witnesses on the tailnet.** Every writer submits to the 7 witnesses at tailnet addresses, so consensus still uses Tailscale. Moving the witness mesh to libp2p is the next step.
+- **One public peer.** xavier is the only public peer. With xavier down, main-2's writer is reachable only when hole punching happens to work. A second public peer on another network would remove this single point. That is the same gap as the third independent line.
+- **No address discovery.** Clients learn writer addresses out of band. xavier's UPnP ports change on restart.
