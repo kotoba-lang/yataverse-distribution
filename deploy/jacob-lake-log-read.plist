@@ -2,29 +2,50 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>Label</key><string>cloud.kotoba.jacob.lake-log-read</string>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>cloud.kotoba.jacob.lake-log-read</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/usr/bin/python3</string>
 		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/bin/serve_lake_epoch.py</string>
-		<string>--sha256</string><string>98240a1decfb6f9e687d58b5a86fb592b43c49e5a1829a5ab862e9138de65c36</string>
-		<string>--count</string><string>825258</string>
-		<string>--epoch</string><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/inventory/inventory-20260926.jsonl:f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188:821533:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/native-100000-300000:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/native-300000-400000</string>
-		<string>--epoch</string><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/inventory/inventory-delta-fence-20260929.jsonl:899e7e26087e98a9c6859db4cd697753f26745e5ac46dc3f3a071a05c585e7d1:977:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/delta-fence-20260929/car-receipts</string>
-		<string>--epoch</string><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/inventory/inventory-epoch2-20261006.jsonl:d5c97b72281d2688a0623943a86881a1d36c5e2a4ab264ddec59e77ca1b4de7f:2700:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/epoch2-20261006</string>
-		<string>--epoch</string><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/inventory/inventory-epoch3.jsonl:c427f6d34a994e8b05b738340f9db19532bd773e45e2058a8e1569a2c1db02ac:48:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/epoch3</string>
-		<string>--ipfs-bin</string><string>/opt/homebrew/bin/ipfs</string>
-		<string>--ipfs-path</string><string>/Volumes/251220/kotoba-ipfs/repo</string>
-		<string>--raw-block-store</string><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/raw-blocks</string>
-		<string>--max-block-bytes</string><string>256000000</string>
-		<string>--large-client-timeout</string><string>1200</string>
-		<string>--host</string><string>127.0.0.1</string>
-		<string>--port</string><string>18096</string>
+		<string>--sha256</string>
+		<string>e0f56ae3da7d9f680d1db2479013ec75ca3185544e3a5d00bd910b81df458ddf</string>
+		<string>--count</string>
+		<string>825282</string>
+		<string>--epoch</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/inventory/inventory-20260926.jsonl:f616962875a0850efa824b53be45fc22edce39f4c280a32cb80b72a55b020188:821533:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/native-100000-300000:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/native-300000-400000</string>
+		<string>--epoch</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/inventory/inventory-delta-fence-20260929.jsonl:899e7e26087e98a9c6859db4cd697753f26745e5ac46dc3f3a071a05c585e7d1:977:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/delta-fence-20260929/car-receipts</string>
+		<string>--epoch</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/inventory/inventory-epoch2-20261006.jsonl:d5c97b72281d2688a0623943a86881a1d36c5e2a4ab264ddec59e77ca1b4de7f:2700:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/epoch2-20261006</string>
+		<string>--epoch</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/inventory/inventory-epoch3.jsonl:c427f6d34a994e8b05b738340f9db19532bd773e45e2058a8e1569a2c1db02ac:48:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/epoch3</string>
+		<string>--epoch</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/inventory/inventory-epoch4.jsonl:1f03ecaac927e849daee4e6a950da61c3dd0873b0c56811bd357f4cb579e94b0:24:/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/epoch4</string>
+		<string>--ipfs-bin</string>
+		<string>/opt/homebrew/bin/ipfs</string>
+		<string>--ipfs-path</string>
+		<string>/Volumes/251220/kotoba-ipfs/repo</string>
+		<string>--raw-block-store</string>
+		<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/lake-state/raw-blocks</string>
+		<string>--max-block-bytes</string>
+		<string>256000000</string>
+		<string>--large-client-timeout</string>
+		<string>1200</string>
+		<string>--host</string>
+		<string>127.0.0.1</string>
+		<string>--port</string>
+		<string>18096</string>
 	</array>
-	<key>WorkingDirectory</key><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/bin</string>
-	<key>RunAtLoad</key><true/>
-	<key>KeepAlive</key><true/>
-	<key>StandardOutPath</key><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/logs/lake-log-read.out.log</string>
-	<key>StandardErrorPath</key><string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/logs/lake-log-read.err.log</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/logs/lake-log-read.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/logs/lake-log-read.out.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/junkawasaki/.local/share/kotoba-bulk-ipfs-jacob/bin</string>
 </dict>
 </plist>
