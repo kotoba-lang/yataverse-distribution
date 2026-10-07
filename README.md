@@ -1374,3 +1374,12 @@ node <release>/engine/cli.js --classpath deploy deploy/<tool>.cljk ...
 - main-2 (backup) then xavier (primary) were switched to the cljk writer.
 - A replay through the public entrance was answered by xavier.
 - The first production write on the cljk writer was graph `bafyreiha3q2…` seq 57: pins 0.2 s, submit 16.6 s.
+
+### R2 follower in kotoba (2026-10-07)
+
+`deploy/r2_head_follower.cljk` replaces `r2_head_follower.py`: same classification, same projection rule.
+
+- The projected record is the writer's JSON object written back unchanged, never rebuilt, so its bytes and key order are inga's.
+- `test/r2_head_follower_test.cljk` checks the classifications, the `--project` preconditions, and that an unreachable writer exits 3 rather than passing.
+- **Live.** A check-mode run agreed with the Python follower on all 4 graphs. The LaunchAgent now runs the cljk version, and its first run exited 0 with 4 AGREE.
+- It now reads the writer at `127.0.0.1:18130` instead of the tailnet address.

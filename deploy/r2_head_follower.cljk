@@ -1,0 +1,125 @@
+;; deploy/r2_head_follower.cljk — keep R2's yataverse graph heads a projection
+;; of inga (ADR-2610062000 D5, P5). Ported from r2_head_follower.py.
+;;
+;; After the P5 cutover a graph head is decided by inga (through
+;; yataverse-writer), and R2's heads/yataverse/ipns/<graph>.json is a copy
+;; this follower writes. For each graph it reads the committed head from a
+;; writer (GET /v1/graph-head, whose document carries the namespace-signed
+;; record) and the R2 object, and classifies the pair:
+;;
+;;   agree        same sequence and value
+;;   r2-ahead     R2 is newer: something wrote R2 around the writer (an error
+;;                after --cutover)
+;;   inga-ahead   inga is newer; with --project the follower writes the exact
+;;                committed record to R2
+;;   diverged     the same sequence names different values: never projected
+;;                over, reported for a human
+;;   absent       one side has no head
+;;
+;; The projected record is written exactly as the writer returned it (a JS
+;; object straight from its JSON, never rebuilt), so its bytes and key order
+;; are inga's.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> r2_head_follower.cljk ...):
+;;   --graph=G ... --writer-url=URL --r2-get-cmd="... {graph}"
+;;   [--cutover] [--project --r2-put-cmd="... {graph} ... {file}"]
+;;
+;; Exit codes: 0 every graph agrees or was projected; 1 a graph is r2-ahead
+;; after --cutover, or diverged; 3 a graph could not be measured.
+
+(ns r2-head-follower
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def fs (js/require "node:fs"))
+(def os (js/require "node:os"))
+(def path (js/require "node:path"))
+
+(defn classify
+  "Pure. Each argument is a head with \"sequence\" and \"value\", or nil."
+  [inga r2]
+  (cond
+    (or (nil? inga) (nil? r2)) :absent
+    (= (get inga "sequence") (get r2 "sequence")) (if (= (get inga "value") (get r2 "value")) :agree :diverged)
+    (> (get inga "sequence") (get r2 "sequence")) :inga-ahead
+    :else :r2-ahead))
+
+(defn- key-of [js-head] (when js-head {"sequence" (aget js-head "sequence") "value" (aget js-head "value")}))
+
+(defn inga-head
+  "-> Promise of the committed head as a JS object, or nil (404)."
+  [writer-url graph]
+  (-> (js/fetch (str (str/replace writer-url #"/+$" "") "/v1/graph-head?graph=" graph)
+                #js {:signal (js/AbortSignal.timeout 300000)})
+      (.then (fn [r]
+               (cond
+                 (= 404 (.-status r)) nil
+                 (not (.-ok r)) (throw (g/unmeasured (str "writer " (.-status r))))
+                 :else (.then (.json r) (fn [j] (.. j -document -head))))))))
+
+(defn r2-head [get-cmd graph]
+  (let [{:keys [code out err]} (g/run! (g/words (str/replace get-cmd "{graph}" graph)) nil 120)]
+    (cond
+      (and (not (zero? code)) (str/includes? (str err (str out)) "does not exist")) nil
+      (not (zero? code)) (throw (g/unmeasured (str "R2 read failed: " (subs err (max 0 (- (count err) 160))))))
+      :else (js/JSON.parse (str out)))))
+
+(defn project! [put-cmd graph js-head]
+  (let [f (.join path (.tmpdir os) (str "yataverse-head-" graph "-" (js/Date.now) ".json"))]
+    (.writeFileSync fs f (js/JSON.stringify js-head))
+    (let [{:keys [code err]} (g/run! (g/words (-> put-cmd (str/replace "{graph}" graph) (str/replace "{file}" f))) nil 120)]
+      (.unlinkSync fs f)
+      (when-not (zero? code)
+        (throw (g/unmeasured (str "R2 write failed: " (subs err (max 0 (- (count err) 160))))))))))
+
+(defn- one-graph
+  "-> Promise of [status-word exit]."
+  [{:keys [writer-url r2-get-cmd r2-put-cmd project? cutover?]} graph]
+  (-> (inga-head writer-url graph)
+      (.then (fn [i]
+               (let [r (r2-head r2-get-cmd graph)
+                     c (classify (key-of i) (key-of r))
+                     detail (str "inga " (some-> i (aget "sequence")) " r2 " (some-> r (aget "sequence")))]
+                 (if (and (= :inga-ahead c) project?)
+                   ;; R2 has no conditional put from here, so narrow the race:
+                   ;; re-read just before writing, and after writing re-check
+                   ;; and repair once more. A rollback that slips through is
+                   ;; repaired on the next run; inga stays the authority.
+                   ((fn attempt [n]
+                      (-> (inga-head writer-url graph)
+                          (.then (fn [i2]
+                                   (let [r2 (r2-head r2-get-cmd graph)]
+                                     (if (or (>= n 3) (not= :inga-ahead (classify (key-of i2) (key-of r2))))
+                                       [(str "PROJECTED " graph " " detail) 0]
+                                       (do (project! r2-put-cmd graph i2)
+                                           (attempt (inc n)))))))))
+                    0)
+                   [(str (str/upper-case (name c)) " " graph " " detail)
+                    (if (or (= :diverged c) (and (= :r2-ahead c) cutover?)) 1 0)]))))
+      (.catch (fn [e] [(str "UNMEASURED " graph ": " (g/message e)) 3]))))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [argv (set (array-seq (aget js/process "argv")))
+        one #(first (flags %))
+        opts {:graphs (vec (flags "--graph")) :writer-url (one "--writer-url")
+              :r2-get-cmd (one "--r2-get-cmd") :r2-put-cmd (one "--r2-put-cmd")
+              :project? (contains? argv "--project") :cutover? (contains? argv "--cutover")}]
+    (when-not (and (seq (:graphs opts)) (:writer-url opts) (:r2-get-cmd opts))
+      (println "REFUSE need --graph --writer-url --r2-get-cmd") (js/process.exit 1))
+    (when (and (:project? opts) (not (and (:r2-put-cmd opts) (:cutover? opts))))
+      (println "REFUSE --project needs --r2-put-cmd and --cutover") (js/process.exit 1))
+    (-> (reduce (fn [p graph]
+                  (.then p (fn [worst]
+                             (.then (one-graph opts graph)
+                                    (fn [[line code]]
+                                      (println line)
+                                      (cond (= 3 code) 3 (= 3 worst) 3 :else (max worst code)))))))
+                (js/Promise.resolve 0) (:graphs opts))
+        (.then (fn [worst] (js/process.exit worst))))))
+
+(when (some #(str/ends-with? % "r2_head_follower.cljk") (array-seq (aget js/process "argv")))
+  (main))

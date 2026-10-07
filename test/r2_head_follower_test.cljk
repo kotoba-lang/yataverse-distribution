@@ -1,0 +1,34 @@
+;; Gate for deploy/r2_head_follower.cljk (ported from test_r2_head_follower.py).
+;; Run: node <release>/engine/cli.js --classpath deploy test/r2_head_follower_test.cljk
+(ns r2-head-follower-test
+  (:require [r2-head-follower :as f]))
+
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+(defn h [s v] {"sequence" s "value" v})
+
+(println "r2-head-follower gate:")
+(check "pairs classify"
+       (= [:agree :diverged :inga-ahead :r2-ahead :absent :absent :absent]
+          [(f/classify (h 5 "a") (h 5 "a")) (f/classify (h 5 "a") (h 5 "b"))
+           (f/classify (h 6 "b") (h 5 "a")) (f/classify (h 5 "a") (h 6 "b"))
+           (f/classify nil (h 5 "a")) (f/classify (h 5 "a") nil) (f/classify nil nil)]))
+
+(def cp (js/require "node:child_process"))
+(def engine (first (filter #(.endsWith % "cli.js") (array-seq (aget js/process "argv")))))
+(defn run-main [& args]
+  (let [r (.spawnSync cp (aget js/process "execPath")
+                      (clj->js (concat [engine "--classpath" "deploy" "deploy/r2_head_follower.cljk" "--graph=g"
+                                        "--writer-url=http://127.0.0.1:9" "--r2-get-cmd=false"] args))
+                      #js {:encoding "utf8" :timeout 60000})]
+    [(.-status r) (.-stdout r)]))
+(check "--project needs --cutover and a put command"
+       (and (= 1 (first (run-main "--project")))
+            (= 1 (first (run-main "--project" "--cutover")))
+            (= 1 (first (run-main "--project" "--r2-put-cmd=true")))))
+(check "an unreachable writer is unmeasured (3), not a pass"
+       (= 3 (first (run-main))))
+
+(if (zero? @failures)
+  (println "r2-head-follower gate: ok")
+  (do (println "r2-head-follower gate:" @failures "failed") (js/process.exit 1)))

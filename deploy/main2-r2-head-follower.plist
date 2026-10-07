@@ -15,24 +15,20 @@
 	<string>Standard</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/opt/homebrew/bin/python3</string>
-		<string>/Users/junkawasaki/.local/share/yataverse-writer/bin/r2_head_follower.py</string>
-		<string>--graph</string>
-		<string>bafyreiha3q2g6ghjzjtydkvsudnixlbpbf6dlw6b7etd2l3ch4mbruv54e</string>
-		<string>--graph</string>
-		<string>bafyreicdx5lzw5bqgxgek4gqtoh3tuivdjglmqax6tqjo734wpx3lfo3sq</string>
-		<string>--graph</string>
-		<string>bafyreidnpq2mwo6ood7xdvu2nztpz6azag233kateilpboddthp4ybpyh4</string>
-		<string>--graph</string>
-		<string>bafyreig6tog2dqujgwgmmzu2gycl2m4nhetgwsbp3thlxk6lteqj5bdjr4</string>
-		<string>--writer-url</string>
-		<string>http://100.108.223.94:18130</string>
-		<string>--r2-get-cmd</string>
-		<string>/opt/homebrew/bin/wrangler r2 object get kotobase-graph-database-production/heads/yataverse/ipns/{graph}.json --remote --pipe</string>
+		<string>/opt/homebrew/bin/node</string>
+		<string>/Users/junkawasaki/.local/share/isekai-score-v5/release/engine/cli.js</string>
+		<string>--classpath</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-writer/bin</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-writer/bin/r2_head_follower.cljk</string>
+		<string>--graph=bafyreiha3q2g6ghjzjtydkvsudnixlbpbf6dlw6b7etd2l3ch4mbruv54e</string>
+		<string>--graph=bafyreicdx5lzw5bqgxgek4gqtoh3tuivdjglmqax6tqjo734wpx3lfo3sq</string>
+		<string>--graph=bafyreidnpq2mwo6ood7xdvu2nztpz6azag233kateilpboddthp4ybpyh4</string>
+		<string>--graph=bafyreig6tog2dqujgwgmmzu2gycl2m4nhetgwsbp3thlxk6lteqj5bdjr4</string>
+		<string>--writer-url=http://127.0.0.1:18130</string>
+		<string>--r2-get-cmd=/opt/homebrew/bin/wrangler r2 object get kotobase-graph-database-production/heads/yataverse/ipns/{graph}.json --remote --pipe</string>
 		<string>--cutover</string>
 		<string>--project</string>
-		<string>--r2-put-cmd</string>
-		<string>/opt/homebrew/bin/wrangler r2 object put kotobase-graph-database-production/heads/yataverse/ipns/{graph}.json --file {file} --remote --content-type application/json</string>
+		<string>--r2-put-cmd=/opt/homebrew/bin/wrangler r2 object put kotobase-graph-database-production/heads/yataverse/ipns/{graph}.json --file {file} --remote --content-type application/json</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
