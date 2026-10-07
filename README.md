@@ -1045,7 +1045,7 @@ The state file in `--work` makes an interrupted run continue from the step where
 - **Install.** The tools go in `~/.local/share/yataverse-lake-cycle/bin`. The cycle resolves its sibling tools from its own directory.
 - **Still reviewed by hand.** The printed follow-ups: the manifest commit, jacob's reader, and the directory pointer. Until they are done, the directory and the onion reader lag the log by at most the epochs cut since. The log and the witnesses do not lag.
 
-## Lake listing from the log: `deploy/project_lake_log.py` (2026-10-07, opt-in)
+## Lake listing from the log: `deploy/project_lake_log.cljk` (2026-10-07, opt-in)
 
 **What it writes.** The `lake-log/` layout that cloud-kotoba/kotobase-ipfs#71 reads when `KOTOBASE_LAKE_LISTING=log`:
 
