@@ -1,11 +1,11 @@
 [Unit]
-Description=Mount yataverse-writer as libp2p protocol /x/yataverse/graph-head/1 on xavier's Kubo
+Description=Mount yataverse-writer as /x/yataverse/graph-head/1 on xavier's Kubo, and open main-2's writer at 127.0.0.1:18131 (p2p_mesh.cljk)
 After=ipfs.service yataverse-writer.service
 Wants=ipfs.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -u /home/xavier/.local/share/yataverse-writer/bin/p2p_mount.py --ipfs "env IPFS_PATH=/mnt/nvme/ipfs-xavier/repo /mnt/nvme/ipfs-xavier/bin/ipfs" --target /ip4/127.0.0.1/tcp/18130 --loop 30
+ExecStart=/usr/local/bin/node /home/xavier/.local/share/yataverse-writer/release/engine/cli.js --classpath /home/xavier/.local/share/yataverse-writer/bin /home/xavier/.local/share/yataverse-writer/bin/p2p_mesh.cljk "--ipfs=env IPFS_PATH=/mnt/nvme/ipfs-xavier/repo /mnt/nvme/ipfs-xavier/bin/ipfs" --listen=/x/yataverse/graph-head/1=/ip4/127.0.0.1/tcp/18130 --forward=/x/yataverse/graph-head/1@/ip4/127.0.0.1/tcp/18131=12D3KooWREkjSRXrLFe6HXzaP9LpRBGNfJV7YuEwLw5tK2VQH9hN --loop=30
 StandardOutput=append:/home/xavier/.local/share/yataverse-writer/logs/p2p-mount.out.log
 StandardError=append:/home/xavier/.local/share/yataverse-writer/logs/p2p-mount.err.log
 Restart=on-failure

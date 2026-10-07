@@ -1,0 +1,139 @@
+;; Vendored from network-awai/network-isekai deploy/p2p_mesh.cljk (canonical; keep in sync).
+;; deploy/p2p_mesh.cljk — keep a host's Kubo stream mounts in place
+;; (ADR-2610062000; witnesses and writers over libp2p, after Holochain).
+;;
+;; Every inga witness and every yataverse writer is also a libp2p protocol on
+;; its host's Kubo (Experimental.Libp2pStreamMounting). Nothing then needs an
+;; inbound address, the tailnet or DNS: a peer is dialed by its peer ID, over
+;; LAN, a UPnP-mapped public port, or a connection the peer keeps open.
+;;
+;;   listen   PROTOCOL=TARGET           inbound streams of PROTOCOL go to TARGET
+;;                                      (this host's witness or writer)
+;;   forward  PROTOCOL@LISTEN=PEER      a local LISTEN address that opens
+;;                                      PROTOCOL on PEER's Kubo
+;;
+;; `ipfs p2p listen/forward` do not survive a Kubo restart, and a stage change
+;; moves a mount to a new address, so every round reads `ipfs p2p ls`, closes
+;; what this host's spec no longer names under a managed protocol, and opens
+;; what is missing.
+;;
+;; usage (node <release>/engine/cli.js deploy/p2p_mesh.cljk ...):
+;;   --ipfs=<ipfs command, words separated by spaces>
+;;   --listen=PROTOCOL=TARGET ...   --forward=PROTOCOL@LISTEN=PEER ...
+;;   [--loop=SECONDS]
+;;
+;; Exit codes (one round): 0 in place; 1 a spec was malformed; 3 Kubo did not answer.
+
+(ns p2p-mesh
+  (:require [clojure.string :as str]))
+
+(def cp (js/require "node:child_process"))
+
+;; ── pure ────────────────────────────────────────────────────────────────────
+
+(defn parse-ls
+  "`ipfs p2p ls` text -> set of [protocol listen target]. Listens show the
+   host's own /p2p/<id> as listen; forwards show /p2p/<peer> as target."
+  [text]
+  (->> (str/split-lines (or text ""))
+       (map #(str/split (str/trim %) #"\s+"))
+       (filter #(= 3 (count %)))
+       (map vec)
+       set))
+
+(defn parse-listen [s]
+  (let [[proto target] (str/split s #"=" 2)]
+    (when (and (str/starts-with? (or proto "") "/x/") (seq target))
+      {:kind :listen :protocol proto :target target})))
+
+(defn parse-forward [s]
+  (let [[lhs peer] (str/split s #"=" 2)
+        [proto listen] (str/split (or lhs "") #"@" 2)]
+    (when (and (str/starts-with? (or proto "") "/x/") (seq listen) (seq peer))
+      {:kind :forward :protocol proto :listen listen :target (str "/p2p/" peer)})))
+
+(defn wanted?
+  "Does row [protocol listen target] already satisfy spec?"
+  [spec [proto listen target]]
+  (and (= proto (:protocol spec))
+       (= target (:target spec))
+       (or (= :listen (:kind spec)) (= listen (:listen spec)))
+       ;; a listen row's listen column is /p2p/<self>; a forward's is an address
+       (= (= :listen (:kind spec)) (str/starts-with? listen "/p2p/"))))
+
+(defn plan
+  "Pure. rows: parse-ls; specs: parsed --listen/--forward. -> {:close [row]
+   :open [spec]}. Only rows under a protocol some spec names are managed;
+   anything else on the host's Kubo is left alone."
+  [rows specs]
+  (let [managed (set (map :protocol specs))]
+    {:close (vec (sort (filter (fn [row] (and (managed (first row))
+                                              (not-any? #(wanted? % row) specs)))
+                               rows)))
+     :open (vec (remove (fn [spec] (some #(wanted? spec %) rows)) specs))}))
+
+;; ── effects ─────────────────────────────────────────────────────────────────
+
+(defn- run [ipfs & args]
+  (let [r (.spawnSync cp (first ipfs) (clj->js (concat (rest ipfs) args))
+                      #js {:encoding "utf8" :timeout 30000})]
+    {:code (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn round!
+  "-> {:closed n :opened n} or throws ex-info."
+  [ipfs specs]
+  (let [ls (run ipfs "p2p" "ls")]
+    (when-not (zero? (:code ls))
+      (throw (ex-info (str "p2p ls: " (str/trim (str (:err ls) (:out ls)))) {:exit 3})))
+    (let [{:keys [close open]} (plan (parse-ls (:out ls)) specs)]
+      (doseq [[proto listen target] close]
+        (run ipfs "p2p" "close" "--protocol" proto "--listen-address" listen "--target-address" target))
+      ;; Open every missing spec even when one fails: on a host whose
+      ;; ephemeral range covers the forward ports (judah: 1024-65535), one
+      ;; port can be briefly held by an outbound socket; the next round
+      ;; retries it, and the others must not wait for it.
+      (let [failed (keep (fn [s]
+                           (let [r (if (= :listen (:kind s))
+                                     (run ipfs "p2p" "listen" (:protocol s) (:target s))
+                                     (run ipfs "p2p" "forward" (:protocol s) (:listen s) (:target s)))]
+                             (when-not (zero? (:code r))
+                               (str (or (:listen s) (:target s)) ": " (str/trim (str (:err r) (:out r)))))))
+                         open)]
+        (when (seq failed)
+          (throw (ex-info (str "opened " (- (count open) (count failed)) "/" (count open) "; "
+                               (str/join "; " failed))
+                          {:exit 3})))
+        {:closed (count close) :opened (count open)}))))
+
+(defn- flags [k]
+  (keep #(when (str/starts-with? % (str k "=")) (subs % (inc (count k))))
+        (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [ipfs (some-> (first (flags "--ipfs")) (str/split #" +") vec)
+        raw (concat (map (juxt identity parse-listen) (flags "--listen"))
+                    (map (juxt identity parse-forward) (flags "--forward")))
+        bad (keep (fn [[s parsed]] (when-not parsed s)) raw)
+        specs (keep second raw)
+        loop-s (some-> (first (flags "--loop")) (js/parseInt 10))
+        say (fn [s] (println s))]
+    (cond
+      (empty? ipfs) (do (say "REFUSE --ipfs is required") (js/process.exit 1))
+      (seq bad) (do (say (str "REFUSE malformed spec: " (str/join " " bad))) (js/process.exit 1))
+      (empty? specs) (do (say "REFUSE no --listen or --forward") (js/process.exit 1)))
+    (let [last-state (atom nil)
+          tick (fn []
+                 (let [state (try (let [{:keys [closed opened]} (round! ipfs specs)]
+                                    (if (zero? (+ closed opened)) "KEPT" (str "MOUNTED closed=" closed " opened=" opened)))
+                                  (catch :default e (str "UNMEASURED " (.-message e))))]
+                   (when (not= state @last-state)
+                     (say (str state " " (count specs) " mounts")))
+                   (reset! last-state state)
+                   state))]
+      (if loop-s
+        (do (tick) (js/setInterval tick (* 1000 loop-s)))
+        (let [s (tick)]
+          (js/process.exit (cond (str/starts-with? s "UNMEASURED") 3 :else 0)))))))
+
+(when (some #(str/ends-with? % "p2p_mesh.cljk") (array-seq (aget js/process "argv")))
+  (main))

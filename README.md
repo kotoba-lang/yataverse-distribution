@@ -1301,9 +1301,9 @@ A document that fails validation is unpinned and reported as a `WARRANT` line wi
 
 **Pieces.**
 
-- `deploy/p2p_mount.py` keeps the mount in place. `ipfs p2p listen` does not survive a Kubo restart, so the script checks `ipfs p2p ls` every 30 s and re-registers when the mount is gone. After a main-2 Kubo restart it remounted in about 12 s.
-  - `--target` (listen) is used on both writer hosts, aimed at the writer on loopback.
-  - `--forward-to PEER --listen ADDR` is used on xavier. It opens main-2's writer at `127.0.0.1:18131`.
+- `deploy/p2p_mesh.cljk` (kotoba; vendored from network-awai/network-isekai, which uses it for the witnesses) keeps the mounts in place. It replaced `p2p_mount.py` the same day. `ipfs p2p listen` does not survive a Kubo restart, so the script checks `ipfs p2p ls` every 30 s and re-registers when the mount is gone. After a main-2 Kubo restart it remounted in about 12 s.
+  - `--listen=PROTOCOL=TARGET` is used on both writer hosts, aimed at the writer on loopback.
+  - `--forward=PROTOCOL@ADDR=PEER` is used on xavier. It opens main-2's writer at `127.0.0.1:18131`, from the same keeper unit.
 - `deploy/p2p_writer_drill.py` reaches each writer over libp2p only. The client is an ephemeral Kubo with no bootstrap list, AutoConf off, no routing, and raw-IP multiaddrs only (`/dns` is refused). For each writer it sends:
   - a GET of a graph head;
   - a replay POST of that committed head. The writer answers 200 with the same document and submits nothing.
@@ -1319,7 +1319,7 @@ A document that fails validation is unpinned and reported as a `WARRANT` line wi
 - main-2's Kubo peers with xavier (`Peering.Peers`). It already filtered tailnet addresses (`Swarm.AddrFilters`), so that connection runs over the public addresses: xavier sees main-2 at `219.104.136.140`.
 - Mount keepers:
   - main-2: `deploy/main2-writer-p2p-mount.plist`;
-  - xavier: `deploy/xavier-yataverse-writer-p2p-mount.service`, and `deploy/xavier-yataverse-writer-p2p-forward-main2.service` for the forward to main-2.
+  - xavier: `deploy/xavier-yataverse-writer-p2p-mount.service`, which also holds the forward to main-2.
 
 **What the drills found.**
 
