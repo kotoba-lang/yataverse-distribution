@@ -454,6 +454,19 @@
         cfg (g/parse-json (.readFileSync fs (one "--config") "utf8"))
         work (or (one "--work") (pick-work (one "--work-root")))]
     (say "work" work)
+    ;; One process per run. The Python cycle had no run lock: a scheduled
+    ;; start while a long run was still capturing would have resumed the same
+    ;; run beside it.
+    (.mkdirSync fs work #js {:recursive true})
+    (let [lock (.join path work "cycle.lock")]
+      (try (.writeFileSync fs lock (str (.-pid js/process)) #js {:flag "wx"})
+           (catch :default _
+             (let [holder (js/parseInt (str (.readFileSync fs lock "utf8")) 10)]
+               (when (and (pos? holder) (try (.kill js/process holder 0) true (catch :default _ false)))
+                 (say (str "RUNNING pid " holder " holds " work))
+                 (js/process.exit 0))
+               (.writeFileSync fs lock (str (.-pid js/process))))))
+      (.on js/process "exit" (fn [] (try (.rmSync fs lock #js {:force true}) (catch :default _ nil)))))
     (let [cyc (make-cycle cfg work)]
       (js/process.exit
        (try (run! cyc (one "--until"))
