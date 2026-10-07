@@ -1449,3 +1449,15 @@ The Python module stays while other Python tools import it.
 One difference: a non-GET request gets 405 where Python answered 501.
 
 **Not switched yet.** The cycle's `reader` step edits that LaunchAgent's arguments by position in their current Python form. The live reader moves together with the matching `step-reader` change, after the kotoba cycle's first full run.
+
+### IPNS fallback in kotoba (2026-10-07)
+
+`deploy/ipns_fallback.cljk` keeps the same rules: re-put the signed record unchanged; re-sign the same value at sequence+1 only when its validity falls below the threshold; never invent a value. `test/ipns_fallback_test.cljk` ports the 6 Python cases.
+
+**One behaviour change.** In `--publish` (primary) mode, the Python tool published at sequence 0 whenever it could not read the network record. Everyone who has seen a higher sequence ignores a 0, yet the tool still reported PUBLISHED, because resolution returned the unchanged old value. The kotoba version refuses instead, unless `--first` is given for a name that has never been published. On 2026-10-07, xavier's `name get` timed out right after its Kubo restart, and the Python version, given the same name, also timed out.
+
+**Live.**
+
+- Run from main-2, both versions printed the same KEPT line for the directory name (seq 9, valid 163 h).
+- jacob's fallback LaunchAgent now runs the cljk version: 4/4 names KEPT (the directory, yataverse-apex, isekai-static, itonami-static).
+- xavier's primary unit now runs the cljk version: it PUBLISHED the directory's same value at seq 10, and the name still resolves to it.
