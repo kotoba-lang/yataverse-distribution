@@ -1,0 +1,27 @@
+;; Gate for deploy/raw_block_store.cljk: interchangeable with the Python store.
+;; Run: node <release>/engine/cli.js --classpath deploy test/raw_block_store_test.cljk <dir made by the Python side>
+(ns raw-block-store-test
+  (:require [clojure.string :as str]
+            [raw-block-store :as r]))
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+(defn throws? [f] (try (f) false (catch :default _ true)))
+(def dir (second (drop-while #(not (str/ends-with? % "raw_block_store_test.cljk")) (array-seq (aget js/process "argv")))))
+(def cids (js->clj (js/JSON.parse (.readFileSync fs (str dir "/cids.json") "utf8"))))
+(defn blob [c] (.readFileSync fs (str dir "/" c ".bin")))
+(println "raw-block-store gate:")
+(check "reads every block the Python store wrote" (every? #(.equals (r/read-block (str dir "/py") %) (blob %)) cids))
+(doseq [c cids] (r/put! (str dir "/kt") c (blob c)))
+(let [files (fn [root] (sort (for [s (array-seq (.readdirSync fs root)) f (array-seq (.readdirSync fs (.join path root s)))] (str s "/" f))))]
+  (check "writes the same files" (= (files (str dir "/py")) (files (str dir "/kt"))))
+  (check "byte for byte, metadata included"
+         (every? #(.equals (.readFileSync fs (.join path dir "py" %)) (.readFileSync fs (.join path dir "kt" %))) (files (str dir "/py")))))
+(check "cids lists the store" (= (set cids) (r/cids (str dir "/kt"))))
+(check "a put whose bytes do not hash to the CID is refused" (throws? #(r/put! (str dir "/kt2") (first cids) (js/Buffer.from "other"))))
+(check "an unknown CID reads as nil" (nil? (r/read-block (str dir "/kt") "bafkreigonzau42ygpemkobt26r76kv7icwbyydhc6aeuzfxf4no53njoge")))
+(check "CIDv0 digests decode" (= 32 (.-length (r/sha256-digest "QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn"))))
+(if (zero? @failures) (println "raw-block-store gate: ok")
+    (do (println "raw-block-store gate:" @failures "failed") (js/process.exit 1)))
