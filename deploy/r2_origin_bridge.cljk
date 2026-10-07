@@ -1,0 +1,135 @@
+;; deploy/r2_origin_bridge.cljk — local, CID-checked R2 bootstrap source for
+;; the lake replicator (ADR-2610062000). Ported from r2_origin_bridge.py.
+;;
+;; Binds only to loopback; a node reaches it through an ssh reverse tunnel, so
+;; the Cloudflare OAuth token never leaves the operator host. It serves only
+;; CIDs in the pinned inventory, verifies every body against its size and CID
+;; before answering, and bounds memory with a byte budget. A temporary copy
+;; source: a Cloudflare dependency kept until the replicas no longer need R2.
+;;
+;;   GET /healthz       fetches the smallest listed block from R2 end to end
+;;   GET /ipfs/<cid>    the verified block, 404 when unlisted, 502 on R2 failure
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> r2_origin_bridge.cljk ...):
+;;   --inventory=F --sha256=HEX --account-id=HEX32 --bucket=NAME [--port=18095] [--max-memory-bytes=512000000]
+
+(ns r2-origin-bridge
+  (:require [clojure.string :as str]
+            [raw-block-store :as r]))
+
+(def fs (js/require "node:fs"))
+(def http (js/require "node:http"))
+(def nc (js/require "node:crypto"))
+(def cp (js/require "node:child_process"))
+
+(def cid-v0 #"Qm[1-9A-HJ-NP-Za-km-z]{44}")
+(def cid-v1 #"b[a-z2-7]{20,200}")
+
+(defn inventory-sizes
+  "A complete pinned snapshot: every row a unique valid CID with a positive
+   size, the whole hashing to `expected`. -> JS Map cid -> size."
+  [p expected]
+  (when-not (re-matches #"[0-9a-f]{64}" (str expected)) (throw (ex-info "inventory digest is invalid" {})))
+  (let [buf (.readFileSync fs p) sizes (js/Map.)]
+    (doseq [line (str/split (.toString buf "utf8") #"\n") :when (seq line)]
+      (let [row (try (js/JSON.parse line) (catch :default _ (throw (ex-info "inventory row is unreadable" {}))))
+            cid (.-cid row) size (.-bytes row)]
+        (when-not (and (string? cid) (or (re-matches cid-v0 cid) (re-matches cid-v1 cid))
+                       (js/Number.isInteger size) (pos? size) (not (.has sizes cid)))
+          (throw (ex-info "inventory CID, size, or uniqueness is invalid" {})))
+        (.set sizes cid size)))
+    (when (or (not= expected (-> (.createHash nc "sha256") (.update buf) (.digest "hex"))) (zero? (.-size sizes)))
+      (throw (ex-info "inventory digest differs from pinned snapshot or is empty" {})))
+    sizes))
+
+(defn make-budget
+  "-> {:acquire (fn size) -> Promise, :release (fn size)}; FIFO waiters."
+  [limit]
+  (let [used (atom 0) waiters (atom [])]
+    (letfn [(drain []
+              (when-let [[size resolve] (first @waiters)]
+                (when (<= (+ @used size) limit)
+                  (swap! waiters #(vec (rest %)))
+                  (swap! used + size)
+                  (resolve nil)
+                  (drain))))]
+      {:acquire (fn [size]
+                  (if (> size limit)
+                    (js/Promise.reject (ex-info "block exceeds bridge memory budget" {:kind :origin}))
+                    (js/Promise. (fn [resolve _] (swap! waiters conj [size resolve]) (drain)))))
+       :release (fn [size] (swap! used - size) (drain))})))
+
+(defn wrangler-token
+  "-> fn [refresh?] returning the OAuth token, cached until a 401 asks for a refresh."
+  []
+  (let [cached (atom nil)]
+    (fn [refresh?]
+      (when (or refresh? (nil? @cached))
+        (let [r (.spawnSync cp "npx" #js ["--yes" "wrangler" "auth" "token" "--json"] #js {:encoding "utf8" :timeout 30000})
+              t (try (.-token (js/JSON.parse (.-stdout r))) (catch :default _ nil))]
+          (when-not (and (zero? (.-status r)) (string? t) (seq t)) (throw (ex-info "wrangler returned no OAuth token" {:kind :origin})))
+          (reset! cached t)))
+      @cached)))
+
+(defn make-origin [sizes account-id bucket token-fn max-memory]
+  (let [budget (make-budget max-memory)
+        canary (first (sort-by #(.get sizes %) (array-seq (js/Array.from (.keys sizes)))))
+        url (fn [cid] (str "https://api.cloudflare.com/client/v4/accounts/" account-id "/r2/buckets/" bucket "/objects/ipld/" cid))
+        once (fn [cid refresh?]
+               (js/fetch (url cid) #js {:headers #js {"Authorization" (str "Bearer " (token-fn refresh?))}
+                                        :redirect "manual" :signal (js/AbortSignal.timeout 60000)}))]
+    {:canary canary
+     :fetch (fn [cid]
+              (let [size (.get sizes cid)]
+                (if (nil? size)
+                  (js/Promise.reject (ex-info "CID is absent from pinned inventory" {:kind :unlisted}))
+                  (-> ((:acquire budget) size)
+                      (.then (fn [_] (once cid false)))
+                      (.then (fn [res] (if (= 401 (.-status res)) (once cid true) res)))
+                      (.then (fn [res]
+                               (when-not (= 200 (.-status res)) (throw (ex-info (str "R2 HTTP " (.-status res)) {:kind :origin})))
+                               (.arrayBuffer res)))
+                      (.then (fn [ab]
+                               (let [body (js/Buffer.from ab)]
+                                 (when-not (= size (.-length body)) (throw (ex-info "R2 size differs from pinned inventory" {:kind :origin})))
+                                 (try (r/verify-cid cid body) (catch :default _ (throw (ex-info "R2 bytes differ from CID" {:kind :origin}))))
+                                 body)))
+                      (.finally (fn [] ((:release budget) size)))))))}))
+
+(defn handler [origin sizes]
+  (fn [req res]
+    (let [p (.-url req)
+          send (fn [status type body]
+                 (.writeHead res status #js {"Content-Type" type "Content-Length" (.-length body)})
+                 (.end res body))
+          fail (fn [status] (send status "text/plain" (js/Buffer.from (str status "\n"))))]
+      (cond
+        (= p "/healthz")
+        (-> ((:fetch origin) (:canary origin))
+            (.then (fn [_] (send 200 "application/json" (js/Buffer.from (js/JSON.stringify #js {"origin_verified" true "inventory_blocks" (.-size sizes)})))))
+            (.catch (fn [_] (fail 503))))
+        (and (str/starts-with? p "/ipfs/") (= 2 (count (filter #{\/} p))))
+        (-> ((:fetch origin) (subs p 6))
+            (.then (fn [body] (send 200 "application/octet-stream" body)))
+            (.catch (fn [e] (fail (if (= :unlisted (:kind (ex-data e))) 404 502)))))
+        :else (fail 404)))))
+
+(defn- flag [k] (some #(when (str/starts-with? % (str k "=")) (subs % (inc (count k)))) (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [account (flag "--account-id") bucket (flag "--bucket")
+        port (js/parseInt (or (flag "--port") "18095") 10)
+        max-memory (js/parseInt (or (flag "--max-memory-bytes") "512000000") 10)]
+    (when-not (re-matches #"[0-9a-f]{32}" (str account)) (println "REFUSE account id must be 32 hex characters") (js/process.exit 2))
+    (when-not (re-matches #"[a-z0-9][a-z0-9-]{2,63}" (str bucket)) (println "REFUSE invalid bucket") (js/process.exit 2))
+    (when (or (< port 1) (> port 65535) (< max-memory 256000000)) (println "REFUSE invalid port or memory bound") (js/process.exit 2))
+    (let [sizes (inventory-sizes (flag "--inventory") (flag "--sha256"))
+          token (wrangler-token)
+          origin (make-origin sizes account bucket token max-memory)]
+      ;; preflight the credential before reporting ready
+      (token false)
+      (.listen (.createServer http (handler origin sizes)) port "127.0.0.1"
+               (fn [] (println (str "R2 bootstrap bridge ready; inventory_blocks=" (.-size sizes))))))))
+
+(when (some #(str/ends-with? % "r2_origin_bridge.cljk") (array-seq (aget js/process "argv")))
+  (main))

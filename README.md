@@ -1461,3 +1461,17 @@ One difference: a non-GET request gets 405 where Python answered 501.
 - Run from main-2, both versions printed the same KEPT line for the directory name (seq 9, valid 163 h).
 - jacob's fallback LaunchAgent now runs the cljk version: 4/4 names KEPT (the directory, yataverse-apex, isekai-static, itonami-static).
 - xavier's primary unit now runs the cljk version: it PUBLISHED the directory's same value at seq 10, and the name still resolves to it.
+
+### R2 bootstrap bridge in kotoba (2026-10-07)
+
+`deploy/r2_origin_bridge.cljk` keeps the same contract:
+
+- loopback only;
+- only CIDs from the pinned inventory;
+- every body checked against its size and CID;
+- one token refresh on a 401;
+- a byte budget on memory.
+
+**Side by side on main-2:** `/healthz` returned 200 from both, 5/5 R2 blocks were identical, and an unlisted CID got 404 from both. The live LaunchAgent (`cloud.yataverse.r2-bootstrap-bridge`, used by xavier's replicator through the reverse tunnel) now runs the cljk version, and `/healthz` verifies an R2 block end to end.
+
+This bridge is itself a Cloudflare dependency, kept until the replicas no longer bootstrap from R2. The Python file stays until `replicate_lake` is ported, because its test file covers both.
