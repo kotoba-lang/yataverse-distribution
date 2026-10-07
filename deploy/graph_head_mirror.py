@@ -216,6 +216,8 @@ def mirror_one(args, graph):
     if action == "unchanged":
         print(f"UNCHANGED {ref} seq {current[0]} r2-sequence {head['sequence']}", flush=True)
         return
+    if args.writer_url:
+        return via_writer(args, ref, graph, head, prev_doc)
     seq, prev = step
     data = mirror_doc(graph, seq, prev, head)
     cid = raw_cid(data)
@@ -251,6 +253,30 @@ def mirror_one(args, graph):
         raise Unmeasured(last[:200])
 
 
+def via_writer(args, ref, graph, head, prev_doc):
+    """Send the R2 head to yataverse-writer (ADR-2610062000 P5) instead of
+    submitting here, so every inga graph write goes through one proposer.
+    `expected` is the head inga holds now, which makes it a compare-and-set."""
+    import urllib.error
+    import urllib.request
+    old = prev_doc["head"] if prev_doc else None
+    body = json.dumps({"graph": graph, "head": head,
+                       "expected": {"sequence": old["sequence"], "value": old["value"]} if old else None}).encode()
+    req = urllib.request.Request(args.writer_url.rstrip("/") + "/v1/graph-head", data=body,
+                                 headers={"content-type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=900) as r:
+            c = json.load(r)["committed"]
+        print(f"MIRRORED-VIA-WRITER {ref} seq {c['seq']} cid {c['cid']} r2-sequence {head['sequence']}", flush=True)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:200]
+        if e.code in (400, 403, 409):
+            raise Refused(f"writer {e.code}: {detail}")
+        raise Unmeasured(f"writer {e.code}: {detail}")
+    except (urllib.error.URLError, OSError) as e:
+        raise Unmeasured(f"writer unreachable: {e}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--graph", action="append", required=True)
@@ -263,9 +289,10 @@ def main(argv=None):
     p.add_argument("--cat-cmd", help="prints a mirror document by CID; {cid}")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--writer-url", help="send heads to yataverse-writer instead of submitting here (P5)")
     p.add_argument("--writer-check", help="after a submit, require the head to pass this writer policy (EDN)")
     args = p.parse_args(argv)
-    if len(args.pin_cmd) < 2 and not args.dry_run:
+    if len(args.pin_cmd) < 2 and not args.dry_run and not args.writer_url:
         p.error("pin each document on at least two custodians (--pin-cmd twice)")
     for g in args.graph:
         if not GRAPH_RE.fullmatch(g):
