@@ -1,0 +1,182 @@
+;; deploy/graph_head.cljk — graph-head documents and namespace signatures
+;; (ADR-2610062000 P4/P5), shared by the writer, the follower and the custody
+;; puller. Ported from graph_head_mirror.py; the bytes it produces must be
+;; identical, because a document's CID is its identity on inga:
+;;
+;;   canonical   JSON with sorted keys, no spaces, non-ASCII escaped as \uXXXX
+;;               (Python json.dumps(sort_keys=True, separators=(",", ":")))
+;;   raw-cid     CIDv1, raw codec, sha2-256, base32 lower, no padding (what
+;;               `ipfs add --cid-version=1 --raw-leaves` gives a small file)
+;;   dag-cbor    canonical dag-cbor of a head record minus its signature
+;;               fields, the bytes the namespace key signs
+
+(ns graph-head
+  (:require [clojure.string :as str]))
+
+(def nc (js/require "node:crypto"))
+(def cp (js/require "node:child_process"))
+
+(def schema "yataverse-graph-head-mirror/v1")
+(def graph-re #"baf[a-z2-7]{50,}")
+
+(defn refused [msg] (ex-info msg {:kind :refused}))
+(defn unmeasured [msg] (ex-info msg {:kind :unmeasured}))
+(defn kind [e] (:kind (ex-data e)))
+
+;; ── base58btc / base32 ───────────────────────────────────────────────────────
+
+(def ^:private b58 "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+(defn b58-decode
+  "-> Buffer, or nil when `text` is not base58btc."
+  [text]
+  (let [idx (map #(.indexOf b58 %) text)]
+    (when (every? #(>= % 0) idx)
+      (let [bytes (reduce (fn [bs d]
+                            (loop [i 0 carry d out []]
+                              (if (< i (count bs))
+                                (let [x (+ (* (nth bs i) 58) carry)]
+                                  (recur (inc i) (quot x 256) (conj out (rem x 256))))
+                                (loop [carry carry out out]
+                                  (if (pos? carry) (recur (quot carry 256) (conj out (rem carry 256))) out)))))
+                          [] idx)]
+        (js/Buffer.from (clj->js (concat (repeat (count (take-while #(= % 0) idx)) 0) (reverse bytes))))))))
+
+(def ^:private b32 "abcdefghijklmnopqrstuvwxyz234567")
+
+(defn b32-encode
+  "RFC 4648 base32, lower case, no padding."
+  [buf]
+  (let [bits (apply str (map #(.padStart (.toString % 2) 8 "0") (array-seq buf)))
+        padded (str bits (apply str (repeat (mod (- 5 (mod (count bits) 5)) 5) "0")))]
+    (apply str (map #(nth b32 (js/parseInt (apply str %) 2)) (partition 5 padded)))))
+
+;; ── canonical JSON (byte-identical to the Python writer) ─────────────────────
+
+(defn- json-str [s]
+  (let [ascii (.replace (js/JSON.stringify s) (js/RegExp. "[\\u0080-\\uffff]" "g")
+                        (fn [c] (str "\\u" (.padStart (.toString (.charCodeAt c 0) 16) 4 "0"))))]
+    ascii))
+
+(defn canonical-str [v]
+  (cond
+    (nil? v) "null"
+    (boolean? v) (if v "true" "false")
+    (number? v) (if (js/Number.isInteger v) (str v) (throw (refused (str "non-integer number " v))))
+    (string? v) (json-str v)
+    (keyword? v) (json-str (name v))
+    (map? v) (str "{" (str/join "," (map (fn [k] (str (json-str (name k)) ":" (canonical-str (get v k))))
+                                         (sort-by name (keys v))))
+                  "}")
+    (sequential? v) (str "[" (str/join "," (map canonical-str v)) "]")
+    :else (throw (refused (str "unsupported value " (pr-str v))))))
+
+(defn canonical
+  "-> Buffer of canonical JSON. Keys are compared as strings, like Python."
+  [v]
+  (js/Buffer.from (canonical-str v) "utf8"))
+
+(defn parse-json
+  "JSON text or Buffer -> Clojure data with string keys kept as strings."
+  [x]
+  (js->clj (js/JSON.parse (str x))))
+
+(defn raw-cid [buf]
+  (let [digest (-> (.createHash nc "sha256") (.update buf) (.digest))]
+    (str "b" (b32-encode (js/Buffer.concat #js [(js/Buffer.from #js [0x01 0x55 0x12 0x20]) digest])))))
+
+(defn mirror-doc
+  "-> Buffer. head is the parsed (string-keyed) head record."
+  [graph seq prev head]
+  (canonical {"schema" schema "graph" graph "seq" seq "prev" prev "head" head}))
+
+;; ── dag-cbor and the namespace signature ─────────────────────────────────────
+
+(defn- cbor-head [major n]
+  (cond
+    (< n 24) [(bit-or (bit-shift-left major 5) n)]
+    (< n 0x100) [(bit-or (bit-shift-left major 5) 24) n]
+    (< n 0x10000) [(bit-or (bit-shift-left major 5) 25) (bit-shift-right n 8) (bit-and n 0xff)]
+    (< n 0x100000000) (into [(bit-or (bit-shift-left major 5) 26)]
+                            (map #(bit-and (js/Math.floor (/ n (js/Math.pow 2 (* 8 %)))) 0xff) [3 2 1 0]))
+    :else (throw (refused "integer too large"))))
+
+(defn- utf8 [s] (vec (array-seq (js/Buffer.from s "utf8"))))
+
+(defn- cbor [v]
+  (cond
+    (nil? v) [0xf6]
+    (boolean? v) [(if v 0xf5 0xf4)]
+    (and (number? v) (js/Number.isInteger v)) (if (>= v 0) (cbor-head 0 v) (cbor-head 1 (- -1 v)))
+    (string? v) (let [b (utf8 v)] (into (cbor-head 3 (count b)) b))
+    (map? v) (let [ks (sort-by (fn [k] [(count (utf8 k)) k]) (keys v))]
+               (into (cbor-head 5 (count ks)) (mapcat (fn [k] (concat (cbor k) (cbor (get v k)))) ks)))
+    (sequential? v) (into (cbor-head 4 (count v)) (mapcat cbor v))
+    :else (throw (refused (str "head record holds an unsupported value: " (pr-str v))))))
+
+(defn dag-cbor [v] (js/Buffer.from (clj->js (cbor v))))
+
+(defn- spki [pub]
+  (.createPublicKey nc #js {:key (js/Buffer.concat #js [(js/Buffer.from #js [0x30 0x2a 0x30 0x05 0x06 0x03 0x2b 0x65 0x70 0x03 0x21 0x00]) pub])
+                            :format "der" :type "spki"}))
+
+(defn ed25519-pub-of-did [did]
+  (when-not (and (string? did) (str/starts-with? did "did:key:z"))
+    (throw (refused "public_key_multibase is not a did:key")))
+  (let [raw (b58-decode (subs did 9))]
+    (when-not (and raw (= 34 (.-length raw)) (= 0xed (aget raw 0)) (= 0x01 (aget raw 1)))
+      (throw (refused "did:key is not Ed25519")))
+    (.subarray raw 2)))
+
+(defn verify-head
+  "Return `record` (string-keyed) when it is a well-formed head for `graph`,
+   signed by one of `signers`; else throw a refusal."
+  [record graph signers]
+  (when-not (map? record) (throw (refused "head is not a JSON object")))
+  (when-not (= graph (get record "name"))
+    (throw (refused (str "head names " (pr-str (get record "name")) ", not " graph))))
+  (when-not (and (string? (get record "value")) (re-matches graph-re (get record "value")))
+    (throw (refused "head value is not a CID")))
+  (when-not (and (number? (get record "sequence")) (js/Number.isInteger (get record "sequence"))
+                 (>= (get record "sequence") 0))
+    (throw (refused "head sequence is not a natural number")))
+  (let [signer (get record "public_key_multibase")
+        sig (get record "signature_multibase")]
+    (when-not (contains? (set signers) signer)
+      (throw (refused (str "head signer " signer " is not pinned"))))
+    (when-not (and (string? sig) (str/starts-with? sig "z"))
+      (throw (refused "signature_multibase is not base58btc")))
+    (let [payload (dissoc record "public_key_multibase" "signature_multibase")
+          sig-bytes (b58-decode (subs sig 1))]
+      (when-not (and sig-bytes
+                     (.verify nc nil (dag-cbor payload) (spki (ed25519-pub-of-did signer)) sig-bytes))
+        (throw (refused "head signature does not verify")))
+      record)))
+
+;; ── processes ────────────────────────────────────────────────────────────────
+
+(defn run!
+  "Synchronous child process. argv: vector of strings. -> {:code :out (Buffer) :err (string)}."
+  ([argv] (run! argv nil 300))
+  ([argv input timeout-s]
+   (let [r (.spawnSync cp (first argv) (clj->js (rest argv))
+                       (clj->js (cond-> {:timeout (* 1000 timeout-s) :maxBuffer (* 64 1024 1024)}
+                                  input (assoc :input input))))]
+     {:code (.-status r) :out (or (.-stdout r) (js/Buffer.alloc 0))
+      :err (str (or (.-stderr r) ""))})))
+
+(defn words [s] (vec (remove str/blank? (str/split (str/trim s) #"\s+"))))
+
+(defn witness-head
+  "The head of `ref` proved by the witnesses: [seq cid], or nil when no
+   witness holds a record. `verifier` is the command prefix that runs
+   lake_head.cljk."
+  [verifier ledger ref]
+  (let [{:keys [code out]} (run! (conj (words verifier) "verify" ledger (str "--ref=" ref)) nil 180)
+        line (or (last (str/split-lines (str/trim (str out)))) "")
+        m (re-find #"^VERIFIED \S+ seq (\d+) cid (\S+)" line)]
+    (cond
+      (and (zero? code) m) [(js/parseInt (nth m 1) 10) (nth m 2)]
+      (= 4 code) nil
+      (= 1 code) (throw (refused (str "witnesses disagree: " (subs line 0 (min 200 (count line))))))
+      :else (throw (unmeasured (str "witnesses did not prove a head: " (subs line 0 (min 200 (count line)))))))))

@@ -10,28 +10,21 @@
 	<string>Background</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/opt/homebrew/bin/python3</string>
-		<string>/Users/junkawasaki/.local/share/yataverse-custody/bin/custody_puller.py</string>
-		<string>--graph</string>
-		<string>bafyreiha3q2g6ghjzjtydkvsudnixlbpbf6dlw6b7etd2l3ch4mbruv54e</string>
-		<string>--graph</string>
-		<string>bafyreicdx5lzw5bqgxgek4gqtoh3tuivdjglmqax6tqjo734wpx3lfo3sq</string>
-		<string>--graph</string>
-		<string>bafyreidnpq2mwo6ood7xdvu2nztpz6azag233kateilpboddthp4ybpyh4</string>
-		<string>--graph</string>
-		<string>bafyreig6tog2dqujgwgmmzu2gycl2m4nhetgwsbp3thlxk6lteqj5bdjr4</string>
-		<string>--signer</string>
-		<string>did:key:z6Mko2hmPxwvKwMPa5oj61JqXnQYSPjo5n6NhKLagvhtVuQp</string>
-		<string>--verifier</string>
-		<string>/opt/homebrew/bin/node /Users/junkawasaki/.local/share/yataverse-custody/release/engine/cli.js --classpath /Users/junkawasaki/.local/share/yataverse-custody/release/inga/src:/Users/junkawasaki/.local/share/yataverse-custody/release/inga-node/src:/Users/junkawasaki/.local/share/yataverse-custody/release/storage/src:/Users/junkawasaki/.local/share/yataverse-custody/release/text/src:/Users/junkawasaki/.local/share/yataverse-custody/release/edn/src:/Users/junkawasaki/.local/share/yataverse-custody/release/bytes/src /Users/junkawasaki/.local/share/yataverse-custody/bin/lake_head.cljk</string>
-		<string>--ledger</string>
-		<string>/Users/junkawasaki/.local/share/yataverse-custody/score-witness-v5.edn</string>
-		<string>--ipfs</string>
-		<string>/opt/homebrew/bin/ipfs --api /ip4/127.0.0.1/tcp/5002</string>
-		<string>--state</string>
-		<string>/Users/junkawasaki/.local/share/yataverse-custody/held.json</string>
-		<string>--loop</string>
-		<string>60</string>
+		<string>/opt/homebrew/bin/node</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-custody/release/engine/cli.js</string>
+		<string>--classpath</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-custody/bin</string>
+		<string>/Users/junkawasaki/.local/share/yataverse-custody/bin/custody_puller.cljk</string>
+		<string>--graph=bafyreiha3q2g6ghjzjtydkvsudnixlbpbf6dlw6b7etd2l3ch4mbruv54e</string>
+		<string>--graph=bafyreicdx5lzw5bqgxgek4gqtoh3tuivdjglmqax6tqjo734wpx3lfo3sq</string>
+		<string>--graph=bafyreidnpq2mwo6ood7xdvu2nztpz6azag233kateilpboddthp4ybpyh4</string>
+		<string>--graph=bafyreig6tog2dqujgwgmmzu2gycl2m4nhetgwsbp3thlxk6lteqj5bdjr4</string>
+		<string>--signer=did:key:z6Mko2hmPxwvKwMPa5oj61JqXnQYSPjo5n6NhKLagvhtVuQp</string>
+		<string>--verifier=/opt/homebrew/bin/node /Users/junkawasaki/.local/share/yataverse-custody/release/engine/cli.js --classpath /Users/junkawasaki/.local/share/yataverse-custody/release/inga/src:/Users/junkawasaki/.local/share/yataverse-custody/release/inga-node/src:/Users/junkawasaki/.local/share/yataverse-custody/release/storage/src:/Users/junkawasaki/.local/share/yataverse-custody/release/text/src:/Users/junkawasaki/.local/share/yataverse-custody/release/edn/src:/Users/junkawasaki/.local/share/yataverse-custody/release/bytes/src /Users/junkawasaki/.local/share/yataverse-custody/bin/lake_head.cljk</string>
+		<string>--ledger=/Users/junkawasaki/.local/share/yataverse-custody/score-witness-v5.edn</string>
+		<string>--ipfs=/opt/homebrew/bin/ipfs --api /ip4/127.0.0.1/tcp/5002</string>
+		<string>--state=/Users/junkawasaki/.local/share/yataverse-custody/held.json</string>
+		<string>--loop=60</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

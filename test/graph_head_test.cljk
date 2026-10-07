@@ -1,0 +1,60 @@
+;; Gate for deploy/graph_head.cljk against real committed documents.
+;; Run: node <release>/engine/cli.js --classpath deploy test/graph_head_test.cljk [DOCS-DIR]
+;; Every document the Python writer produced must re-serialise to the same
+;; bytes, hash to its file name, and carry a head whose signature verifies.
+(ns graph-head-test
+  (:require [clojure.string :as str]
+            [graph-head :as g]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def signer "did:key:z6Mko2hmPxwvKwMPa5oj61JqXnQYSPjo5n6NhKLagvhtVuQp")
+
+(def failures (atom 0))
+(defn check [label ok]
+  (println (if ok "  ✓" "  ✗") label)
+  (when-not ok (swap! failures inc)))
+
+(println "graph-head gate:")
+(check "base32 matches RFC 4648 vectors"
+       (and (= "my" (g/b32-encode (js/Buffer.from "f")))
+            (= "mzxw6ytboi" (g/b32-encode (js/Buffer.from "foobar")))))
+(check "canonical JSON sorts keys, drops spaces, escapes non-ASCII like Python"
+       (= "{\"a\":[1,null,true],\"b\":\"\\u00e9\\u007f\"}"
+          (str/replace (str (g/canonical {"b" "é\u007f" "a" [1 nil true]})) "\u007f" "\\u007f")))
+(check "dag-cbor orders map keys by length first"
+       (= [0xa2 0x61 0x62 0x01 0x62 0x61 0x61 0x02] (vec (array-seq (g/dag-cbor {"aa" 2 "b" 1})))))
+
+(def dir (or (second (drop-while #(not (str/ends-with? % "graph_head_test.cljk")) (array-seq (aget js/process "argv"))))
+             (str (aget js/process "env" "HOME") "/.local/share/yataverse-graph-mirror/docs")))
+(def files (filter #(str/ends-with? % ".json") (array-seq (.readdirSync fs dir))))
+(def results
+  (for [f files]
+    (let [data (.readFileSync fs (.join path dir f))
+          doc (g/parse-json data)
+          cid (subs f 0 (- (count f) 5))]
+      {:bytes (.equals data (g/canonical doc))
+       :cid (= cid (g/raw-cid data))
+       :doc (.equals data (g/mirror-doc (get doc "graph") (get doc "seq") (get doc "prev") (get doc "head")))
+       :sig (try (g/verify-head (get doc "head") (get doc "graph") [signer]) true (catch :default _ false))})))
+(check (str (count files) " real documents re-serialise byte for byte") (and (seq files) (every? :bytes results)))
+(check "each hashes to its file name (raw CID)" (every? :cid results))
+(check "mirror-doc rebuilds each from its fields" (every? :doc results))
+(check "each head's namespace signature verifies" (every? :sig results))
+
+(let [doc (g/parse-json (.readFileSync fs (.join path dir (first files))))
+      head (get doc "head")
+      refusal (fn [h] (try (g/verify-head h (get doc "graph") [signer]) nil
+                           (catch :default e (g/kind e))))]
+  (check "a changed sequence, value or graph is refused"
+         (= [:refused :refused :refused]
+            [(refusal (update head "sequence" inc))
+             (refusal (assoc head "value" "bafyreigchr5r5xm64kssxkkyrebtfxozp6lfmvyoimvighzir4bn3rhkn4"))
+             (try (g/verify-head head "bafyreig6tog2dqujgwgmmzu2gycl2m4nhetgwsbp3thlxk6lteqj5bdjr4" [signer]) nil
+                  (catch :default e (g/kind e)))]))
+  (check "an unpinned signer is refused" (= :refused (try (g/verify-head head (get doc "graph") ["did:key:z6Mkother"]) nil
+                                                          (catch :default e (g/kind e))))))
+
+(if (zero? @failures)
+  (println "graph-head gate: ok")
+  (do (println "graph-head gate:" @failures "failed") (js/process.exit 1)))
