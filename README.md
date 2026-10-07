@@ -1080,3 +1080,15 @@ Measured on epoch 3: the resumed run passed `reader` without changing the plist 
 - A policy value may be `{"writers" #{...} "from_seq" n}`, which grandfathers history from before the policy.
 - The local copy of the signing text is byte-identical to `inga.writer/signing-text`, checked by base64 comparison: 114 bytes both.
 - Records signed with v1 (graph mirror seqs 3 and up before this change, and lake seq 3) do not verify as v2. Enable a policy with `from_seq` at or above the first v2 seq for each ref.
+
+**The writer policy is pinned in the witness ledger (2026-10-07).** `score-witness-v5.edn` now carries `:writer-policy` (network-awai/network-isekai#347). The ledger's CID is now `bafkreidfimaqkza5svjyw2vuinddpjrvdf3t42xk27w6bqblbtiueohjpi`, pinned on xavier and jacob.
+
+**What readers do.** `lake_head.cljk` enforces the ledger's policy by default. `--writer-policy=FILE` still overrides it.
+
+**Checked on 2026-10-07.**
+
+- Under the ledger policy, all five current heads verify: the lake at seq 3 and the four graphs.
+- They pass because `from_seq` grandfathers the history committed before the policy.
+- A copy of the ledger naming another key for graph `bafyreiha3q2…` was refused by all 7 witnesses as `writer-not-allowed` (exit 3).
+
+**Run the drill with the new ledger.** Pass `--ledger-cid bafkreidfimaqkza5…`.
