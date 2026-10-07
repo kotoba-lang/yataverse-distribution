@@ -1,0 +1,54 @@
+;; deploy/import_lake_car.cljk — import a bounded lake CAR and pin its
+;; inventory CIDs through one DAG root (ADR-2610062000). Ported from
+;; import_lake_car.py; same root record, so the same root CID.
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> import_lake_car.cljk ...):
+;;   --inventory=F --sha256=HEX --count=N --start-row=N --max-blocks=N --car=F --car-sha256=HEX
+;;   --ipfs-bin=PATH --ipfs-path=DIR [--min-free-bytes=1000000000000] [--receipt=F]
+;; Exit codes: 0 imported (the receipt is printed); 2 refused.
+
+(ns import-lake-car
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [lake-inventory :as li]
+            [lake-kubo :as k]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+
+(defn import-batch [{:keys [inventory sha256 count start-row max-blocks car car-sha256 ipfs-bin ipfs-path min-free-bytes receipt]}]
+  (when-not (and (re-matches k/sha256-re (str sha256)) (re-matches k/sha256-re (str car-sha256))) (k/refuse "invalid SHA-256 argument"))
+  (when-not (and (<= 1 max-blocks 1000) (>= start-row 0) (>= count 1) (>= min-free-bytes 0)) (k/refuse "invalid inventory range"))
+  (when-not (and (.existsSync fs ipfs-bin) (.existsSync fs ipfs-path) (.existsSync fs car)) (k/refuse "Kubo binary, repository, or CAR is absent"))
+  (let [inv (li/open-inventory inventory sha256 count)
+        [rows _] (li/rows inv start-row max-blocks)
+        cids (mapv #(get % "cid") rows)
+        car-size (.-size (.statSync fs car))]
+    (when (or (empty? cids) (some #(not (re-matches k/cid-re %)) cids)) (k/refuse "invalid selected CID"))
+    (when (or (< car-size 1) (not= car-sha256 (k/sha256-file car))) (k/refuse "CAR SHA-256 differs from export receipt"))
+    (when (< (- (k/free-bytes ipfs-path) (* 2 car-size)) min-free-bytes) (k/refuse "physical disk reserve would be crossed"))
+    (let [env (k/verify-repo ipfs-bin ipfs-path)]
+      (k/kubo! ipfs-bin env ["dag" "import" "--allow-big-block" "--pin-roots=false" "--fast-provide-root=false"
+                             "--fast-provide-dag=false" car] :timeout-s 600)
+      (let [root (k/pin-root! ipfs-bin env (k/batch-root sha256 start-row cids))
+            result {"status" "complete" "inventory_sha256" sha256 "start_row" start-row "end_row" (+ start-row (clojure.core/count cids))
+                    "blocks" (clojure.core/count cids) "bytes" (reduce + 0 (map #(get % "size") rows))
+                    "car_sha256" car-sha256 "root" root "repository" (.resolve path ipfs-path)}]
+        (when receipt (k/write-receipt! receipt result))
+        result))))
+
+(defn- flag [kk] (some #(when (str/starts-with? % (str kk "=")) (subs % (inc (clojure.core/count kk)))) (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (try
+    (println (g/py-json-str
+              (import-batch {:inventory (flag "--inventory") :sha256 (flag "--sha256") :count (js/parseInt (flag "--count") 10)
+                             :start-row (js/parseInt (flag "--start-row") 10) :max-blocks (js/parseInt (flag "--max-blocks") 10)
+                             :car (flag "--car") :car-sha256 (flag "--car-sha256") :ipfs-bin (flag "--ipfs-bin") :ipfs-path (flag "--ipfs-path")
+                             :min-free-bytes (js/parseInt (or (flag "--min-free-bytes") "1000000000000") 10) :receipt (flag "--receipt")})))
+    (catch :default e
+      (.write js/process.stderr (str "REFUSED: " (g/message e) "\n"))
+      (js/process.exit 2))))
+
+(when (some #(str/ends-with? % "import_lake_car.cljk") (array-seq (aget js/process "argv")))
+  (main))
