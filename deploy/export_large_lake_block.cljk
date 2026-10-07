@@ -1,0 +1,141 @@
+;; deploy/export_large_lake_block.cljk — make an importable UnixFS CAR for
+;; one oversized, CID-checked lake block (ADR-2610062000). Ported from
+;; export_large_lake_block.py; same receipt.
+;;
+;; A CAR frame holding a 200 MB raw block is legal bytes, but Kubo's CAR
+;; importer refuses the section. This stores the same bytes as 256 KiB UnixFS
+;; leaves, then proves a fresh offline repository can restore the original
+;; CID from the CAR alone (import, cat, re-put with the original prefix).
+;;
+;; usage (node <release>/engine/cli.js --classpath <deploy> export_large_lake_block.cljk ...):
+;;   --inventory=F --sha256=HEX --count=N --row=N --base-url=URL/ipfs/ --ipfs-bin=PATH --output=F
+;; Exit codes: 0 exported (the receipt is printed and written beside the CAR); 2 refused.
+
+(ns export-large-lake-block
+  (:require [clojure.string :as str]
+            [graph-head :as g]
+            [lake-inventory :as li]
+            [raw-block-store :as r]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def os (js/require "node:os"))
+(def cp (js/require "node:child_process"))
+(def nc (js/require "node:crypto"))
+
+(def min-large-block 8000000)
+(def max-block 256000000)
+(def max-car 536870912)
+
+(defn- refuse [msg] (throw (ex-info msg {:kind :export})))
+
+(defn run!
+  "-> stdout Buffer, or write stdout to `out-file`."
+  [argv & {:keys [env out-file timeout-s] :or {timeout-s 300}}]
+  (let [fd (when out-file (.openSync fs out-file "wx"))
+        r (.spawnSync cp (first argv) (clj->js (rest argv))
+                      (clj->js (cond-> {:timeout (* 1000 timeout-s) :maxBuffer (* 64 1024 1024)}
+                                 env (assoc :env env)
+                                 fd (assoc :stdio ["ignore" fd "pipe"]))))]
+    (when fd (.fsyncSync fs fd) (.closeSync fs fd))
+    (when (.-error r) (refuse (str "command failed to run: " (first argv))))
+    (when-not (zero? (.-status r))
+      (refuse (str "command refused: " (first argv) " " (str/trim (subs (str (.-stderr r)) 0 (min 180 (count (str (.-stderr r)))))))))
+    (.-stdout r)))
+
+(defn digest-file [p ceiling]
+  (let [size (.-size (.statSync fs p))]
+    (when (> size ceiling) (refuse "file exceeds byte ceiling"))
+    [size (-> (.createHash nc "sha256") (.update (.readFileSync fs p)) (.digest))]))
+
+(defn checked-source-url [base cid]
+  (let [u (js/URL. base)
+        remote? (and (= "https:" (.-protocol u)) (re-matches #"[A-Za-z0-9.-]+" (.-hostname u)))
+        local? (and (= "http:" (.-protocol u)) (= "127.0.0.1" (.-hostname u)) (seq (.-port u)))]
+    (when-not (and (or remote? local?) (= "/ipfs/" (.-pathname u)) (= "" (.-search u)) (= "" (.-hash u)) (= "" (.-username u)) (= "" (.-password u)))
+      (refuse "source must be HTTPS or loopback HTTP /ipfs/ gateway base"))
+    (str base cid)))
+
+(defn source-curl-argv [url size output]
+  (let [local? (str/starts-with? url "http:")]
+    (concat ["curl" "-fsS" "--proto" (if local? "=http" "=https")]
+            (when local? ["--noproxy" "*"])
+            ["--max-redirs" "0" "--connect-timeout" "5" "--max-time" "300" "--max-filesize" (str size) "--output" output url])))
+
+(defn inventory-row [{:keys [inventory sha256 count row]}]
+  (let [inv (li/open-inventory inventory sha256 count)]
+    (when-not (and (<= 0 row) (< row (li/row-count inv))) (refuse "row outside immutable inventory"))
+    (let [[[r] _] (li/rows inv row 1) cid (get r "cid") size (get r "size")]
+      (when-not (and (< min-large-block size) (<= size max-block)) (refuse "row is outside oversized-block bounds"))
+      (r/sha256-digest cid)
+      [cid size])))
+
+(defn- fresh-repo [ipfs dir]
+  (let [env (doto (js/Object.assign #js {} (aget js/process "env")) (aset "IPFS_PATH" dir))]
+    (run! [ipfs "init" "--profile=server"] :env env :timeout-s 120)
+    env))
+
+(defn restore-original [ipfs car root original-cid expected-size expected-digest dir]
+  (let [env (fresh-repo ipfs (.join path dir "restore-repo"))
+        restored (.join path dir "restored.block")]
+    (run! [ipfs "dag" "import" car] :env env)
+    (run! [ipfs "--offline" "cat" root] :env env :out-file restored)
+    (let [[size digest] (digest-file restored max-block)]
+      (when-not (and (= expected-size size) (.equals digest expected-digest)) (refuse "offline UnixFS recovery differs from original CID bytes"))
+      (let [put (if (str/starts-with? original-cid "Qm")
+                  [ipfs "block" "put" "--format=v0" "--allow-big-block" restored]
+                  (let [prefix (str/split (str/trim (str (run! [ipfs "cid" "format" "-f" "%c %h %L" original-cid] :env env))) #"\s+")]
+                    (when-not (and (= 3 (clojure.core/count prefix)) (= "sha2-256" (second prefix)) (= "32" (nth prefix 2)))
+                      (refuse "original CID prefix is unsupported"))
+                    [ipfs "block" "put" (str "--cid-codec=" (first prefix)) "--mhtype=sha2-256" "--allow-big-block" restored]))]
+        (when-not (= original-cid (str/trim (str (run! put :env env)))) (refuse "rehydrated original CID differs"))
+        size))))
+
+(defn export! [{:keys [ipfs-bin output base-url sha256 row] :as a}]
+  (when-not (.existsSync fs ipfs-bin) (refuse "Kubo binary does not exist"))
+  (let [[cid size] (inventory-row a)
+        receipt (str output ".json")]
+    (when (or (.existsSync fs output) (.existsSync fs receipt)) (refuse "output or receipt already exists"))
+    (let [url (checked-source-url base-url cid)
+          dir (.mkdtempSync fs (.join path (.tmpdir os) "yataverse-large-car-"))]
+      (try
+        (let [source (.join path dir "source.block")]
+          (run! (vec (source-curl-argv url size source)) :timeout-s 310)
+          (let [[actual digest] (digest-file source max-block)]
+            (when-not (and (= size actual) (.equals digest (r/sha256-digest cid))) (refuse "source byte count or CID digest differs"))
+            (let [env (fresh-repo ipfs-bin (.join path dir "source-repo"))
+                  root (str/trim (str (run! [ipfs-bin "add" "--cid-version=1" "--raw-leaves" "--chunker=size-262144" "--quiet" source] :env env)))
+                  _ (when-not (re-matches #"b[a-z2-7]{20,200}" root) (refuse "UnixFS root CID is invalid"))
+                  car (.join path dir "recovery.car")
+                  _ (run! [ipfs-bin "dag" "export" root] :env env :out-file car)
+                  [car-bytes car-digest] (digest-file car max-car)]
+              (restore-original ipfs-bin car root cid size digest dir)
+              (let [record {"schema" 1 "inventory_sha256" sha256 "row" row "original_cid" cid "original_bytes" size
+                            "original_sha256" (.toString digest "hex") "recovery_root" root "car_bytes" car-bytes
+                            "car_sha256" (.toString car-digest "hex")
+                            "validation" "fresh-offline-kubo-import-cat-and-original-cid-rehydration"}
+                    pending (str output "." (.replace (.randomUUID nc) (js/RegExp. "-" "g") "") ".partial")]
+                (.copyFileSync fs car pending)
+                (.writeFileSync fs (str pending ".json") (str (g/py-json-str record) "\n"))
+                (try
+                  (.linkSync fs pending output)
+                  (try (.linkSync fs (str pending ".json") receipt)
+                       (catch :default e (.unlinkSync fs output) (throw e)))
+                  (finally (try (.unlinkSync fs pending) (catch :default _ nil))
+                           (try (.unlinkSync fs (str pending ".json")) (catch :default _ nil))))
+                record))))
+        (finally (.rmSync fs dir #js {:recursive true :force true}))))))
+
+(defn- flag [k] (some #(when (str/starts-with? % (str k "=")) (subs % (inc (count k)))) (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (try
+    (println (g/py-json-str (export! {:inventory (flag "--inventory") :sha256 (flag "--sha256") :count (js/parseInt (flag "--count") 10)
+                                      :row (js/parseInt (flag "--row") 10) :base-url (flag "--base-url") :ipfs-bin (flag "--ipfs-bin")
+                                      :output (flag "--output")})))
+    (catch :default e
+      (.write js/process.stderr (str "REFUSED: " (g/message e) "\n"))
+      (js/process.exit 2))))
+
+(when (some #(str/ends-with? % "export_large_lake_block.cljk") (array-seq (aget js/process "argv")))
+  (main))
