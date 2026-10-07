@@ -1,0 +1,64 @@
+;; deploy/netwatch.cljk — sample a process tree's sockets with lsof
+;; (ADR-2610062000 P6 observation). A separate process: the drill's steps are
+;; synchronous and would block an in-process timer.
+;;
+;; Every --interval-ms it lists the TCP/UDP sockets of --root-pid's process
+;; tree (plus any `tor` daemon, which the onion reads go through) and appends
+;; each new (command, remote) pair to --out as a JSON line. It exits when the
+;; root process is gone, writing the sample count to --count-file.
+;;
+;; usage: node <release>/engine/cli.js --classpath <deploy> netwatch.cljk
+;;          --root-pid=N --out=F --count-file=F [--interval-ms=500]
+
+(ns netwatch
+  (:require [clojure.string :as str]))
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+
+(defn tree
+  "Pure. ps rows [pid ppid comm] -> the set of pids under root, plus tor."
+  [rows root]
+  (let [kids (reduce (fn [m [pid ppid]] (update m ppid conj pid)) {} rows)
+        tors (keep (fn [[pid _ comm]] (when (= "tor" (.basename path (str comm))) pid)) rows)]
+    (loop [todo [root] seen #{root}]
+      (if-let [x (first todo)]
+        (let [new (remove seen (get kids x))] (recur (concat (rest todo) new) (into seen new)))
+        (into seen tors)))))
+
+(defn- ps-rows []
+  (->> (str/split-lines (str (.-stdout (.spawnSync cp "ps" #js ["-axo" "pid=,ppid=,comm="] #js {:encoding "utf8"}))))
+       (map str/trim) (remove str/blank?)
+       (map #(let [[pid ppid comm] (str/split % #"\s+" 3)] [(js/parseInt pid 10) (js/parseInt ppid 10) comm]))))
+
+(defn- alive? [pid] (try (.kill js/process pid 0) true (catch :default _ false)))
+
+(defn- flag [k] (some #(when (str/starts-with? % (str k "=")) (subs % (inc (count k)))) (array-seq (aget js/process "argv"))))
+
+(defn main []
+  (let [root (js/parseInt (flag "--root-pid") 10)
+        out (flag "--out") count-file (flag "--count-file")
+        interval (js/parseInt (or (flag "--interval-ms") "500") 10)
+        seen (atom #{}) samples (atom 0)]
+    ((fn tick []
+       (if-not (alive? root)
+         (do (.writeFileSync fs count-file (str @samples)) (js/process.exit 0))
+         (let [pids (str/join "," (sort (tree (ps-rows) root)))
+               lsof (str (.-stdout (.spawnSync cp "lsof" #js ["-nP" "-i" "-a" "-p" pids] #js {:encoding "utf8" :timeout 30000})))]
+           (swap! samples inc)
+           (.writeFileSync fs count-file (str @samples))
+           (doseq [line (rest (str/split-lines lsof))]
+             (let [parts (str/split (str/trim line) #"\s+")
+                   name (first (filter #(str/includes? % "->") parts))]
+               (when name
+                 (let [remote (second (str/split name #"->")) k [(first parts) remote]]
+                   (when-not (@seen k)
+                     (swap! seen conj k)
+                     (.appendFileSync fs out (str (js/JSON.stringify #js {:t (js/Date.now) :ev "lsof" :cmd (first parts)
+                                                                          :pid (js/parseInt (second parts) 10) :remote remote})
+                                                  "\n")))))))
+           (js/setTimeout tick interval)))))))
+
+(when (some #(str/ends-with? % "netwatch.cljk") (array-seq (aget js/process "argv")))
+  (main))

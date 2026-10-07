@@ -1,0 +1,22 @@
+;; Gate for deploy/lake_epoch_cycle.cljk: run selection and step order.
+(ns lake-epoch-cycle-test
+  (:require [lake-epoch-cycle :as c]))
+(def fs (js/require "node:fs"))
+(def os (js/require "node:os"))
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+(defn run-dir [root name state]
+  (let [d (str root "/" name)] (.mkdirSync fs d #js {:recursive true})
+    (.writeFileSync fs (str d "/cycle-state.json") (js/JSON.stringify (clj->js state))) d))
+(println "lake-epoch-cycle gate:")
+(check "steps are the Python cycle's, in order"
+       (= ["head" "capture" "diff" "resolve" "delta" "xavier" "jacob" "cids" "manifest" "submit" "bundle" "check" "reader"] c/steps))
+(let [root (.mkdtempSync fs (str (.tmpdir os) "/cycle-gate-"))]
+  (run-dir root "run-20261005T0430Z" {"done" ["head" "capture" "diff" "resolve" "delta" "xavier" "jacob" "cids" "manifest" "submit" "bundle" "check" "reader"]})
+  (check "a finished newest run starts a new dated one" (not= (str root "/run-20261005T0430Z") (c/pick-work root)))
+  (let [mid (run-dir root "run-20261006T0430Z" {"done" ["head" "capture" "diff" "resolve" "delta" "xavier" "jacob" "cids" "manifest" "submit"]})]
+    (check "a run stopped after submit is resumed, not restarted" (= mid (c/pick-work root))))
+  (run-dir root "run-20261007T0430Z" {"done" ["head" "capture" "diff" "resolve" "delta"] "inv" {"rows" 0}})
+  (check "a run that found nothing to commit counts as finished" (c/finished? (str root "/run-20261007T0430Z"))))
+(if (zero? @failures) (println "lake-epoch-cycle gate: ok")
+    (do (println "lake-epoch-cycle gate:" @failures "failed") (js/process.exit 1)))

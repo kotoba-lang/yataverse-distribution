@@ -1419,6 +1419,25 @@ Both are valid, because the namespace signature covers dag-cbor, which is order-
 
 The Python originals stay until `lake_epoch_cycle` (which calls them) is ported.
 
+### Capture and the epoch cycle in kotoba (2026-10-07)
+
+- **`deploy/capture_lake_inventory.cljk`** replaces the curl subprocess with `fetch` under the same rules: loopback HTTP or HTTPS only, a 2 MB page cap, a 45 s timeout, transport retries at the same cursor, and no retry on malformed data.
+  - **Cross-check, live.** Python walked 3 pages. kotoba walked 2 pages, stopped, and resumed for the third, at the same cutoff. The partial inventories were byte-identical (600 rows), and every checkpoint field matched except the output path. A walk either tool started can be resumed by the other.
+  - Python's `flock` became an exclusive lock file holding the pid, taken over when its holder is dead.
+- **`deploy/lake_epoch_cycle.cljk`** has the same steps, checks and `cycle-state.json`, so either version can resume a run the other started.
+  - It runs this directory's kotoba tools (capture, diff, delta, manifest).
+  - Until they are ported, it calls the remote Python tools on xavier and jacob exactly as before.
+  - `test/lake_epoch_cycle_test.cljk` covers the step order and run selection: a run stopped after `submit` is resumed, not restarted.
+- The manifest relation now says `lake_epoch delta`, the method rather than the Python file.
+
+### P6 drill in kotoba (2026-10-07)
+
+`deploy/p6_drill.cljk` replaces `p6_drill.py`. It is built on the cycle's kotoba steps.
+
+- **Observation.** `deploy/netwatch.cljk` is a separate lsof sampler: the drill's steps are synchronous and would block an in-process timer. Node children are still recorded by `net_audit/net_audit_hook.cjs`. Every tool the drill runs is now kotoba on node, so the Python audit hook (`net_audit/sitecustomize.py`) is gone.
+- **Gate** (`test/p6_drill_test.cljk`): signing, every field signed, canonical blocks, classification, the summary, and the netwatch tree. It also checks that the epoch-5 action Python signed still verifies under the kotoba code.
+- **Cross-check.** Re-summarising the real 2026-10-07 observation log with the kotoba code reproduces the recorded receipt exactly: tailnet 55, loopback 19, public 123, 0 Cloudflare, 0 name lookups, 71 public remotes.
+- `independent_read_drill.py` is removed. Its kotoba port is the one the drill calls.
 ### Raw block store in kotoba (2026-10-07)
 
 `deploy/raw_block_store.cljk` uses the same layout and writes byte-identical metadata, so the two implementations share one store.
@@ -1490,3 +1509,27 @@ This bridge is itself a Cloudflare dependency, kept until the replicas no longer
   - **End to end:** epoch 4's range was exported on xavier, carried through main-2 and imported on jacob, all in kotoba. The result was `shipped` with root `bafyreibc43h…` (epoch 4's), and the transient CARs were removed on both ends, leaving only the import receipt.
 - **`deploy/audit_lake.cljk`** provides the receipt audit and the inventory audit. Receipt names are frozen before pins are listed, and `direct_pin_rows` counts over the direct ∪ recursive union, as Python did. **On jacob**, over epoch 4's receipts, its report is byte-identical to Python's: 24/24 covered through the CAR root.
 - **`deploy/router_standby.cljk`** keeps the same guarded decision: three confirmed failures; no takeover while the primary still listens; no deletion of a working mapping without `--allow-router-cutover`; rollback when a replacement fails. `test/router_standby_test.cljk` ports the 6 Python cases. It runs on gad, which has been offline since 2026-10-02, so it is not deployed yet.
+
+### First production epoch cut by the kotoba cycle (2026-10-07)
+
+The kotoba cycle ran on the production runs directory from `head` to `reader` and committed **epoch 6**.
+
+| Step | Result |
+|---|---|
+| Capture | Two full walks of about 4,128 pages each at cutoff 2026-10-07T03:00Z: 825,389 rows, agreeing |
+| Diff | 3,856 rows since epoch 0 |
+| Resolve | The first attempt timed out while I was running two full `pin ls` audits on jacob. The rerun resolved 6 epochs, 825,283 rows |
+| Delta | 107 rows, 64,735 bytes, none large |
+| xavier | Leaf readback 107/107 |
+| jacob | Audit complete, readback 107/107 |
+| Manifest | `bafkreiezmplv…` |
+| Submit | Verified by 7 witnesses |
+| Bundle | `bafkreie5xqy…` |
+| Check | 825,390 rows covering the listing (the 1 row only in the log is the P6 action) |
+| Reader | The onion reader serves 825,390 rows (`2334fb3e`) |
+
+**Follow-ups committed:** `deploy/lake-manifests/epoch-6.json` and the reader plist. The directory pointer stays a reviewed step.
+
+**Schedule.** The 04:30 LaunchAgent now runs the cljk cycle, which has a run lock. The Python cycle schedule was paused during this run so that it could not resume the same run beside it.
+
+**Retired.** `lake_epoch_cycle.py`, `capture_lake_inventory.py`, `diff_lake_inventory.py` and `lake_epoch.py`. The cycle still calls the remote Python tools on xavier and jacob (replicate, temporary reader, CAR export/import, audit, large lane) until they switch to their verified kotoba ports.
