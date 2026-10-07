@@ -29,6 +29,10 @@
 		<string>http://100.108.223.94:18130</string>
 		<string>--r2-get-cmd</string>
 		<string>/opt/homebrew/bin/wrangler r2 object get kotobase-graph-database-production/heads/yataverse/ipns/{graph}.json --remote --pipe</string>
+		<string>--cutover</string>
+		<string>--project</string>
+		<string>--r2-put-cmd</string>
+		<string>/opt/homebrew/bin/wrangler r2 object put kotobase-graph-database-production/heads/yataverse/ipns/{graph}.json --file {file} --remote --content-type application/json</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -37,7 +41,7 @@
 	<key>StandardOutPath</key>
 	<string>/Users/junkawasaki/.local/share/yataverse-writer/logs/follower.out.log</string>
 	<key>StartInterval</key>
-	<integer>600</integer>
+	<integer>120</integer>
 	<key>WorkingDirectory</key>
 	<string>/Users/junkawasaki/.local/share/yataverse-writer</string>
 </dict>
