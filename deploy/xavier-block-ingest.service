@@ -5,15 +5,15 @@ Wants=ipfs.service
 
 [Service]
 Type=simple
-WorkingDirectory=/home/xavier/.local/share/yataverse-writer
+WorkingDirectory=/home/xavier/.local/share/block-ingest
 # --allow lists the did:key of every Worker that may write. Each signer's
 # blocks are held under /block-ingest/<its did:key>/ in Kubo's MFS.
-ExecStart=/usr/local/bin/node /home/xavier/.local/share/yataverse-writer/release/engine/cli.js --classpath /home/xavier/.local/share/yataverse-writer/bin /home/xavier/.local/share/yataverse-writer/bin/block_ingest.cljk --host=127.0.0.1 --port=18140 \
-  --allow=did:key:REPLACE_WITH_MURAKUMO_WORKER_SIGNER \
+ExecStart=/usr/local/bin/node /home/xavier/.local/share/yataverse-writer/release/engine/cli.js --classpath /home/xavier/.local/share/block-ingest/bin /home/xavier/.local/share/block-ingest/bin/block_ingest.cljk --host=127.0.0.1 --port=18140 \
+  --allow=did:key:z6Mkr2JXYtHYmcH84SPxZCQnBCLXGSgcMhc9AAJhpBXnJnFY \
   --ipfs-bin=/mnt/nvme/ipfs-xavier/bin/ipfs --ipfs-path=/mnt/nvme/ipfs-xavier/repo \
   --max-block-bytes=16777216 --max-concurrent-puts=4
-StandardOutput=append:/home/xavier/.local/share/yataverse-writer/logs/block-ingest.out.log
-StandardError=append:/home/xavier/.local/share/yataverse-writer/logs/block-ingest.err.log
+StandardOutput=append:/home/xavier/.local/share/block-ingest/logs/block-ingest.out.log
+StandardError=append:/home/xavier/.local/share/block-ingest/logs/block-ingest.err.log
 Restart=on-failure
 RestartSec=10
 MemoryMax=1G

@@ -1561,3 +1561,17 @@ Tests:
 ```
 node <release>/engine/cli.js --classpath deploy:test test/block_ingest_test.cljk
 ```
+
+**Installed on xavier (2026-10-07).**
+- **Service:** `block-ingest.service`, a user unit, active on 127.0.0.1:18140.
+  - Its files are in `~/.local/share/block-ingest/bin`, with its own `graph_head.cljk` taken from main; the writer's copy is untouched.
+  - It allows one signer: the murakumo.cloud Worker, `did:key:z6Mkr2JXYtHYmcH84SPxZCQnBCLXGSgcMhc9AAJhpBXnJnFY`. The Worker holds the Ed25519 seed (base64url) as the secret `BLOCK_INGEST_SIGNING_KEY`.
+- **Live checks:**
+  - GET of a block xavier already holds returned 200 with 571 B;
+  - an unsigned PUT returned 401;
+  - a PUT signed by a key not on the allowlist returned 403.
+- **The public entrance needs root.** `deploy/install-block-ingest-nginx.sh`, staged in `~/.local/share/block-ingest/nginx/`, installs:
+  - the rate-limit zone;
+  - the ACME port-80 vhost;
+  - a webroot certificate for `yataverse-blocks.220-146-170-114.sslip.io`;
+  - the 443 vhost.
