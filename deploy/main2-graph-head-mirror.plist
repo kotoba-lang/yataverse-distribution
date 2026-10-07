@@ -45,6 +45,8 @@
 		<string>/Users/junkawasaki/.local/share/yataverse-graph-mirror/docs</string>
 		<string>--writer-check</string>
 		<string>/Users/junkawasaki/.local/share/yataverse-graph-mirror/writer-check.edn</string>
+		<string>--writer-url</string>
+		<string>http://127.0.0.1:18130</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

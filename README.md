@@ -1092,3 +1092,43 @@ Measured on epoch 3: the resumed run passed `reader` without changing the plist 
 - A copy of the ledger naming another key for graph `bafyreiha3q2…` was refused by all 7 witnesses as `writer-not-allowed` (exit 3).
 
 **Run the drill with the new ledger.** Pass `--ledger-cid bafkreidfimaqkza5…`.
+
+## yataverse-writer: the fleet proposer for graph heads (2026-10-07, ADR-2610062000 P5, step 1)
+
+**What it is.** `deploy/yataverse_writer.py` is the D3 proposer. It takes over from the Worker as the place a graph head is decided.
+
+| Request | Responses |
+|---|---|
+| `POST /v1/graph-head {graph, expected, head}` | 200 committed, 409 conflict (names the current head), 403 refused, 503 unmeasured |
+| `GET /v1/graph-head?graph=` | The committed head and its document |
+
+**What a POST does, in order.**
+
+1. Verifies the head's signature against the pinned namespace signer.
+2. Checks that `expected` equals the head inga holds now. This is the compare-and-set.
+3. Requires the sequence to move forward.
+4. Writes the same mirror document the P4 mirror writes and pins it on jacob and xavier.
+5. Submits it signed with the writer key. The witnesses enforce the ledger's writer policy.
+6. Answers only after 5 of 7 witnesses prove the commit.
+
+Retrying a committed head returns the same 200. Writes to one graph are serialised; across writers, inga's first-wins sequence decides.
+
+**The mirror goes through it.** `graph_head_mirror.py --writer-url` posts R2 heads to the writer instead of submitting itself, so every inga graph write has one proposer.
+
+**Measured live on main-2 (2026-10-07).** The writer runs as `deploy/main2-yataverse-writer.plist` on 127.0.0.1:18130.
+
+| Test | Result |
+|---|---|
+| Head signed by an unknown key | 403 `not pinned` |
+| Stale `expected` | 409, naming the current head (sequence 3662) |
+| The real R2 head (3665) | Committed as seq 23 |
+| Same request again | The same 200 |
+| `GET` | The committed head in about 2 s |
+
+Seven unit tests cover the decision.
+
+**Not yet.**
+
+- The Worker still writes R2 directly. Moving its writes to the writer, and fencing direct R2 head writes, needs the Worker deploy path (control-plane#774).
+- The writer listens on loopback only.
+- The follower that writes R2 from inga does not exist yet.
