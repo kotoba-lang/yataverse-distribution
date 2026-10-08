@@ -1,0 +1,78 @@
+;; Read CID-checked lake bytes through /x/yataverse/lake-reader/1.
+;; No DNS, bootstrap, delegated router, Cloudflare or tailnet peer address.
+;; node <release>/engine/cli.js --classpath deploy deploy/p2p_reader_drill.cljk
+;;   --ipfs-bin=PATH --peer=/ip4/PUBLIC/tcp/PORT/p2p/ID --cid=CID
+(ns p2p-reader-drill
+  (:require [clojure.string :as str]
+            [ephemeral-kubo :as k]
+            [raw-block-store :as r]))
+
+(def protocol "/x/yataverse/lake-reader/1")
+(def net (js/require "node:net"))
+
+(defn public-peer? [addr]
+  ;; Refuse private/loopback/tailnet IPv4: a passing drill must leave the LAN.
+  (when-let [[_ a b c d port peer]
+             (re-matches #"/ip4/([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)/tcp/([0-9]+)/p2p/([A-Za-z0-9]+)" addr)]
+    (let [a (js/parseInt a) b (js/parseInt b)]
+      (and (< 0 a 224) (every? #(<= 0 (js/parseInt %) 255) [b c d]) (not (#{10 127} a))
+           (not (and (= a 100) (<= 64 b 127)))
+           (not (and (= a 172) (<= 16 b 31)))
+           (not (and (= a 192) (= b 168)))
+           (not (and (= a 169) (= b 254)))
+           (<= 1 (js/parseInt port) 65535) (boolean (seq peer))))))
+
+(defn verify-response [cid status data]
+  (when-not (= status 200) (throw (ex-info (str "reader HTTP " status) {})))
+  (when-not (<= 1 (.-length data) (* 2 1024 1024))
+    (throw (ex-info "drill requires a block within 1..2 MiB" {})))
+  (r/verify-cid cid data)
+  {:cid cid :bytes (.-length data) :verified true})
+
+(defn- free-port []
+  (js/Promise. (fn [resolve reject]
+                 (let [s (.createServer net)]
+                   (.on s "error" reject)
+                   (.listen s 0 "127.0.0.1"
+                            #(let [port (.-port (.address s))]
+                               (.close s (fn [] (resolve port)))))))))
+
+(defn main []
+  (let [flag (fn [name] (some #(when (str/starts-with? % (str name "="))
+                                (subs % (inc (count name))))
+                             (array-seq (aget js/process "argv"))))
+        addr (flag "--peer") cid (flag "--cid") active (atom nil)]
+    (when-not (and addr (public-peer? addr) cid)
+      (println "REFUSE need a public raw IPv4 TCP peer and --cid") (js/process.exit 1))
+    (r/sha256-digest cid)
+    (-> (k/start! (or (flag "--ipfs-bin") "ipfs") "none"
+                  [["Experimental.Libp2pStreamMounting" "true"]])
+        (.then (fn [kubo]
+                 (reset! active kubo)
+                 (when-not (zero? (:code (k/ipfs! kubo ["swarm" "connect" addr] 45)))
+                   (throw (ex-info "public peer connection failed" {})))
+                 (.then (free-port)
+                        (fn [port]
+                          (when-not (zero? (:code (k/ipfs! kubo ["p2p" "forward" protocol
+                                                                (str "/ip4/127.0.0.1/tcp/" port)
+                                                                (str "/p2p/" (k/peer-of addr))])))
+                            (throw (ex-info "reader stream unavailable" {})))
+                          (-> (js/fetch (str "http://127.0.0.1:" port "/ipfs/" cid)
+                                        #js {:signal (js/AbortSignal.timeout 45000) :redirect "error"})
+                              (.then (fn [response]
+                                       (.then (.arrayBuffer response)
+                                              #(assoc (verify-response cid (.-status response) (js/Buffer.from %))
+                                                      :path (k/connections kubo (k/peer-of addr)))))))))))
+        (.then (fn [result]
+                 (println (js/JSON.stringify (clj->js (assoc result :drill "yataverse-p2p-reader"
+                                                            :peer addr :protocol protocol :dns "none"
+                                                            :cloudflare "none" :tailscale "none"
+                                                            :checked (.toISOString (js/Date.))))))
+                 (k/stop! @active)
+                 (js/setTimeout #(js/process.exit 0) 3500)))
+        (.catch (fn [e]
+                  (println "FAIL" (.-message e))
+                  (when @active (k/stop! @active))
+                  (js/setTimeout #(js/process.exit 1) 3500))))))
+
+(when (some #(str/ends-with? % "p2p_reader_drill.cljk") (array-seq (aget js/process "argv"))) (main))

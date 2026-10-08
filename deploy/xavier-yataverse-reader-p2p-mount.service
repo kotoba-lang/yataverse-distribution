@@ -1,0 +1,14 @@
+[Unit]
+Description=Yataverse CID-checked lake reader over libp2p
+After=ipfs.service
+Wants=ipfs.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/node /home/xavier/.local/share/yataverse-writer/release/engine/cli.js --classpath /home/xavier/.local/share/yataverse-writer/bin /home/xavier/.local/share/yataverse-writer/bin/p2p_mesh.cljk "--ipfs=env IPFS_PATH=/mnt/nvme/ipfs-xavier/repo /mnt/nvme/ipfs-xavier/bin/ipfs" --listen=/x/yataverse/lake-reader/1=/ip4/127.0.0.1/tcp/8090 --loop=30
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
