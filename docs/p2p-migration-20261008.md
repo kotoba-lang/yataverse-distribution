@@ -14,7 +14,7 @@ PR #93 (`3cc51c1` main integration) adds the dedicated user service
 at port 8090 as `/x/yataverse/lake-reader/1`. The 30-second mount keeper
 restores this protocol after Kubo restarts and leaves other protocols alone.
 It exposes the reader's existing inventory and local-custody block API,
-not the Kubo administration API. The existing writer service was unchanged.
+not the Kubo administration API.
 
 At `2026-10-08T04:49:10.823Z`, an empty client Kubo connected to public
 IPv4 `220.146.170.114:13515`, peer
@@ -65,9 +65,19 @@ gateway is not supplied by these configs. Do not route to a missing Worker.
 
 ## Remaining migration gates
 
-- Witness consensus still uses tailnet endpoints. Move client and witness
-  transports to libp2p without changing pinned witness keys, quorum or
-  signature verification; measure fresh signed commit and readback.
+- Writer-to-Witness client transport is now libp2p (PRs #95 and #96, main
+  `799f004`). Xavier's active writer reads a derived ledger pointing to
+  loopback forwards 13001–13007, each pinned to its Witness peer ID. The
+  original chain, all seven public keys and writer policies are unchanged.
+  The previous ledger is retained as `score-witness-v5-tailnet-before-20261008.edn`.
+  A newly signed record for the dedicated acceptance ref
+  `yataverse/graph/bafkreieezmuowwyshvjwdhme5ip5lwqrsz4t5utc7bgd4r6h3jyqd75gbi`
+  committed at sequence 0 in 33,756 ms, verified by w1/w2/w4/w6/w7. The
+  production lake and graph heads were not changed. This proves new signed
+  consensus over the P2P client path, not fixture-byte custody: a separate
+  Kubo readback of the fixture timed out. w3/w5 remain unreachable; do not
+  restart any of the five healthy Witnesses. Witness listener addresses and
+  recovery of those two nodes still require work before full tailnet removal.
 - Add a separately reachable reader/custodian and verify fallback under a
   controlled failure only after confirming fresh quorum and custody.
 - Recover consumers of deleted authn/IPFS bindings: `itonami-app-auth`,
@@ -79,3 +89,32 @@ gateway is not supplied by these configs. Do not route to a missing Worker.
   so a subsequent release cannot silently recreate retired Workers.
 - R2 bootstrap/follower paths and Cloudflare DNS authority remain dependencies.
   P2P data retrieval passing does not prove their complete removal.
+
+## Consumer and authentication work prepared this session
+
+Hyakka draft PR `network-awai/app-hyakka#1195` removes its deleted
+`net-kotobase-ipfs` binding and uses the independent HTTPS Reader
+`https://yataverse-data.220-146-170-114.sslip.io:8443/ipfs/<cid>` until the
+canonical Yataverse DNS/TLS entry is qualified. Consumers validate raw/DAG-CBOR
+CIDv1 SHA-256 before decoding, with size/time bounds and no redirects.
+The actual fetch code retrieved and verified the game root (79,429 bytes)
+and ledger root (5,250 bytes); corrupted bytes were refused.
+This is not deployed. The existing `amu compile ... worker` build accepts no
+bare build name. A follow-up using the actual entry and explicit module paths
+also stops at unresolved `cljs.reader`; neither probe emitted a Worker bundle.
+Keep the PR draft until the build and production read surface pass.
+
+Authentication draft PR `cloud-kotoba/kotobase-control-plane#781` lets viewer,
+inference and operator Biscuit verifiers use a pinned public root without an
+issuer seed. The 15-test/87-assertion smoke suite passed, including explicit
+wrong-key refusal, expiry, model/output limits and operator revocation.
+Minting still requires issuer custody. The old Worker and AuthnStore remain
+retired; public-key verification does not restore sessions, account records,
+or a token issuer. No deployed auth consumer was switched by this source change.
+
+Current source configurations still name the deleted `kotobase-authn` in
+`local-murakumo`, `app-aozora-engine/auth`, `nexus-x402`, `app-kotoba-cloud`
+and the API gateway. The gateway also still names the deleted staging graph
+Worker. Those paths need local capability verification and the corresponding
+P2P data contract before bindings can be removed safely. Passkey/session
+lookup and minting must not be treated as public-key verification.
