@@ -1,0 +1,21 @@
+[Unit]
+Description=Yataverse client forwards to pinned inga witnesses over libp2p
+After=ipfs.service
+Wants=ipfs.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/node /home/xavier/.local/share/yataverse-writer/release/engine/cli.js --classpath /home/xavier/.local/share/yataverse-writer/bin /home/xavier/.local/share/yataverse-writer/bin/p2p_mesh.cljk "--ipfs=env IPFS_PATH=/mnt/nvme/ipfs-xavier/repo /mnt/nvme/ipfs-xavier/bin/ipfs" \
+  --forward=/x/inga/isekai-score-20261006-v5/1@/ip4/127.0.0.1/tcp/13001=12D3KooWDwb5sJBRuhjbnMZkzgTFxVWSifawWYzUcVvEuXfMv5N8 \
+  --forward=/x/inga/isekai-score-20261006-v5/1@/ip4/127.0.0.1/tcp/13002=12D3KooWCrUDXqAFdayFZjHqmpkPoLqG1pNjM4oW7h5UeEezu8VC \
+  --forward=/x/inga/isekai-score-20261006-v5/1@/ip4/127.0.0.1/tcp/13003=12D3KooWCEZ8V3WkknwUmJGxCYLF9eBUxBurTL8Fp12sp6pP1S2h \
+  --forward=/x/inga/isekai-score-20261006-v5/1@/ip4/127.0.0.1/tcp/13004=12D3KooWH9wE67DN5RTdF1NeX7YVe7tJzZaU4z6ry6mDh8mPFE8g \
+  --forward=/x/inga/isekai-score-20261006-v5/1@/ip4/127.0.0.1/tcp/13005=12D3KooWP3bLqtQdAwkgVTaNRj1BawkACV5HCTWqrNcx3atqWuvo \
+  --forward=/x/inga/isekai-score-20261006-v5/1@/ip4/127.0.0.1/tcp/13006=12D3KooWFud9xw8fr3rYk7kEYxpt4a4wXZbrFiiTKBwBNxXASAM5 \
+  --forward=/x/inga/isekai-score-20261006-v5/1@/ip4/127.0.0.1/tcp/13007=12D3KooWMLDv6ZQQ8GSwV15zSajEWq31h4zZNR9hTWypKqvy4ivP --loop=30
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

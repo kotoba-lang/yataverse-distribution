@@ -1,0 +1,20 @@
+(ns witness-client-test (:require [witness-client :as w]))
+(def ids (mapv #(str "w" %) (range 1 8)))
+(def source {:chain-id "fixture-chain" :pubkeys (zipmap ids (repeat "pinned-key"))
+             :writer-policy {"fixture-ref" {"writers" #{"did:key:fixture"}}}
+             :libp2p {:protocol "/x/inga/fixture/1"}
+             :witnesses (mapv (fn [i] {:id (str "w" i) :peer (str "12D3KooWFixture" i)
+                                      :ip "100.64.0.1" :port (+ 12000 i) :host (str "host" i)}) (range 1 8))})
+(defn check [label ok] (println label ok) (when-not ok (js/process.exit 1)))
+(defn refused? [f] (try (f) false (catch :default _ true)))
+(def local (w/derive source 13000))
+(check "chain, keys, order and policy preserved"
+       (= (select-keys source [:chain-id :pubkeys :writer-policy]) (select-keys local [:chain-id :pubkeys :writer-policy])))
+(check "witness metadata preserved" (= (:witnesses source) (mapv #(merge %1 (select-keys %2 [:ip :port])) (:witnesses local) (:witnesses source))))
+(check "only loopback" (every? #(= "127.0.0.1" (:ip %)) (:witnesses local)))
+(check "unique ports" (= (set (range 13001 13008)) (set (map :port (:witnesses local)))))
+(check "seven peer forwards" (= 7 (count (w/forward-args local))))
+(check "missing witness refused" (refused? #(w/derive (update source :witnesses subvec 1) 13000)))
+(check "missing key refused" (refused? #(w/derive (update source :pubkeys dissoc "w1") 13000)))
+(check "port overflow refused" (refused? #(w/derive source 65535)))
+(check "missing peer refused" (refused? #(w/derive (update-in source [:witnesses 0] dissoc :peer) 13000)))

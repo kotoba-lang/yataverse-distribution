@@ -1,0 +1,38 @@
+;; Derive local libp2p client endpoints without changing consensus authority.
+;; The source is the client's current ledger: preserve all pinned keys/policy.
+;; node <release>/engine/cli.js --classpath deploy witness_client.cljk SOURCE OUTPUT
+(ns witness-client
+  (:require [clojure.edn :as edn] [clojure.string :as str]))
+(def fs (js/require "node:fs"))
+
+(defn derive [ledger base]
+  (let [ws (:witnesses ledger) ids (mapv :id ws)]
+    (when-not (and (= 7 (count ws)) (= (set ids) (set (keys (:pubkeys ledger))))
+                   (= (set ids) (set (map #(str "w" %) (range 1 8))))
+                   (integer? base) (<= 1024 base (- 65535 7))
+                   (every? #(re-matches #"12D3KooW[A-Za-z0-9]+" (str (:peer %))) ws)
+                   (= 7 (count (set (map :peer ws)))))
+      (throw (ex-info "REFUSE incomplete pinned seven-witness ledger or port range" {})))
+    (assoc ledger :client-transport {:kind :libp2p :host "127.0.0.1" :forward-port-base base}
+           :witnesses (mapv (fn [w] (assoc w :ip "127.0.0.1"
+                                         :port (+ base (js/parseInt (subs (:id w) 1) 10)))) ws))))
+
+(defn forward-args [ledger]
+  (let [protocol (get-in ledger [:libp2p :protocol])]
+    (when-not (re-matches #"/x/[a-z0-9/._-]+" (str protocol))
+      (throw (ex-info "REFUSE missing pinned protocol" {})))
+    (mapv (fn [w] (str "--forward=" protocol "@/ip4/127.0.0.1/tcp/" (:port w) "=" (:peer w)))
+          (:witnesses ledger))))
+
+(defn main []
+  (let [argv (array-seq (aget js/process "argv"))
+        [source output] (rest (drop-while #(not (str/ends-with? % "witness_client.cljk")) argv))
+        ledger (edn/read-string (.readFileSync fs source "utf8"))
+        local (derive ledger (or (get-in ledger [:libp2p :forward-port-base]) 13000))
+        args (forward-args local)]
+    (when-not output (throw (ex-info "REFUSE need source and output ledger paths" {})))
+    ;; Atomic rename prevents a verifier from reading a half-written ledger.
+    (.writeFileSync fs (str output ".tmp") (str (pr-str local) "\n") #js {:mode 384})
+    (.renameSync fs (str output ".tmp") output)
+    (doseq [a args] (println a))))
+(when (some #(str/ends-with? % "witness_client.cljk") (array-seq (aget js/process "argv"))) (main))
