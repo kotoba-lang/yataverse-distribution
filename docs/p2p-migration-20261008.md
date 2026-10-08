@@ -72,7 +72,13 @@ gateway is not supplied by these configs. Do not route to a missing Worker.
   The previous ledger is retained as `score-witness-v5-tailnet-before-20261008.edn`.
   A newly signed record for the dedicated acceptance ref
   `yataverse/graph/bafkreieezmuowwyshvjwdhme5ip5lwqrsz4t5utc7bgd4r6h3jyqd75gbi`
-  committed at sequence 0 in 33,756 ms, verified by w1/w2/w4/w6/w7. The
+  committed at sequence 0 in 33,756 ms, verified by w1/w2/w4/w6/w7. A subsequent
+  bundle fetch returned five proofs; local offline `verify-bundle` validated
+  all five against the canonical network-isekai pinned ledger. An unsigned
+  sequence-1 probe received the existing mempool acknowledgement (HTTP 200),
+  but the subsequent five-Witness verified projection remained at signed
+  sequence 0. Ingress acceptance is not writer admission or a committed head;
+  authorization is enforced by the writer-policy projection. The
   production lake and graph heads were not changed. This proves new signed
   consensus over the P2P client path, not fixture-byte custody: a separate
   Kubo readback of the fixture timed out. w3/w5 remain unreachable; do not
@@ -106,7 +112,8 @@ Keep the PR draft until the build and production read surface pass.
 
 Authentication draft PR `cloud-kotoba/kotobase-control-plane#781` lets viewer,
 inference and operator Biscuit verifiers use a pinned public root without an
-issuer seed. The 15-test/87-assertion smoke suite passed, including explicit
+issuer seed. Public discovery metadata also uses that pinned root without a
+seed. The 15-test/88-assertion smoke suite passed, including explicit
 wrong-key refusal, expiry, model/output limits and operator revocation.
 Minting still requires issuer custody. The old Worker and AuthnStore remain
 retired; public-key verification does not restore sessions, account records,
