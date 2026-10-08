@@ -4,13 +4,12 @@
 CID's replicas live, bridge the plan into the p2p exchange semantics the
 stack already ships, and name the e2e delivery path end to end.**
 
-`yataverse.com` is the decentralized mirror zone of the kotobase bytes
-plane (ADR-2609131630, com-junkawasaki root). One Worker serves both
-`{cid}.ipfs.kotobase.net` and `{cid}.ipfs.yataverse.com` from one R2
-bucket — the zone is a Location, not a second implementation. This repo
-owns the layer that plane was missing: the replication PLANNER and the
-gossip/bitswap BRIDGE for p2p delivery over that zone, so delivery does
-not stop at the two HTTP gateways.
+Yataverse is the public entrance; Kotobase names the underlying storage
+technology. The former `net-kotobase-ipfs` Worker was deleted on 2026-10-08
+at the owner's request. Its R2 gateway and wildcard URL behavior are retired.
+This repo owns replication planning, the gossip/bitswap bridge, and the
+self-hosted reader/writer deployment tools. See the [current migration
+receipt and remaining gates](docs/p2p-migration-20261008.md).
 
 The name is a family name: the serving family of `yataverse.com`
 (registered in `manifest/concept-vocabulary.edn`, com-junkawasaki root).
@@ -19,7 +18,7 @@ The name is a family name: the serving family of `yataverse.com`
 
 | layer | owner | this repo's role |
 |---|---|---|
-| bytes gateways (R2 origin + mirror zone) | `net-kotobase/ipfs` Worker | describes the stages (`delivery-path`); performs nothing |
+| live local-custody bytes reader | self-hosted Kubo + lake reader | deploys `/x/yataverse/lake-reader/1`; verifies CID bytes |
 | gossip / bitswap semantics | `kotoba-lang/io-libp2p` | consumes via `gossip-bridge`; never re-implements |
 | transport (QUIC/Noise overlay) | `kotoba-lang/murakumo` overlay | the adapter seam (ADR-2607023100, unlanded) |
 | node inventory (`:labels {:tier :zone}`) | murakumo `fleet.edn` | input to `planner/plan-replication` |
