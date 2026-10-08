@@ -1,0 +1,15 @@
+(ns p2p-reader-drill-test
+  (:require [p2p-reader-drill :as d] [graph-head :as g]))
+(defn check [label ok] (println label ok) (when-not ok (js/process.exit 1)))
+(defn refused? [f] (try (f) false (catch :default _ true)))
+(def suffix "/tcp/4001/p2p/12D3KooWExample")
+(check "public raw IP" (d/public-peer? (str "/ip4/220.146.170.114" suffix)))
+(doseq [ip ["127.0.0.1" "10.0.0.1" "192.168.1.1" "172.16.0.1" "100.87.226.80" "169.254.1.1"]]
+  (check (str "refuse " ip) (not (d/public-peer? (str "/ip4/" ip suffix)))))
+(check "refuse DNS" (not (d/public-peer? (str "/dns4/yataverse.com" suffix))))
+(check "refuse malformed IP" (not (d/public-peer? (str "/ip4/220.999.1.1" suffix))))
+(def bytes (js/Buffer.from "p2p reader fixture"))
+(def cid (g/raw-cid bytes))
+(check "CID checked" (:verified (d/verify-response cid 200 bytes)))
+(check "corrupted bytes refused" (refused? #(d/verify-response cid 200 (js/Buffer.from "wrong"))))
+(check "HTTP refusal preserved" (refused? #(d/verify-response cid 404 bytes)))
