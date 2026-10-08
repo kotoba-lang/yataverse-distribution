@@ -18,3 +18,6 @@
 (check "missing key refused" (refused? #(w/derive (update source :pubkeys dissoc "w1") 13000)))
 (check "port overflow refused" (refused? #(w/derive source 65535)))
 (check "missing peer refused" (refused? #(w/derive (update-in source [:witnesses 0] dissoc :peer) 13000)))
+(def old (update source :witnesses #(mapv (fn [w] (dissoc w :peer)) %)))
+(check "older client enriched without changing authority" (= source (w/with-peers old source)))
+(check "different pinned keys refused" (refused? #(w/with-peers old (assoc-in source [:pubkeys "w1"] "foreign-key"))))

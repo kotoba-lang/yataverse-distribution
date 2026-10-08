@@ -5,6 +5,13 @@
   (:require [clojure.edn :as edn] [clojure.string :as str]))
 (def fs (js/require "node:fs"))
 
+(defn with-peers [source pinned]
+  (when-not (= (select-keys source [:chain-id :pubkeys]) (select-keys pinned [:chain-id :pubkeys]))
+    (throw (ex-info "REFUSE peer ledger has different chain or witness keys" {})))
+  (let [peers (into {} (map (juxt :id :peer) (:witnesses pinned)))]
+    (assoc source :libp2p (:libp2p pinned)
+           :witnesses (mapv #(assoc % :peer (get peers (:id %))) (:witnesses source)))))
+
 (defn derive [ledger base]
   (let [ws (:witnesses ledger) ids (mapv :id ws)]
     (when-not (and (= 7 (count ws)) (= (set ids) (set (keys (:pubkeys ledger))))
@@ -26,8 +33,9 @@
 
 (defn main []
   (let [argv (array-seq (aget js/process "argv"))
-        [source output] (rest (drop-while #(not (str/ends-with? % "witness_client.cljk")) argv))
+        [source output peer-source] (rest (drop-while #(not (str/ends-with? % "witness_client.cljk")) argv))
         ledger (edn/read-string (.readFileSync fs source "utf8"))
+        ledger (if peer-source (with-peers ledger (edn/read-string (.readFileSync fs peer-source "utf8"))) ledger)
         local (derive ledger (or (get-in ledger [:libp2p :forward-port-base]) 13000))
         args (forward-args local)]
     (when-not output (throw (ex-info "REFUSE need source and output ledger paths" {})))
