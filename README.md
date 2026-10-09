@@ -1597,3 +1597,110 @@ node <release>/engine/cli.js --classpath deploy:test test/block_ingest_test.cljk
   - It first timed out because of a half-open connection: main-2 listed xavier, but xavier did not list main-2.
   - The mirror now re-dials the source (`--source-peer`) before retrying a failed copy.
 - **Tests:** `test/block_ingest_heads_test.cljk`, 9 checks: named only if held, monotonic seq, signer allowlist, the signature binding name/seq/cid, per-signer heads, and the holds listing.
+
+## Public app entrance: `{k51}.ipns.220-146-170-114.sslip.io` (2026-10-09)
+
+Static itonami apps published by network-awai/cloud-itonami
+`ops/independent/publish_app_ipfs.py` are served over HTTPS from Xavier
+without Cloudflare. Each app is its own origin,
+`https://{k51}.ipns.220-146-170-114.sslip.io/`. This is the subdomain-gateway
+form of ADR-2608140500, so apps do not share storage, cookies or service
+workers. `ipns://{k51}` remains the canonical address; this hostname is one
+entrance to it.
+
+| file | installed as |
+|---|---|
+| `deploy/xavier-public-apps-http.conf` | `sites-enabled/yataverse-apps-http`: port 80, ACME HTTP-01 and the 308 to HTTPS |
+| `deploy/xavier-public-apps.conf` | `sites-enabled/yataverse-apps`: port 443 |
+| `deploy/xavier-public-apps.map` | `/etc/nginx/yataverse-apps.map`, the allow-list |
+| `deploy/xavier-map-hash-bucket.conf` | `conf.d/00-map-hash-bucket.conf` |
+| `deploy/xavier-apps-cert-to-gad.sh` | Xavier `/etc/letsencrypt/renewal-hooks/deploy/yataverse-apps-to-gad.sh` |
+| `deploy/gad-receive-apps-cert.sh` | gad `/usr/local/sbin/receive-yataverse-apps-cert` (forced command) |
+
+- **Not an open gateway.** Only names in the map are served; any other k51
+  host answers 404. The map is generated from cloud-itonami's
+  `app-ipfs-publications.json` with the jq line at the top of the file.
+- **Bytes and names come from Xavier's Kubo.** The 443 host proxies to
+  `127.0.0.1:8080` with `Host: {k51}.ipns.localhost:8080`, Kubo's built-in
+  subdomain gateway. Every listed app is recursively pinned on Xavier, and
+  Xavier holds its key.
+- **Limits.** GET and HEAD only (others answer 405). 8 requests per second
+  with a burst of 16, and 8 connections per address.
+- **Hash bucket size.** The k51 keys are 62 characters, so
+  `map_hash_bucket_size 128`. nginx fixes the bucket size at the first `map`
+  it reads (`conf.d/itonami-office-method-map.conf`), so the setting has to
+  sort first in `conf.d`.
+- **One certificate.** All listed hostnames share one Let's Encrypt
+  certificate, `--cert-name yataverse-apps`. sslip.io is not on the Public
+  Suffix List, so the per-domain issuance limit is shared with every sslip.io
+  user. Adding an app therefore means re-running the same `certbot certonly
+  --webroot -w /var/www/letsencrypt --cert-name yataverse-apps -d …` with
+  every name, then updating the map and reloading. Renewal uses the existing
+  certbot timer and the nginx reload deploy hook.
+
+To add an app, publish it, regenerate the map, re-issue the certificate with
+the new name added, run `nginx -t` and reload.
+
+**Measured 2026-10-09.**
+- From outside, all 23 listed hosts returned the `index.html` SHA-256
+  recorded at publication.
+- An unlisted k51 host returned 404, and POST returned 405.
+- The existing data, isekai, itonami-static, writer and aozora hosts kept
+  their responses.
+- The first install attempt of the 443 file failed `nginx -t` (duplicate
+  `map_hash_bucket_size`) and was rolled back before any reload. A
+  `/root/nginx-backup-*.tgz` was taken before each change.
+
+**gad standby (2026-10-09).** gad has the same entrance:
+`deploy/gad-public-apps{-http,}.conf`, the same map and the same
+`00-map-hash-bucket.conf`. It answers when the router's 443/8443 mapping is
+moved to gad, in the same way as the lake standby above. gad's certbot timer
+is off and port 80 normally reaches Xavier, so gad gets no certificate of its
+own. It serves a copy of Xavier's `yataverse-apps` certificate from
+`/etc/nginx/tls/yataverse-apps/` (key mode 0600), outside certbot. The key was
+streamed root-to-root over ssh and never written on the operator machine.
+
+- **After Xavier renews**, the certificate reaches gad automatically.
+  Xavier's certbot deploy hook (`deploy/xavier-apps-cert-to-gad.sh`, installed
+  as `renewal-hooks/deploy/yataverse-apps-to-gad.sh`) sends only the
+  `yataverse-apps` lineage. It uses a dedicated key,
+  `/root/.ssh/yataverse-apps-cert-sync`, and connects to **gad's LAN address
+  192.168.1.16** with strict host-key checking. On gad that key is
+  `restrict,from="192.168.1.28",command="/usr/local/sbin/receive-yataverse-apps-cert"`
+  (`deploy/gad-receive-apps-cert.sh`). The receiver accepts a tar with
+  exactly `fullchain.pem` and `privkey.pem`, and checks that:
+  - the key matches the certificate;
+  - the certificate is currently valid;
+  - the certificate covers every host in gad's map.
+
+  Only then does it swap the pair in (key 0600), run `nginx -t` and reload.
+  If anything fails it puts the previous pair back. The outcome is logged on
+  both nodes under `journalctl -t yataverse-apps-cert`. A failed copy never
+  fails the renewal on Xavier.
+- **Why the LAN address.** On a tailnet address, port 22 is answered by
+  **Tailscale SSH**. It authorizes by tailnet policy and ignores
+  `authorized_keys`, so the forced command silently does not apply. That
+  happened in the first test on 2026-10-09: the stream went to a root shell
+  on gad instead of the receiver. The shell executed nothing meaningful, but
+  the error output carried the certificate's private key into the operator's
+  session logs. The certificate was therefore re-issued with a new key the
+  same hour (serial `055FC21B…`, replacing `0562930D…`), and the old pair was
+  deleted from gad.
+- **Measured over the LAN path** (2026-10-09):
+  - `ssh … id` ran the receiver, not `id`, and was refused.
+  - A stale pair on gad was replaced and nginx reloaded.
+  - Resending the same pair logged "unchanged".
+  - A tar with an extra member was refused, and so was a mismatched key.
+  - A different lineage was ignored.
+  - Both nodes then served serial `055FC21B…`.
+- **For a long takeover**, issue gad's own certificate instead, as for the
+  lake host.
+- **Measured.** I sent requests straight to gad's address
+  (`--resolve …:443:100.82.98.110`). All 23 hosts returned the recorded
+  `index.html` digest, an unlisted host returned 404 and POST returned 405.
+  gad's data, itonami-static and isekai-static hosts returned 200, and
+  murakumo-gad's `/` stayed a 404 by its own config. The public path still
+  goes to Xavier. Before the change I backed up gad's nginx to
+  `/root/nginx-backup-20261009T054017Z.tgz`.
+
+`yataverse.com` names are separate work.

@@ -1,0 +1,25 @@
+# Generated from network-awai/cloud-itonami ops/independent/app-ipfs-publications.json:
+#   jq -r 'to_entries[] | "\(.value.ipns) 1;  # \(.key)"' app-ipfs-publications.json | sort -k4
+k51qzi5uqu5djtt1dyta9dn81plkv9i1w1gijooiur8r48m5qfj58ysbvuzc5s 1;  # air-book
+k51qzi5uqu5dk8snhs7fivu3booa2db2en5e2e3pjpfpwjvw33brwhjg96d188 1;  # app-air-cargo
+k51qzi5uqu5dhpturft17i8dddr99ngimdxwjjcw04gdcxq5fmugmohf8wpugo 1;  # app-air-crew
+k51qzi5uqu5divtf94y04zn2y3zhnbq8ok2ih7z2n7u1wmzw2du4m0qjrmzv24 1;  # app-air-dcs
+k51qzi5uqu5dlei73iciyqd8iezis47cxhcemgczo99xkyc26wz3omglx819d6 1;  # app-air-ffp
+k51qzi5uqu5dmii8ylbm20m45c032a3h67wac6qj4jwwe5uwd8pq8mdd9qzpua 1;  # app-air-mro
+k51qzi5uqu5dhvkx7w6qpdodfyrr2q8pfzpn7xi1j1dozf9tngnkjfyjm6xz3r 1;  # app-air-ops
+k51qzi5uqu5dgz0j1gn49mntc90ophjc3rzgyiez4yaed4iqgugu9xnap2z5ow 1;  # app-air-sched
+k51qzi5uqu5djscfrr5cgssbp6ekjoiuxctnt9eunqkfxowkuetg2lnlvzxh53 1;  # app-air-sms
+k51qzi5uqu5dhn9r5k9onthby8k0tm8pvagvfworonagyf9cpof8i7h3bo3i81 1;  # app-air-yield
+k51qzi5uqu5diepydqjicwbtaqc8fi64a4147dk8u5wjnjjkrhhkno2tz0yo1n 1;  # app-live
+k51qzi5uqu5djvvchjx52912hkh7w1a6ad2ey2o0qdlrk6nd8xgigt4sdgsipa 1;  # app-manabi-cert-prep
+k51qzi5uqu5dhquqdw6xdo1e0qzydpl7c974tddjk9tr8kzvrwfbyu8c7sj3ic 1;  # app-warehouse
+k51qzi5uqu5dm94wneh8x62l1q4lwq8dfx1p6zhc2w9i532ykh8r9xnoqlunww 1;  # app-webya
+k51qzi5uqu5dh98ov634btcdy8681hu4o01739tcqlp3ubrh5k0x3wjbwfs0dr 1;  # fashion
+k51qzi5uqu5dli3vvmsz4vfm2n1gv5nm0jfifj37bxqzbm3kx54p9e6al83w84 1;  # graph-sos-intel
+k51qzi5uqu5dk73q2ogkqx3uzcj7zwilcd5bpujqoap2vzyipdl36gisf5mcj8 1;  # houshi
+k51qzi5uqu5dlx8n5uqh1tsuwv90nhlm21nez8ljf438e942pgbd20mfeohhgt 1;  # kaisya
+k51qzi5uqu5dlirtpepmh3kwmewylwjzcc5v8pcranl683f4sswbqx22ish9ub 1;  # managon
+k51qzi5uqu5dh383glrwhq1km4nu3xmj5ebsf4hda6k21ljlkdppkwg79lqrfv 1;  # recap
+k51qzi5uqu5djqlmsulkbgtgl1w7ts9g8os24setm1r2ovpw8yaljnc9627v4n 1;  # vehicle
+k51qzi5uqu5dlry909sxjo7x182twmoohcfmflp1m723zf42pievqqv873tsru 1;  # voxelforge
+k51qzi5uqu5dlq495k600itlb4e9d2ysd5xbqtxszgj7tleiu53q0aqly64ijo 1;  # yard-ops
