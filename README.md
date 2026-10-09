@@ -1597,3 +1597,58 @@ node <release>/engine/cli.js --classpath deploy:test test/block_ingest_test.cljk
   - It first timed out because of a half-open connection: main-2 listed xavier, but xavier did not list main-2.
   - The mirror now re-dials the source (`--source-peer`) before retrying a failed copy.
 - **Tests:** `test/block_ingest_heads_test.cljk`, 9 checks: named only if held, monotonic seq, signer allowlist, the signature binding name/seq/cid, per-signer heads, and the holds listing.
+
+## Public app entrance: `{k51}.ipns.220-146-170-114.sslip.io` (2026-10-09)
+
+Static itonami apps published by network-awai/cloud-itonami
+`ops/independent/publish_app_ipfs.py` are served over HTTPS from Xavier
+without Cloudflare. Each app is its own origin,
+`https://{k51}.ipns.220-146-170-114.sslip.io/`. This is the subdomain-gateway
+form of ADR-2608140500, so apps do not share storage, cookies or service
+workers. `ipns://{k51}` remains the canonical address; this hostname is one
+entrance to it.
+
+| file | installed as |
+|---|---|
+| `deploy/xavier-public-apps-http.conf` | `sites-enabled/yataverse-apps-http`: port 80, ACME HTTP-01 and the 308 to HTTPS |
+| `deploy/xavier-public-apps.conf` | `sites-enabled/yataverse-apps`: port 443 |
+| `deploy/xavier-public-apps.map` | `/etc/nginx/yataverse-apps.map`, the allow-list |
+| `deploy/xavier-map-hash-bucket.conf` | `conf.d/00-map-hash-bucket.conf` |
+
+- **Not an open gateway.** Only names in the map are served; any other k51
+  host answers 404. The map is generated from cloud-itonami's
+  `app-ipfs-publications.json` with the jq line at the top of the file.
+- **Bytes and names come from Xavier's Kubo.** The 443 host proxies to
+  `127.0.0.1:8080` with `Host: {k51}.ipns.localhost:8080`, Kubo's built-in
+  subdomain gateway. Every listed app is recursively pinned on Xavier, and
+  Xavier holds its key.
+- **Limits.** GET and HEAD only (others answer 405). 8 requests per second
+  with a burst of 16, and 8 connections per address.
+- **Hash bucket size.** The k51 keys are 62 characters, so
+  `map_hash_bucket_size 128`. nginx fixes the bucket size at the first `map`
+  it reads (`conf.d/itonami-office-method-map.conf`), so the setting has to
+  sort first in `conf.d`.
+- **One certificate.** All listed hostnames share one Let's Encrypt
+  certificate, `--cert-name yataverse-apps`. sslip.io is not on the Public
+  Suffix List, so the per-domain issuance limit is shared with every sslip.io
+  user. Adding an app therefore means re-running the same `certbot certonly
+  --webroot -w /var/www/letsencrypt --cert-name yataverse-apps -d …` with
+  every name, then updating the map and reloading. Renewal uses the existing
+  certbot timer and the nginx reload deploy hook.
+
+To add an app, publish it, regenerate the map, re-issue the certificate with
+the new name added, run `nginx -t` and reload.
+
+**Measured 2026-10-09.**
+- From outside, all 23 listed hosts returned the `index.html` SHA-256
+  recorded at publication.
+- An unlisted k51 host returned 404, and POST returned 405.
+- The existing data, isekai, itonami-static, writer and aozora hosts kept
+  their responses.
+- The first install attempt of the 443 file failed `nginx -t` (duplicate
+  `map_hash_bucket_size`) and was rolled back before any reload. A
+  `/root/nginx-backup-*.tgz` was taken before each change.
+
+**Not covered.** gad has no copy of this virtual host, so if the router
+mapping moves to gad these hosts stop answering until the same files are
+installed there. `yataverse.com` names are separate work.
