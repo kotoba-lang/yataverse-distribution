@@ -1704,3 +1704,65 @@ streamed root-to-root over ssh and never written on the operator machine.
   `/root/nginx-backup-20261009T054017Z.tgz`.
 
 `yataverse.com` names are separate work.
+
+### kaisya domain cutover completed (2026-10-09, 18:33 JST)
+
+Only `kaisya.itonami.cloud` and `kaisya.itonami.app` were changed.
+Their canonical address remains
+`ipns://k51qzi5uqu5dlx8n5uqh1tsuwv90nhlm21nez8ljf438e942pgbd20mfeohhgt`.
+Both aliases now have DNS-only A records at `220.146.170.114`, TTL 300,
+and `_dnslink` TXT records containing `dnslink=/ipns/<k51>`.
+Cloudflare MCP successfully saved and read back those records. The two
+Worker custom domains were detached; the `cloud-itonami-kaisya` script
+still exists and requires owner approval before deletion.
+
+Installed source:
+
+| file | destination / role |
+|---|---|
+| `deploy/kaisya-domains-http.conf` | both nodes: ACME webroot and 308 redirect |
+| `deploy/xavier-kaisya-domains.conf` | Xavier HTTPS: fixed Kubo IPNS Host |
+| `deploy/gad-kaisya-domains.conf` | gad standby HTTPS: same Host, copied TLS pair |
+| `deploy/xavier-kaisya-cert-to-gad.sh` | Xavier `/etc/letsencrypt/renewal-hooks/deploy/kaisya-domains-to-gad.sh` |
+| `deploy/gad-receive-kaisya-cert.sh` | gad `/usr/local/sbin/receive-kaisya-domains-cert` |
+
+Xavier's `kaisya-domains` certificate has serial
+`054B148CA4FC95B393C6ACD2E96365499E07`, expiring 2027-01-07 08:33:34 UTC.
+gad holds the validated copy in `/etc/nginx/tls/kaisya-domains/`.
+The dedicated key stays on Xavier at `/root/.ssh/kaisya-domains-cert-sync`.
+gad restricts it to `from="192.168.1.28"` and the new receiver command.
+The hook connects only to `192.168.1.16`; before every transfer, it runs
+`id` and requires the receiver's exact refusal and exit 1. No certificate
+is sent if that probe fails. Renewal transfer logs use
+`journalctl -t kaisya-domains-cert`; the initial transfer completed exit 0.
+The original yataverse-apps lineage and receiver are unchanged.
+
+Before HTTP and HTTPS installations, `/etc/nginx` was backed up:
+Xavier `/root/nginx-backup-20261009T093116Z-kaisya.tgz` and
+`/root/nginx-backup-20261009T093224Z-kaisya-https.tgz`;
+gad `/root/nginx-backup-20261009T093046Z-kaisya.tgz` and
+`/root/nginx-backup-20261009T093239Z-kaisya-https.tgz`.
+Both nodes passed `nginx -t` and reloaded. Xavier retains the pre-existing
+isekai-static duplicate-name warnings.
+
+Live verification:
+
+- Both public aliases returned GET/HEAD 200 and POST 405.
+- Both public index bodies and both direct gad bodies
+  (`--resolve <host>:443:100.82.98.110`) matched SHA-256
+  `c131d698b50c39267938fb95ad9100e82859633b37c0eafad4f39692ea529f65`.
+- gad refused POST with 405 on both aliases.
+- Public A and `_dnslink` TXT queries matched the saved values.
+
+These checks qualify static delivery. Public traffic still uses Xavier;
+gad takeover requires moving the router mapping. Automatic future renewal
+has a deployed hook and a successful manual transfer; no future renewal
+cycle has occurred yet. Other apps' aliases, kotobase.net, old certificate
+revocation, and Worker deletion were outside this cutover.
+
+To roll traffic back, detach the new HTTPS aliases on the own-node side
+only after restoring Cloudflare custom domains: remove just the two new A
+records, then PUT `/accounts/<account>/workers/domains` with the original
+`hostname`, `zone_id`, and `service: cloud-itonami-kaisya`. Verify restored
+HTTPS before considering rollback complete. DNSLink may remain because
+IPNS remains canonical. Never delete the Worker as part of that rollback.
