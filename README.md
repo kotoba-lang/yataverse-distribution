@@ -1649,6 +1649,25 @@ the new name added, run `nginx -t` and reload.
   `map_hash_bucket_size`) and was rolled back before any reload. A
   `/root/nginx-backup-*.tgz` was taken before each change.
 
-**Not covered.** gad has no copy of this virtual host, so if the router
-mapping moves to gad these hosts stop answering until the same files are
-installed there. `yataverse.com` names are separate work.
+**gad standby (2026-10-09).** gad has the same entrance:
+`deploy/gad-public-apps{-http,}.conf`, the same map and the same
+`00-map-hash-bucket.conf`. It answers when the router's 443/8443 mapping is
+moved to gad, in the same way as the lake standby above. gad's certbot timer
+is off and port 80 normally reaches Xavier, so gad gets no certificate of its
+own. It serves a copy of Xavier's `yataverse-apps` certificate from
+`/etc/nginx/tls/yataverse-apps/` (key mode 0600), outside certbot. The key was
+streamed root-to-root over ssh and never written on the operator machine.
+
+- **After Xavier renews**, copy the certificate again:
+  `ssh root@xavier 'tar -chf - -C /etc/letsencrypt/live/yataverse-apps fullchain.pem privkey.pem' | ssh gad 'tar -xf - -C /etc/nginx/tls/yataverse-apps && nginx -t && systemctl reload nginx'`
+- **For a long takeover**, issue gad's own certificate instead, as for the
+  lake host.
+- **Measured.** I sent requests straight to gad's address
+  (`--resolve …:443:100.82.98.110`). All 23 hosts returned the recorded
+  `index.html` digest, an unlisted host returned 404 and POST returned 405.
+  gad's data, itonami-static and isekai-static hosts returned 200, and
+  murakumo-gad's `/` stayed a 404 by its own config. The public path still
+  goes to Xavier. Before the change I backed up gad's nginx to
+  `/root/nginx-backup-20261009T054017Z.tgz`.
+
+`yataverse.com` names are separate work.
