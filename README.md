@@ -1614,6 +1614,8 @@ entrance to it.
 | `deploy/xavier-public-apps.conf` | `sites-enabled/yataverse-apps`: port 443 |
 | `deploy/xavier-public-apps.map` | `/etc/nginx/yataverse-apps.map`, the allow-list |
 | `deploy/xavier-map-hash-bucket.conf` | `conf.d/00-map-hash-bucket.conf` |
+| `deploy/xavier-apps-cert-to-gad.sh` | Xavier `/etc/letsencrypt/renewal-hooks/deploy/yataverse-apps-to-gad.sh` |
+| `deploy/gad-receive-apps-cert.sh` | gad `/usr/local/sbin/receive-yataverse-apps-cert` (forced command) |
 
 - **Not an open gateway.** Only names in the map are served; any other k51
   host answers 404. The map is generated from cloud-itonami's
@@ -1658,8 +1660,39 @@ own. It serves a copy of Xavier's `yataverse-apps` certificate from
 `/etc/nginx/tls/yataverse-apps/` (key mode 0600), outside certbot. The key was
 streamed root-to-root over ssh and never written on the operator machine.
 
-- **After Xavier renews**, copy the certificate again:
-  `ssh root@xavier 'tar -chf - -C /etc/letsencrypt/live/yataverse-apps fullchain.pem privkey.pem' | ssh gad 'tar -xf - -C /etc/nginx/tls/yataverse-apps && nginx -t && systemctl reload nginx'`
+- **After Xavier renews**, the certificate reaches gad automatically.
+  Xavier's certbot deploy hook (`deploy/xavier-apps-cert-to-gad.sh`, installed
+  as `renewal-hooks/deploy/yataverse-apps-to-gad.sh`) sends only the
+  `yataverse-apps` lineage. It uses a dedicated key,
+  `/root/.ssh/yataverse-apps-cert-sync`, and connects to **gad's LAN address
+  192.168.1.16** with strict host-key checking. On gad that key is
+  `restrict,from="192.168.1.28",command="/usr/local/sbin/receive-yataverse-apps-cert"`
+  (`deploy/gad-receive-apps-cert.sh`). The receiver accepts a tar with
+  exactly `fullchain.pem` and `privkey.pem`, and checks that:
+  - the key matches the certificate;
+  - the certificate is currently valid;
+  - the certificate covers every host in gad's map.
+
+  Only then does it swap the pair in (key 0600), run `nginx -t` and reload.
+  If anything fails it puts the previous pair back. The outcome is logged on
+  both nodes under `journalctl -t yataverse-apps-cert`. A failed copy never
+  fails the renewal on Xavier.
+- **Why the LAN address.** On a tailnet address, port 22 is answered by
+  **Tailscale SSH**. It authorizes by tailnet policy and ignores
+  `authorized_keys`, so the forced command silently does not apply. That
+  happened in the first test on 2026-10-09: the stream went to a root shell
+  on gad instead of the receiver. The shell executed nothing meaningful, but
+  the error output carried the certificate's private key into the operator's
+  session logs. The certificate was therefore re-issued with a new key the
+  same hour (serial `055FC21B…`, replacing `0562930D…`), and the old pair was
+  deleted from gad.
+- **Measured over the LAN path** (2026-10-09):
+  - `ssh … id` ran the receiver, not `id`, and was refused.
+  - A stale pair on gad was replaced and nginx reloaded.
+  - Resending the same pair logged "unchanged".
+  - A tar with an extra member was refused, and so was a mismatched key.
+  - A different lineage was ignored.
+  - Both nodes then served serial `055FC21B…`.
 - **For a long takeover**, issue gad's own certificate instead, as for the
   lake host.
 - **Measured.** I sent requests straight to gad's address
