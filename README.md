@@ -1543,9 +1543,10 @@ Owner direction: murakumo must not depend on R2. Nothing outside the fleet could
   - `DELETE /v1/blocks/<cid>` releases the signer's own hold.
   - `GET /v1/blocks/<cid>` is public and checks the bytes against the CID.
   - `GET /health`.
-- **Addresses are hashes.** Only raw CIDv1 sha2-256 is accepted, and the body must hash to the CID. Nobody can store bytes under someone else's name.
+- **Addresses are hashes.** CIDv1 sha2-256 with codec raw (0x55) or dag-cbor (0x71) is accepted, and the body must hash to the CID. Nobody can store bytes under someone else's name. dag-cbor was added on 2026-10-10 so that Merkle-LSM nodes (kotobase-peer manifests, catalog directories, runs) can live on the fleet instead of R2 (com-junkawasaki/root ADR-2610092150). The codec is the writer's claim; Kubo does not validate dag-cbor either, and readers that decode a block check it.
 - **Writes are signed.** The headers are `x-kotoba-signer` (a did:key on `--allow`), `x-kotoba-time` (within `--max-skew`) and `x-kotoba-signature`. The signature is base64url Ed25519 over `kotoba/block-ingest/v1\n<METHOD>\n<cid>\n<time>`. The body is not signed, because the CID already binds it.
-- **Holds, not pins.** A block is held as the MFS entry `/block-ingest/<signer>/<cid>`, which keeps it from GC. `DELETE` removes only that entry, so a signer cannot unpin the lake, the writer's documents or another signer's blocks.
+- **Holds, not pins.** A raw block is held as the MFS entry `/block-ingest/<signer>/<cid>`, which keeps it from GC. `DELETE` removes only that entry, so a signer cannot unpin the lake, the writer's documents or another signer's blocks.
+- **dag-cbor holds.** MFS takes only UnixFS (Kubo 0.41: `cp: source must be a valid UnixFS`), so a dag-cbor block is held by a direct pin plus the signer's entry in `<state-dir>/holds/<signer>.json`. The pin is removed only when the last signer holding the block releases it. `GET /v1/holds/<signer>` lists both kinds, and `block_mirror` copies both.
 - **Deployment:** `xavier-block-ingest.service` listens on loopback :18140, behind `xavier-block-ingest.conf` (nginx, 16 MiB bodies).
 
 Tests:
@@ -1558,8 +1559,12 @@ Tests:
   - a 3 MiB block was stored, read back byte for byte, released, and refused at 17 MiB;
   - after `ipfs repo gc` the held block was still served and the released one was gone.
 
+- `test/block_ingest_test.cljk` also covers CID parsing, dag-cbor writes and reads, and refusals for other codecs and for dag-cbor bytes that do not hash.
+- `test/block_ingest_kubo_test.cljk` runs the real `kubo-store` on a throwaway repo (pass `--ipfs-bin`). It checks that raw and dag-cbor holds survive `repo gc`, that a dag-cbor pin outlives one signer's release and is collected after the last one, and that the holds listing has both kinds.
+
 ```
 node <release>/engine/cli.js --classpath deploy:test test/block_ingest_test.cljk
+node <release>/engine/cli.js --classpath deploy:test test/block_ingest_kubo_test.cljk --ipfs-bin=$(which ipfs)
 ```
 
 **Installed on xavier (2026-10-07).**

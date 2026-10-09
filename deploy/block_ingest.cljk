@@ -15,14 +15,24 @@
 ;;   GET    /v1/blocks/<cid>   the bytes, read offline and checked against the CID   404
 ;;   GET    /health
 ;;
-;; CIDs are raw CIDv1 sha2-256 (base32 "b..."): the address IS the hash, so a
-;; writer cannot store bytes under someone else's name, and a reader checks
-;; what it gets.
+;; CIDs are CIDv1 sha2-256 (base32 "b...") with codec raw (0x55) or dag-cbor
+;; (0x71): the address IS the hash, so a writer cannot store bytes under
+;; someone else's name, and a reader checks what it gets. The hash is checked
+;; for every codec; the codec itself is the writer's claim (Kubo does not
+;; validate dag-cbor either), and readers that decode the block check it.
+;; dag-cbor is accepted so that Merkle-LSM nodes (kotobase-peer manifests,
+;; catalog directories, runs) live on the fleet instead of R2
+;; (ADR-2610092150).
 ;;
-;; Holds, not pins. A held block is an MFS entry /block-ingest/<signer>/<cid>,
+;; Holds, not pins. A held raw block is an MFS entry /block-ingest/<signer>/<cid>,
 ;; which keeps it from Kubo's GC. DELETE removes only that entry, so a signer
 ;; can release what it stored and nothing else: the lake's pins, other
 ;; signers' holds and the writer's documents are untouched.
+;;
+;; MFS takes only UnixFS (dag-pb or raw) -- Kubo 0.41 answers "cp: source must
+;; be a valid UnixFS" for dag-cbor -- so a dag-cbor hold is a direct pin plus
+;; the signer's entry in <state-dir>/holds/<signer>.json. The pin is removed
+;; only when the last signer that holds the block releases it.
 ;;
 ;; Signature. Every PUT and DELETE carries
 ;;   x-kotoba-signer:    did:key (Ed25519) on --allow
@@ -53,7 +63,48 @@
 (def nc (js/require "node:crypto"))
 
 (def domain-tag "kotoba/block-ingest/v1\n")
-(def raw-cid-re #"b[a-z2-7]{58}")
+(def raw-cid-re
+  "Shape of an accepted CID string: CIDv1, one-byte codec, sha2-256, base32.
+   Shape only -- `parse-cid` decides whether the codec is accepted."
+  #"b[a-z2-7]{58}")
+
+(def codecs {0x55 "raw" 0x71 "dag-cbor"})
+
+(def ^:private b32-alphabet "abcdefghijklmnopqrstuvwxyz234567")
+
+(defn- b32-decode [s]
+  (loop [[c & more] (seq s) bits 0 v 0 out []]
+    (if-not c
+      out
+      (let [i (.indexOf b32-alphabet c)
+            v (bit-or (bit-shift-left (bit-and v 0xff) 5) i)
+            bits (+ bits 5)]
+        (if (>= bits 8)
+          (recur more (- bits 8) v (conj out (bit-and (unsigned-bit-shift-right v (- bits 8)) 0xff)))
+          (recur more bits v out))))))
+
+(defn parse-cid
+  "{:codec \"raw\"|\"dag-cbor\" :digest Buffer} for an accepted CID string, else nil."
+  [s]
+  (when (and (string? s) (re-matches raw-cid-re s))
+    (let [bs (b32-decode (subs s 1))
+          codec (get codecs (nth bs 1 nil))]
+      (when (and (= 36 (count bs)) (= 1 (nth bs 0)) codec
+                 (= 0x12 (nth bs 2)) (= 0x20 (nth bs 3)))
+        {:codec codec :digest (js/Buffer.from (clj->js (subvec bs 4)))}))))
+
+(defn cid-of
+  "CIDv1 base32 for `buf` under `codec` (\"raw\" or \"dag-cbor\")."
+  [codec buf]
+  (let [code (some (fn [[k v]] (when (= v codec) k)) codecs)
+        digest (-> (.createHash nc "sha256") (.update buf) (.digest))]
+    (str "b" (g/b32-encode (js/Buffer.concat #js [(js/Buffer.from #js [0x01 code 0x12 0x20]) digest])))))
+
+(defn hashes-to?
+  "Do `buf`'s bytes hash to the digest named by `cid`?"
+  [cid buf]
+  (when-let [{:keys [digest]} (parse-cid cid)]
+    (.equals digest (-> (.createHash nc "sha256") (.update buf) (.digest)))))
 (def default-max-block-bytes (* 16 1024 1024))
 
 ;; ── signature ───────────────────────────────────────────────────────────────
@@ -103,6 +154,33 @@
 (def fs (js/require "node:fs"))
 (def path-mod (js/require "node:path"))
 
+(defn- unixfs? [cid] (= "raw" (:codec (parse-cid cid))))
+
+(defn- path-parts
+  "/block-ingest/<suffix>/<cid> -> [suffix cid]."
+  [p]
+  (let [[_ suffix cid] (re-matches #"/block-ingest/([^/]+)/([^/]+)" p)] [suffix cid]))
+
+(defn file-holds
+  "Non-UnixFS holds as one JSON array of CIDs per signer under `state-dir`."
+  [state-dir]
+  (let [file #(.join path-mod state-dir "holds" (str % ".json"))
+        read-set (fn [suffix] (set (try (g/parse-json (.readFileSync fs (file suffix) "utf8")) (catch :default _ []))))
+        write! (fn [suffix cids]
+                 (let [f (file suffix) tmp (str f ".tmp")]
+                   (.mkdirSync fs (.dirname path-mod f) #js {:recursive true})
+                   (.writeFileSync fs tmp (g/canonical-str (vec (sort cids))))
+                   (.renameSync fs tmp f)))]
+    {:held? (fn [suffix cid] (contains? (read-set suffix) cid))
+     :add! (fn [suffix cid] (write! suffix (conj (read-set suffix) cid)))
+     :remove! (fn [suffix cid] (write! suffix (disj (read-set suffix) cid)))
+     :list (fn [suffix] (read-set suffix))
+     :held-by-anyone? (fn [cid]
+                        (let [dir (.join path-mod state-dir "holds")]
+                          (boolean (some (fn [f] (and (str/ends-with? f ".json")
+                                                      (contains? (read-set (subs f 0 (- (count f) 5))) cid)))
+                                         (try (array-seq (.readdirSync fs dir)) (catch :default _ []))))))}))
+
 (defn file-heads
   "Heads kept as one JSON file per signer under `state-dir`:
    {:head (fn [suffix name]) :heads (fn [suffix]) :put-head! (fn [suffix name rec])}."
@@ -119,42 +197,60 @@
                     (js/Promise.resolve nil)))}))
 
 (defn kubo-store
-  "The store over a Kubo CLI: put the block, hold it in MFS, release, read
-   offline, list a signer's holds; heads live in `state-dir`. Every function
-   returns a Promise."
+  "The store over a Kubo CLI: put the block, hold it (MFS for raw, a direct
+   pin + `file-holds` for dag-cbor), release, read offline, list a signer's
+   holds; heads live in `state-dir`. Every function returns a Promise."
   [ipfs-bin ipfs-path & [state-dir]]
   (let [env (doto (js/Object.assign #js {} (aget js/process "env")) (aset "IPFS_PATH" ipfs-path))
-        ipfs (fn [args & [stdin]] (run ipfs-bin env args stdin))]
+        ipfs (fn [args & [stdin]] (run ipfs-bin env args stdin))
+        pins (file-holds (or state-dir "."))
+        pin! (fn [cid]
+               (.then (ipfs ["pin" "add" "--recursive=false" cid])
+                      (fn [{:keys [code err]}]
+                        (when-not (zero? code) (throw (g/unmeasured (str "pin add: " (str/trim err))))))))
+        mfs-hold! (fn [p cid]
+                    (-> (ipfs ["files" "mkdir" "-p" (subs p 0 (str/last-index-of p "/"))])
+                        (.then (fn [_] (ipfs ["files" "cp" (str "/ipfs/" cid) p])))
+                        (.then (fn [{:keys [code err]}]
+                                 (when-not (or (zero? code) (str/includes? err "already has entry"))
+                                   (throw (g/unmeasured (str "files cp: " (str/trim err)))))))))
+        hold! (fn [p]
+                (let [[suffix cid] (path-parts p)]
+                  (if (unixfs? cid)
+                    (mfs-hold! p cid)
+                    (.then (pin! cid) (fn [_] ((:add! pins) suffix cid))))))]
     (merge
-    {:put! (fn [buf]
-             (-> (ipfs ["block" "put" "--cid-codec=raw" "--mhtype=sha2-256" "--allow-big-block"] buf)
+    {:put! (fn [codec buf]
+             (-> (ipfs ["block" "put" (str "--cid-codec=" codec) "--mhtype=sha2-256" "--allow-big-block"] buf)
                  (.then (fn [{:keys [code out err]}]
                           (if (zero? code) (str/trim (str out)) (throw (g/unmeasured (str "block put: " (str/trim err)))))))))
-     :held? (fn [p] (.then (ipfs ["files" "stat" "--hash" p]) #(zero? (:code %))))
-     :hold! (fn [p]
-              (-> (ipfs ["files" "mkdir" "-p" (subs p 0 (str/last-index-of p "/"))])
-                  (.then (fn [_] (ipfs ["files" "cp" (str "/ipfs/" (last (str/split p #"/"))) p])))
-                  (.then (fn [{:keys [code err]}]
-                           (when-not (or (zero? code) (str/includes? err "already has entry"))
-                             (throw (g/unmeasured (str "files cp: " (str/trim err)))))))))
-     :release! (fn [p] (.then (ipfs ["files" "rm" p]) #(zero? (:code %))))
+     :held? (fn [p]
+              (let [[suffix cid] (path-parts p)]
+                (if (unixfs? cid)
+                  (.then (ipfs ["files" "stat" "--hash" p]) #(zero? (:code %)))
+                  (js/Promise.resolve ((:held? pins) suffix cid)))))
+     :hold! hold!
+     :release! (fn [p]
+                 (let [[suffix cid] (path-parts p)]
+                   (if (unixfs? cid)
+                     (.then (ipfs ["files" "rm" p]) #(zero? (:code %)))
+                     (do ((:remove! pins) suffix cid)
+                         (if ((:held-by-anyone? pins) cid)
+                           (js/Promise.resolve true)
+                           (.then (ipfs ["pin" "rm" cid]) (fn [_] true)))))))
      :get (fn [cid] (.then (ipfs ["block" "get" "--offline" cid]) #(when (zero? (:code %)) (:out %))))
      :holds (fn [suffix]
               (.then (ipfs ["files" "ls" (str "/block-ingest/" suffix)])
                      (fn [{:keys [code out]}]
-                       (if (zero? code)
-                         (vec (sort (filter #(re-matches raw-cid-re %) (str/split-lines (str out)))))
-                         []))))
+                       (vec (sort (into ((:list pins) suffix)
+                                        (when (zero? code)
+                                          (filter #(re-matches raw-cid-re %) (str/split-lines (str out))))))))))
      ;; mirror helpers: hold a block that is (or will be, via bitswap) in Kubo
      :hold-remote! (fn [p cid timeout-s]
-                     (-> (ipfs ["files" "mkdir" "-p" (subs p 0 (str/last-index-of p "/"))])
-                         (.then (fn [_] (ipfs ["block" "stat" (str "--timeout=" timeout-s "s") cid])))
+                     (-> (ipfs ["block" "stat" (str "--timeout=" timeout-s "s") cid])
                          (.then (fn [{:keys [code err]}]
                                   (when-not (zero? code) (throw (g/unmeasured (str "fetch " cid ": " (str/trim err)))))
-                                  (ipfs ["files" "cp" (str "/ipfs/" cid) p])))
-                         (.then (fn [{:keys [code err]}]
-                                  (when-not (or (zero? code) (str/includes? err "already has entry"))
-                                    (throw (g/unmeasured (str "files cp: " (str/trim err)))))))))}
+                                  (hold! p)))))}
     (when state-dir (file-heads state-dir)))))
 
 ;; ── requests ────────────────────────────────────────────────────────────────
@@ -170,15 +266,15 @@
     (cond
       (and (= method "GET") (= path "/health")) (js/Promise.resolve (json 200 {"ok" true}))
       (nil? cid) (js/Promise.resolve (json 404 {"refused" "not found"}))
-      (not (re-matches raw-cid-re cid)) (js/Promise.resolve (json 400 {"refused" "not a raw CIDv1 sha2-256"}))
+      (not (parse-cid cid)) (js/Promise.resolve (json 400 {"refused" "not a CIDv1 sha2-256 with codec raw or dag-cbor"}))
 
       (= method "GET")
       (.then ((:get store) cid)
              (fn [buf]
                (cond
                  (nil? buf) (json 404 {"refused" "block is not held here"})
-                 (not= cid (g/raw-cid buf)) (json 500 {"unmeasured" "stored bytes do not hash to the CID"})
-                 :else {:status 200 :bytes buf})))
+                 (not (hashes-to? cid buf)) (json 500 {"unmeasured" "stored bytes do not hash to the CID"})
+                 :else {:status 200 :bytes buf :cid cid})))
 
       (#{"PUT" "DELETE"} method)
       (if-let [[status reason] (authorize opts method cid headers now)]
@@ -193,13 +289,13 @@
             (cond
               (nil? body) (js/Promise.resolve (json 400 {"refused" "body required"}))
               (> (.-length body) (:max-block-bytes opts)) (js/Promise.resolve (json 413 {"refused" "block too large"}))
-              (not= cid (g/raw-cid body)) (js/Promise.resolve (json 400 {"refused" "bytes do not hash to the CID"}))
+              (not (hashes-to? cid body)) (js/Promise.resolve (json 400 {"refused" "bytes do not hash to the CID"}))
               :else
               (-> ((:held? store) p)
                   (.then (fn [already]
                            (if already
                              (json 200 {"cid" cid "size" (.-length body) "held" p})
-                             (-> ((:put! store) body)
+                             (-> ((:put! store) (:codec (parse-cid cid)) body)
                                  (.then (fn [got]
                                           (when-not (= got cid) (throw (g/unmeasured (str "Kubo stored " got " for " cid))))
                                           ((:hold! store) p)))
@@ -263,8 +359,8 @@
             cid (get rec "cid") seq (get rec "seq")]
         (cond
           (not (re-matches head-name-re name)) (js/Promise.resolve (json 400 {"refused" "bad head name"}))
-          (not (and (string? cid) (re-matches raw-cid-re cid) (js/Number.isInteger seq) (pos? seq)))
-          (js/Promise.resolve (json 400 {"refused" "body must be {\"cid\": raw cid, \"seq\": positive integer}"}))
+          (not (and (parse-cid cid) (js/Number.isInteger seq) (pos? seq)))
+          (js/Promise.resolve (json 400 {"refused" "body must be {\"cid\": raw or dag-cbor cid, \"seq\": positive integer}"}))
           :else
           (if-let [[status reason] (authorize opts "PUT" (head-message-slot name seq cid) headers now)]
             (js/Promise.resolve (json status {"refused" reason}))
@@ -296,9 +392,10 @@
        (.on req "end" #(when-not @over (resolve (js/Buffer.concat chunks))))
        (.on req "error" #(resolve nil))))))
 
-(defn- reply [^js res {:keys [status json bytes]}]
+(defn- reply [^js res {:keys [status json bytes cid]}]
   (if bytes
-    (do (.writeHead res status #js {"content-type" "application/vnd.ipld.raw" "content-length" (.-length bytes)
+    (do (.writeHead res status #js {"content-type" (if (= "dag-cbor" (:codec (parse-cid cid)))
+                                                      "application/vnd.ipld.dag-cbor" "application/vnd.ipld.raw") "content-length" (.-length bytes)
                                     "cache-control" "public, max-age=31536000, immutable"})
         (.end res bytes))
     (let [s (g/canonical-str json)]

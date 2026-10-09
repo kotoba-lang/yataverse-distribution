@@ -1,0 +1,76 @@
+;; Gate for block-ingest's kubo-store against a real Kubo: raw holds live in
+;; MFS, dag-cbor holds are direct pins tracked per signer, both survive
+;; `repo gc`, and a dag-cbor pin is dropped only when its last signer releases
+;; it. Uses a throwaway IPFS_PATH; needs a Kubo binary.
+;;
+;;   node <release>/engine/cli.js --classpath deploy:test test/block_ingest_kubo_test.cljk --ipfs-bin=$(which ipfs)
+(ns block-ingest-kubo-test
+  (:require [clojure.string :as str]
+            [block-ingest :as b]
+            [block-ingest-test :as t]))
+
+(def os (js/require "node:os"))
+(def fs (js/require "node:fs"))
+(def cp (js/require "node:child_process"))
+(def failures (atom 0))
+(defn check [label ok] (println (if ok "  ✓" "  ✗") label) (when-not ok (swap! failures inc)))
+
+(def ipfs-bin (some #(when (str/starts-with? % "--ipfs-bin=") (subs % 11)) (array-seq (aget js/process "argv"))))
+(def now 1790000000)
+(def opts {:allow #{(:did t/murakumo) (:did t/other)} :max-skew 300 :max-block-bytes 1024})
+
+(defn run []
+  (let [dir (.mkdtempSync fs (str (.tmpdir os) "/block-ingest-kubo-"))
+        repo (str dir "/repo")
+        env (doto (js/Object.assign #js {} (aget js/process "env")) (aset "IPFS_PATH" repo))
+        sh (fn [& args] (.spawnSync cp ipfs-bin (clj->js args) #js {:env env}))
+        gc! #(sh "repo" "gc")
+        _ (sh "init" "--profile=test")
+        store (b/kubo-store ipfs-bin repo (str dir "/state"))
+        h #(b/handle opts store now %)
+        put (fn [who c bytes] (h {:method "PUT" :path (str "/v1/blocks/" c) :headers (t/signed who "PUT" c now) :body bytes}))
+        del (fn [who c] (h {:method "DELETE" :path (str "/v1/blocks/" c) :headers (t/signed who "DELETE" c now)}))
+        gettable? (fn [c] (.then ((:get store) c) some?))
+        suffix (subs (:did t/murakumo) 8)]
+    (println "block-ingest kubo gate:" ipfs-bin)
+    ;; one at a time: without a daemon, concurrent CLI calls contend for repo.lock
+    (-> (reduce (fn [p [who c bytes]] (.then p (fn [acc] (.then (put who c bytes) #(conj acc %)))))
+                (js/Promise.resolve [])
+                [[t/murakumo t/cid t/block] [t/murakumo t/cbor-cid t/cbor] [t/other t/cbor-cid t/cbor]])
+        (.then (fn [rs]
+                 (check "raw and dag-cbor writes are stored and held (201 each)" (every? #(= 201 (:status %)) rs))
+                 (gc!)
+                 (-> (gettable? t/cid)
+                     (.then (fn [raw?] (.then (gettable? t/cbor-cid) (fn [cbor?] [raw? cbor?]))))
+                     (.then (fn [[raw? cbor?]] (.then ((:holds store) suffix) (fn [holds] [raw? cbor? holds])))))))
+        (.then (fn [[raw? cbor? holds]]
+                 (check "both survive repo gc" (and raw? cbor?))
+                 (check "the holds listing has the raw (MFS) and the dag-cbor (pin) hold" (= (set holds) #{t/cid t/cbor-cid}))
+                 (h {:method "GET" :path (str "/v1/blocks/" t/cbor-cid)})))
+        (.then (fn [r]
+                 (check "the dag-cbor block reads back from Kubo, checked against its CID"
+                        (and (= 200 (:status r)) (.equals (:bytes r) t/cbor)))
+                 (del t/murakumo t/cbor-cid)))
+        (.then (fn [r]
+                 (check "one signer releases its dag-cbor hold (200)" (= 200 (:status r)))
+                 (gc!)
+                 (.then (gettable? t/cbor-cid) (fn [cbor?] (.then ((:holds store) suffix) (fn [holds] [cbor? holds]))))))
+        (.then (fn [[cbor? holds]]
+                 (check "the other signer's hold keeps the pin through gc" cbor?)
+                 (check "the releasing signer no longer lists it" (= holds [t/cid]))
+                 (del t/other t/cbor-cid)))
+        (.then (fn [_] (gc!) (gettable? t/cbor-cid)))
+        (.then (fn [cbor?]
+                 (check "after the last signer releases it, gc removes the block" (not cbor?))
+                 (del t/murakumo t/cid)))
+        (.then (fn [_] (gc!) (gettable? t/cid)))
+        (.then (fn [raw?]
+                 (check "a released raw (MFS) hold is collected too" (not raw?))
+                 (.rmSync fs dir #js {:recursive true :force true})
+                 (println (if (zero? @failures) "block-ingest kubo gate: passed" (str "block-ingest kubo gate: " @failures " failure(s)")))
+                 (js/process.exit (if (zero? @failures) 0 1)))))))
+
+(when (some #(str/ends-with? % "block_ingest_kubo_test.cljk") (array-seq (aget js/process "argv")))
+  (if ipfs-bin
+    (run)
+    (do (println "block-ingest kubo gate: skipped (pass --ipfs-bin=PATH)") (js/process.exit 0))))
