@@ -1,0 +1,287 @@
+(ns lossless-storage
+  "Offline research codec. No network, publication, encryption or live-store writes.
+   All references terminate in independently compressed anchors. Vector search is
+   an encoding hint only: decoding uses authenticated content IDs, never ANN.")
+
+(def zlib (js/require "node:zlib"))
+(def crypto (js/require "node:crypto"))
+(def max-bytes (* 16 1024 1024))
+(defn refuse [message] (throw (ex-info message {:kind :research-storage})))
+(defn sha [buf] (-> (.createHash crypto "sha256") (.update buf) (.digest "hex")))
+(defn json-bytes [x] (js/Buffer.from (js/JSON.stringify (clj->js x)) "utf8"))
+(defn positive-int? [x] (and (integer? x) (pos? x)))
+(def magic (js/Buffer.from "YATAP01\n"))
+(def zstd-magic (js/Buffer.from "YATAZ01\n"))
+(defn record-cost [r]
+  (+ (.-length (json-bytes (dissoc r :data))) (.-length (js/Buffer.from (:data r) "base64"))))
+(defn serialize-pack [p]
+  (let [blobs (mapv #(js/Buffer.from (:data %) "base64") (:records p))
+        metadata (json-bytes (assoc p :records (mapv #(assoc (dissoc %1 :data) :encoded-size (.-length %2)) (:records p) blobs)))
+        header (js/Buffer.alloc 12)]
+    (.copy magic header) (.writeUInt32BE header (.-length metadata) 8)
+    (js/Buffer.concat (clj->js (into [header metadata] blobs)))))
+(defn parse-pack [payload]
+  (let [payload (if (and (>= (.-length payload) 12) (.equals zstd-magic (.subarray payload 0 8)))
+                  (let [expected (.readUInt32BE payload 8)]
+                    (when (> expected (* 3 max-bytes)) (refuse "solid expansion exceeds bound"))
+                    (let [buf (.zstdDecompressSync zlib (.subarray payload 12)
+                                                  #js {:maxOutputLength (max 1 expected)})]
+                      (when-not (= expected (.-length buf)) (refuse "solid expansion size differs")) buf))
+                  payload)]
+  (when (or (< (.-length payload) 12) (not (.equals magic (.subarray payload 0 8))))
+    (refuse "invalid pack magic"))
+  (let [length (.readUInt32BE payload 8) start (+ 12 length)]
+    (when (> start (.-length payload)) (refuse "truncated metadata"))
+    (let [p (js->clj (js/JSON.parse (.toString payload "utf8" 12 start)) :keywordize-keys true)
+          offset (atom start)
+          records (mapv (fn [r]
+                          (let [n (:encoded-size r) from @offset]
+                            (when-not (and (integer? n) (<= 0 n max-bytes) (<= (+ from n) (.-length payload)))
+                              (refuse "invalid encoded record extent"))
+                            (swap! offset + n)
+                            (assoc (dissoc r :encoded-size) :data (.toString (.subarray payload from @offset) "base64")))) (:records p))]
+      (when-not (= @offset (.-length payload)) (refuse "trailing pack bytes"))
+      (assoc p :records records)))))
+
+;; Simple deterministic Gear CDC, deliberately not called FastCDC.
+(def gear (mapv #(-> (.createHash crypto "sha256") (.update (str "yataverse-gear-v1:" %))
+                    (.digest) (.readUInt32LE 0)) (range 256)))
+(defn chunks
+  ([buf] (chunks buf 2048 8191 16384))
+  ([buf minimum mask maximum]
+   (when-not (and (positive-int? minimum) (positive-int? maximum) (<= minimum maximum)
+                  (positive-int? mask) (zero? (bit-and mask (inc mask))))
+     (refuse "invalid chunk parameters"))
+   (loop [offset 0 start 0 rolling 0 out []]
+     (if (= offset (.-length buf))
+       (cond-> out (< start offset) (conj (.subarray buf start offset)))
+       (let [h (bit-or 0 (+ (bit-shift-left rolling 1) (nth gear (aget buf offset))))
+             end (inc offset) size (- end start)]
+         (if (and (>= size minimum) (or (zero? (bit-and h mask)) (>= size maximum)))
+           (recur end end 0 (conj out (.subarray buf start end)))
+           (recur end start h out)))))))
+
+;; A fixed-size lexical byte sketch, NOT a learned semantic embedding/LLM.
+;; Rebuildable encoder-only index; its transient bytes are reported separately.
+(defn sketch [buf]
+  (let [v (js/Float64Array. 64)]
+    (doseq [i (range 0 (max 0 (- (.-length buf) 2)) 8)]
+      (let [bucket (bit-and 63 (bit-xor (* 31 (aget buf i))
+                                      (* 17 (aget buf (inc i))) (aget buf (+ i 2))))]
+        (aset v bucket (inc (aget v bucket)))))
+    v))
+(defn cosine [a b]
+  (loop [i 0 dot 0 aa 0 bb 0]
+    (if (= i 64) (if (or (zero? aa) (zero? bb)) 0 (/ dot (js/Math.sqrt (* aa bb))))
+      (let [x (aget a i) y (aget b i)]
+        (recur (inc i) (+ dot (* x y)) (+ aa (* x x)) (+ bb (* y y)))))))
+(defn compress [buf dictionary]
+  (.deflateRawSync zlib buf (clj->js (cond-> {:level 9} dictionary (assoc :dictionary dictionary)))))
+
+(defn pack
+  "files = [{:name logical-name :bytes Buffer}]. Names are labels, never paths.
+   mode = :plain (per-file), :cdc (dedup), :vector (dedup + base dictionary).
+   No delta chains. Chooses a reference only if its FULL record is smaller."
+  [files mode]
+  (when-not (contains? #{:plain :cdc :vector} mode) (refuse "unknown pack mode"))
+  (when-not (= (count files) (count (set (map :name files)))) (refuse "duplicate names"))
+  (let [records (atom []) seen (atom {}) anchors (atom [])
+        input-size (reduce + 0 (map #(.-length (:bytes %)) files))]
+    (when (> input-size max-bytes) (refuse "research corpus exceeds 16 MiB"))
+    (let [entries
+          (mapv
+           (fn [{:keys [name bytes]}]
+             (when-not (and (string? name) (js/Buffer.isBuffer bytes)) (refuse "invalid file"))
+             {:name name :size (.-length bytes) :sha256 (sha bytes)
+              :chunks
+              (mapv
+               (fn [buf]
+                 (let [id (sha buf)]
+                   (if (and (not= mode :plain) (contains? @seen id))
+                     (get @seen id)
+                     (let [full (compress buf nil)
+                           raw {:id id :size (.-length buf) :codec "raw" :data (.toString buf "base64")}
+                           standalone {:id id :size (.-length buf) :codec "deflate-raw-v1"
+                                       :data (.toString full "base64")}
+                           baseline (min-key record-cost raw standalone)
+                           v (when (= mode :vector) (sketch buf))
+                           candidates (when v (take 4 (sort-by #(- (cosine v (:vector %))) @anchors)))
+                           choices (map (fn [a]
+                                          {:id id :size (.-length buf) :codec "deflate-dict-v1"
+                                           :base (:index a)
+                                           :data (.toString (compress buf (:bytes a)) "base64")}) candidates)
+                           best (reduce (fn [a b] (if (< (record-cost b) (record-cost a)) b a))
+                                        baseline choices)
+                           index (count @records)]
+                       (swap! records conj best)
+                       (swap! seen assoc id index)
+                       (when (and v (nil? (:base best)))
+                         (swap! anchors #(vec (take-last 64 (conj % {:index index :bytes buf :vector v})))))
+                       index))))
+               (if (= mode :plain) [bytes] (chunks bytes)))}) files)
+          payload (serialize-pack {:schema "yataverse-research-pack/v1" :mode (name mode)
+                               :files entries :records @records})]
+      {:bytes payload :input-bytes input-size :records (count @records)
+       :dictionary-records (count (filter :base @records))
+       :index-vector-bytes (* 64 8 (count @anchors))
+       :index-anchor-bytes (reduce + 0 (map #(.-length (:bytes %)) @anchors))})))
+
+(defn solid-pack
+  "Strong conventional baseline: zstd level 9 over the same binary container
+   holding raw file records, including filenames/lengths/digests. No AI."
+  [files]
+  (when-not (= (count files) (count (set (map :name files)))) (refuse "duplicate names"))
+  (let [size (reduce + 0 (map #(.-length (:bytes %)) files))]
+    (when (> size max-bytes) (refuse "solid input exceeds bound"))
+    (let [records (mapv (fn [f] {:id (sha (:bytes f)) :size (.-length (:bytes f)) :codec "raw"
+                                :data (.toString (:bytes f) "base64")}) files)
+          entries (mapv (fn [i f] {:name (:name f) :size (.-length (:bytes f))
+                                  :sha256 (sha (:bytes f)) :chunks [i]}) (range) files)
+          raw (serialize-pack {:schema "yataverse-research-pack/v1" :mode "solid-zstd"
+                               :files entries :records records})
+          compressed (.zstdCompressSync zlib raw
+                       (clj->js {:params {(aget (.-constants zlib) "ZSTD_c_compressionLevel") 9}}))
+          header (js/Buffer.alloc 12)]
+      (.copy zstd-magic header) (.writeUInt32BE header (.-length raw) 8)
+      {:bytes (js/Buffer.concat #js [header compressed]) :input-bytes size :records (count files)
+       :dictionary-records 0 :index-vector-bytes 0 :index-anchor-bytes 0})))
+
+(defn adaptive-pack [files]
+  (let [variants (into [(assoc (solid-pack files) :selected-mode "solid-zstd")]
+                       (mapv #(assoc (pack files %) :selected-mode (name %)) [:plain :cdc :vector]))]
+    (apply min-key #(.-length (:bytes %)) variants)))
+
+(defn unpack
+  "Requires a caller-trusted payload digest. Hash detects corruption; it is not
+   an authenticity signature. Returns verified labels + bytes, writes no files."
+  [payload expected-sha]
+  (when-not (and (<= (.-length payload) (* 3 max-bytes)) (= expected-sha (sha payload)))
+    (refuse "payload digest/size mismatch"))
+  (let [p (parse-pack payload)
+        decoded (atom []) total (atom 0)]
+    (when-not (and (= "yataverse-research-pack/v1" (:schema p))
+                   (vector? (:records p)) (vector? (:files p))) (refuse "invalid pack schema"))
+    (doseq [[index r] (map-indexed vector (:records p))]
+      (when-not (and (integer? (:size r)) (<= 0 (:size r) max-bytes)
+                     (string? (:data r))) (refuse "invalid record"))
+      (swap! total + (:size r))
+      (when (> @total max-bytes) (refuse "expanded corpus exceeds bound"))
+      (let [encoded (js/Buffer.from (:data r) "base64") base (:base r)
+            dictionary (when (some? base)
+                         (when-not (and (integer? base) (<= 0 base) (< base index)
+                                        (nil? (:base (nth (:records p) base))))
+                           (refuse "dictionary must be a previous independent anchor"))
+                         (nth @decoded base))
+            out (case (:codec r)
+                  "raw" (do (when (some? base) (refuse "raw base forbidden")) encoded)
+                  "deflate-raw-v1" (do (when (some? base) (refuse "standalone base forbidden"))
+                                      (.inflateRawSync zlib encoded #js {:maxOutputLength (max 1 (:size r))}))
+                  "deflate-dict-v1" (do (when-not dictionary (refuse "missing dictionary"))
+                                       (.inflateRawSync zlib encoded
+                                         #js {:dictionary dictionary :maxOutputLength (max 1 (:size r))}))
+                  (refuse "unsupported codec"))]
+        (when-not (and (= (:size r) (.-length out)) (= (:id r) (sha out)))
+          (refuse "record hash/size mismatch"))
+        (swap! decoded conj out)))
+    (doseq [f (:files p)]
+      (when-not (and (integer? (:size f)) (<= 0 (:size f) max-bytes)) (refuse "invalid logical size")))
+    (when (> (reduce + 0 (map :size (:files p))) max-bytes) (refuse "logical expansion exceeds bound"))
+    (let [result (mapv (fn [f]
+                         (when-not (and (string? (:name f)) (vector? (:chunks f))
+                                        (integer? (:size f)) (<= 0 (:size f) max-bytes))
+                           (refuse "invalid file descriptor"))
+                         (let [parts (mapv (fn [i]
+                                            (when-not (and (integer? i) (<= 0 i) (< i (count @decoded)))
+                                              (refuse "invalid chunk reference"))
+                                            (nth @decoded i)) (:chunks f))
+                               size (reduce + 0 (map #(.-length %) parts))]
+                           (when-not (= size (:size f)) (refuse "file size mismatch"))
+                           (let [buf (js/Buffer.concat (clj->js parts))]
+                             (when-not (= (:sha256 f) (sha buf)) (refuse "file digest mismatch"))
+                             {:name (:name f) :bytes buf}))) (:files p))]
+      (when (or (> (reduce + 0 (map #(.-length (:bytes %)) result)) max-bytes)
+                (not= (count result) (count (set (map :name result)))))
+        (refuse "expanded files exceed bound or duplicate names"))
+      result)))
+
+;; Systematic (6,4) erasure code over GF(256), polynomial 0x11d.
+;; P = D0 xor D1 xor D2 xor D3; Q = D0 xor 2D1 xor 4D2 xor 8D3.
+;; All pairs of columns of [1,1,1,1;1,2,4,8] are independent.
+(defn gf-mul [a b]
+  (loop [x a y b out 0]
+    (if (zero? y) out
+      (recur (bit-and 255 (bit-xor (bit-shift-left x 1) (if (>= x 128) 0x11d 0)))
+             (bit-shift-right y 1) (if (odd? y) (bit-xor out x) out)))))
+(def gf-tables (mapv (fn [a] (js/Buffer.from (clj->js (mapv #(gf-mul a %) (range 256))))) (range 256)))
+(defn gf-inverse [x]
+  (when (zero? x) (refuse "singular matrix"))
+  (first (filter #(= 1 (gf-mul x %)) (range 1 256))))
+(def generator [[1 0 0 0] [0 1 0 0] [0 0 1 0] [0 0 0 1] [1 1 1 1] [1 2 4 8]])
+(defn validate-placement
+  "Six shard positions -> independent failure-domain labels. Guarantees only
+   the requested number of whole-domain losses, under a truthful domain map."
+  [domains domain-losses]
+  (when-not (and (= 6 (count domains)) (satisfies? ISeqable domains)
+                 (every? #(and (string? %) (not (empty? %))) domains)
+                 (positive-int? domain-losses) (<= domain-losses (count (set domains))))
+    (refuse "invalid placement"))
+  (let [worst (reduce + (take domain-losses (sort > (vals (frequencies domains)))))]
+    (when (> worst 2) (refuse "correlated domain loss exceeds parity budget"))
+    {:domains domains :domain-losses domain-losses :worst-case-erased-shards worst}))
+(defn inverse-matrix [matrix]
+  (loop [column 0 rows (mapv (fn [i row] (into row (mapv #(if (= % i) 1 0) (range 4)))) (range 4) matrix)]
+    (if (= column 4) (mapv #(subvec % 4) rows)
+      (let [pivot (first (filter #(not (zero? (get-in rows [% column]))) (range column 4)))]
+        (when-not pivot (refuse "singular shard set"))
+        (let [swapped (assoc rows column (nth rows pivot) pivot (nth rows column))
+              inv (gf-inverse (get-in swapped [column column]))
+              row (mapv #(gf-mul % inv) (nth swapped column))
+              normalized (assoc swapped column row)
+              eliminated (mapv (fn [i r] (if (= i column) r
+                                          (let [scale (nth r column)]
+                                            (mapv #(bit-xor %1 (gf-mul scale %2)) r row))))
+                               (range 4) normalized)]
+          (recur (inc column) eliminated))))))
+(defn combine [row buffers]
+  (let [out (js/Buffer.alloc (.-length (first buffers)))]
+    (doseq [[coefficient buf] (map vector row buffers) :when (pos? coefficient)]
+      (let [table (nth gf-tables coefficient)]
+        (dotimes [i (.-length buf)]
+          (aset out i (bit-xor (aget out i) (aget table (aget buf i)))))))
+    out))
+(defn shard [payload]
+  (when (> (.-length payload) (* 3 max-bytes)) (refuse "payload too large"))
+  (let [width (max 1 (js/Math.ceil (/ (.-length payload) 4)))
+        padded (js/Buffer.alloc (* width 4))]
+    (.copy payload padded)
+    (let [data (mapv #(.subarray padded (* % width) (* (inc %) width)) (range 4))
+          shards (into data (mapv #(combine % data) (subvec generator 4)))
+          manifest {:schema "yataverse-research-ec/v1" :k 4 :m 2 :width width
+                    :bytes (.-length payload) :sha256 (sha payload) :shards (mapv sha shards)}]
+      {:manifest manifest :manifest-sha256 (sha (json-bytes manifest)) :shards shards})))
+(defn physical-size [encoded]
+  (+ (reduce + 0 (map #(.-length %) (:shards encoded)))
+     (* 3 (+ (.-length (json-bytes (:manifest encoded)))
+             (.-length (json-bytes {:manifest-sha256 (:manifest-sha256 encoded)
+                                    :payload-sha256 (:sha256 (:manifest encoded))}))))))
+(defn recover
+  "Nil, wrong-sized and hash-invalid shards count as erasures. At least four
+   valid distinct positions AND the caller-trusted manifest hash are required."
+  [manifest trusted-manifest-sha shards]
+  (when-not (and (= trusted-manifest-sha (sha (json-bytes manifest)))
+                 (= "yataverse-research-ec/v1" (:schema manifest)) (= 4 (:k manifest)) (= 2 (:m manifest))
+                 (positive-int? (:width manifest)) (integer? (:bytes manifest))
+                 (<= 0 (:bytes manifest) (* 3 max-bytes))
+                 (= (:width manifest) (max 1 (js/Math.ceil (/ (:bytes manifest) 4)))))
+    (refuse "untrusted/invalid recovery manifest"))
+  (when-not (and (= 6 (count shards)) (= 6 (count (:shards manifest)))) (refuse "invalid shard count"))
+  (let [valid (vec (keep-indexed (fn [i b] (when (and b (js/Buffer.isBuffer b)
+                                                    (= (:width manifest) (.-length b))
+                                                    (= (nth (:shards manifest) i) (sha b))) i)) shards))]
+    (when (< (count valid) 4) (refuse "fewer than four valid shards"))
+    (let [indices (subvec valid 0 4)
+          inverse (inverse-matrix (mapv #(nth generator %) indices))
+          selected (mapv #(nth shards %) indices)
+          buf (.subarray (js/Buffer.concat (clj->js (mapv #(combine % selected) inverse))) 0 (:bytes manifest))]
+      (when-not (= (:sha256 manifest) (sha buf)) (refuse "reconstructed payload digest mismatch"))
+      buf)))

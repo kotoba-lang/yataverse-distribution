@@ -1,0 +1,106 @@
+{
+  "schema": "yataverse-wan-research/v1",
+  "rows": [
+    {
+      "lostSite": "xavier-wan",
+      "survivor": "jacob-wan",
+      "additionalLostShardPositions": [],
+      "downloadBytes": 7363038,
+      "downloadMs": 3016.051707,
+      "decodeMs": 36.598291000000245,
+      "exactRawContainerSHA": "a069ffff7c10fe97c6527898acb86765f0a20e153653cf8bbc4cb8fb00b3a520",
+      "verified": true
+    },
+    {
+      "lostSite": "xavier-wan",
+      "survivor": "jacob-wan",
+      "additionalLostShardPositions": [
+        0,
+        1
+      ],
+      "downloadBytes": 4908882,
+      "downloadMs": 2536.3056659999993,
+      "decodeMs": 40.63445800000045,
+      "exactRawContainerSHA": "a069ffff7c10fe97c6527898acb86765f0a20e153653cf8bbc4cb8fb00b3a520",
+      "verified": true
+    },
+    {
+      "repairSite": "xavier-wan",
+      "sourceSite": "jacob-wan",
+      "recreateMs": 42.648959000000104,
+      "uploadBytes": 7364688,
+      "uploadMs": 6715.164375000002,
+      "readbackBytes": 7362468,
+      "readbackMs": 3986.498582000002,
+      "repairSHA": "de2434f651bc4700773ba437a429045e71967a4193a331b135b6ea7b78ffab9d",
+      "readbackVerified": true
+    },
+    {
+      "lostSite": "jacob-wan",
+      "survivor": "xavier-wan",
+      "additionalLostShardPositions": [],
+      "downloadBytes": 7363038,
+      "downloadMs": 3638.863333999998,
+      "decodeMs": 32.74370900000213,
+      "exactRawContainerSHA": "a069ffff7c10fe97c6527898acb86765f0a20e153653cf8bbc4cb8fb00b3a520",
+      "verified": true
+    },
+    {
+      "lostSite": "jacob-wan",
+      "survivor": "xavier-wan",
+      "additionalLostShardPositions": [
+        0,
+        1
+      ],
+      "downloadBytes": 4908882,
+      "downloadMs": 3364.197457999995,
+      "decodeMs": 43.57379199999923,
+      "exactRawContainerSHA": "a069ffff7c10fe97c6527898acb86765f0a20e153653cf8bbc4cb8fb00b3a520",
+      "verified": true
+    },
+    {
+      "repairSite": "jacob-wan",
+      "sourceSite": "xavier-wan",
+      "recreateMs": 47.467709000004106,
+      "uploadBytes": 7364688,
+      "uploadMs": 4422.248918000005,
+      "readbackBytes": 7362468,
+      "readbackMs": 2927.0353329999925,
+      "repairSHA": "de2434f651bc4700773ba437a429045e71967a4193a331b135b6ea7b78ffab9d",
+      "readbackVerified": true
+    }
+  ],
+  "custody": [
+    {
+      "site": "xavier-wan",
+      "files": 13,
+      "bytes": 7364818,
+      "allocatedBytes": 7401472,
+      "fsync": true
+    },
+    {
+      "site": "jacob-wan",
+      "files": 13,
+      "bytes": 7364818,
+      "allocatedBytes": 7401472,
+      "fsync": true
+    }
+  ],
+  "sites": [
+    {
+      "domain": "xavier-wan",
+      "host": "xavier (existing authorized SSH route)"
+    },
+    {
+      "domain": "jacob-wan",
+      "host": "jacob (existing authorized SSH route)"
+    }
+  ],
+  "manifestSHA": "de2434f651bc4700773ba437a429045e71967a4193a331b135b6ea7b78ffab9d",
+  "rawSHA": "a069ffff7c10fe97c6527898acb86765f0a20e153653cf8bbc4cb8fb00b3a520",
+  "guarantee": "two complete EC copies across two declared WAN domains; any one site plus any two surviving shard erasures; trusted manifest and codec availability assumed",
+  "injection": "client withholds all requests to lost site; no physical network shutdown; six shards read over real SSH links; fsynced repaired copies read back",
+  "physicalProfile": "12 shards, 6 manifests and 6 receipts; twice one EC physical footprint; repair copies additional test storage",
+  "limits": "one bounded pack; actual link outage and full lake WAN restore not tested; caches not flushed; no annual durability or provider SLA equivalence established",
+  "codeSHA": "67ed350e8dcbd975fa299ebcb27fa85830b995d1b35a97a5d09d04960e74b23b"
+}

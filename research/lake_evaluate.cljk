@@ -1,0 +1,169 @@
+(ns lake-evaluate
+  "Read-only lake inventory census and bounded byte evaluation. No writes to
+   Kubo, no pins, network bootstrap, provider upload, or source deletion.
+   Run with research/nbb.edn and classpath .:../deploy."
+  (:require [lossless-storage :as s] [raw-block-store :as raw] [graph-head :as graph]))
+(def fs (js/require "node:fs"))
+(def cp (js/require "node:child_process"))
+(def path (js/require "node:path"))
+(def performance (.-performance (js/require "node:perf_hooks")))
+(def argv (vec (array-seq (.-argv js/process))))
+(defn option [key default] (or (second (drop-while #(not= % key) argv)) default))
+(def inv-path (option "--inventory" nil))
+(def report-path (option "--report" nil))
+(def shard-output (option "--shard-output" nil))
+(when-not (and inv-path report-path) (s/refuse "--inventory and --report required"))
+(when (.existsSync fs report-path) (s/refuse "report already exists"))
+(when (and shard-output (.existsSync fs shard-output)) (s/refuse "shard output must be new"))
+(def all? (some #{"--all"} argv))
+(def start-row (js/Number (option "--start-row" "0")))
+(def limit (js/Number (option "--limit" "64")))
+(def budget (js/Number (option "--max-read-bytes" "8388608")))
+(def max-selected-block (js/Number (option "--max-block-bytes" "256000000")))
+(when-not (and (integer? start-row) (<= 0 start-row) (s/positive-int? limit) (s/positive-int? budget)
+               (s/positive-int? max-selected-block) (<= max-selected-block 256000000))
+  (s/refuse "invalid evaluation bounds"))
+(def inventory (.readFileSync fs inv-path))
+(def inventory-sha (s/sha inventory))
+(when-let [declared (option "--sha256" nil)]
+  (when-not (= declared inventory-sha) (s/refuse "inventory digest differs")))
+(def buckets (atom {}))
+(def samples (atom {}))
+(def seen (js/Set.))
+(def rows (atom 0))
+(def total (atom 0))
+(def requested (atom []))
+(defn bucket [size]
+  (cond (< size 1024) "lt1KiB" (< size 16384) "1-16KiB" (< size 262144) "16-256KiB"
+        (< size 1048576) "256KiB-1MiB" (< size 8388608) "1-8MiB" :else "ge8MiB"))
+(loop [offset 0]
+  (when (< offset (.-length inventory))
+    (let [nl (.indexOf inventory 10 offset) end (if (neg? nl) (.-length inventory) (inc nl))
+          row (js/JSON.parse (.toString inventory "utf8" offset end))
+          cid (.-cid row) size (.-bytes row) index @rows]
+      (when-not (and (string? cid) (re-matches #"(Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,200})" cid)
+                     (s/positive-int? size) (<= size 256000000) (not (.has seen cid)))
+        (s/refuse "invalid or duplicate inventory row"))
+      (.add seen cid) (swap! rows inc) (swap! total + size)
+      (let [b (bucket size) entry {:row index :cid cid :bytes size
+                                  :rank (s/sha (js/Buffer.from (str "sample-v1:" cid)))}]
+        (swap! buckets update b (fn [x] {:rows (inc (or (:rows x) 0)) :bytes (+ (or (:bytes x) 0) size)}))
+        (swap! samples update b #(vec (take 12 (sort-by :rank (conj (or % []) entry)))))
+        (when (and all? (<= start-row index) (< index (+ start-row limit)))
+          (swap! requested conj entry)))
+      (recur end))))
+(when-let [expected (option "--count" nil)]
+  (when-not (= @rows (js/Number expected)) (s/refuse "inventory count differs")))
+(when (and all? (>= start-row @rows)) (s/refuse "start row outside inventory"))
+(def candidates (if all? @requested
+                    (vec (take limit (mapcat (fn [n] (keep #(nth % n nil) (vals (into (sorted-map) @samples)))) (range 12))))))
+(def ipfs-bin (option "--ipfs-bin" "/opt/homebrew/bin/ipfs"))
+(def ipfs-path (option "--ipfs-path" nil))
+(def raw-root (option "--raw-block-store" nil))
+(def flatfs-root (option "--flatfs-root" nil))
+(def consumed (atom 0))
+(def evaluated (atom []))
+(def batch-files (atom []))
+(def unavailable (atom []))
+(def excluded (atom []))
+(defn read-block [entry]
+  (let [cid (:cid entry)]
+    (or (when raw-root (raw/read-block raw-root cid 256000000))
+        ;; Kubo flatfs uses the multihash key with next-to-last/2 sharding.
+        ;; Direct read only: no daemon/repository lock, writes or datastore walk.
+        ;; Every returned byte is checked against inventory size and CID below.
+        (when flatfs-root
+          (let [key (.toUpperCase (graph/b32-encode
+                                    (js/Buffer.concat #js [(js/Buffer.from #js [18 32]) (raw/sha256-digest cid)])))
+                f (.join path flatfs-root (subs key (- (count key) 3) (dec (count key))) (str key ".data"))]
+            (when (.existsSync fs f)
+              (when-not (and (.isFile (.lstatSync fs f)) (= (:bytes entry) (.-size (.statSync fs f))))
+                (s/refuse "flatfs block type/size differs"))
+              (.readFileSync fs f))))
+        (let [env (js/Object.assign #js {} (.-env js/process))]
+          (when ipfs-path (aset env "IPFS_PATH" ipfs-path))
+          (let [result (.spawnSync cp ipfs-bin (clj->js ["--offline" "block" "get" cid])
+                                  #js {:env env :timeout 15000 :maxBuffer 256001024})]
+            (when (= 0 (.-status result)) (.-stdout result)))))))
+(doseq [entry candidates]
+  (if (or (> (:bytes entry) max-selected-block) (> (+ @consumed (:bytes entry)) budget))
+    (swap! excluded conj (assoc (dissoc entry :rank) :reason "read-budget/block-bound"))
+    (if-let [bytes (read-block entry)]
+      (do
+        (when-not (= (:bytes entry) (.-length bytes)) (s/refuse "lake block size differs"))
+        (raw/verify-cid (:cid entry) bytes)
+        (swap! consumed + (.-length bytes))
+        ;; Large blocks are split into bounded evaluation windows, but the FULL
+        ;; original block is CID-verified before any window gets evaluated.
+        (doseq [offset (range 0 (.-length bytes) 4194304)]
+          (let [buf (.subarray bytes offset (min (.-length bytes) (+ offset 4194304)))
+                files [{:name (str (:cid entry) "@" offset) :bytes buf}]
+                _ (when (<= (+ (reduce + 0 (map #(.-length (:bytes %)) @batch-files)) (.-length buf)) s/max-bytes)
+                    (swap! batch-files into files))
+                results
+                (mapv (fn [mode]
+                        (let [start (.now performance) p (s/pack files mode)
+                              at (.now performance) e (s/shard (:bytes p))
+                              rb (s/json-bytes {:manifest-sha256 (:manifest-sha256 e)
+                                               :payload-sha256 (s/sha (:bytes p))})
+                              physical (+ (reduce + 0 (map #(.-length %) (:shards e)))
+                                          (* 3 (+ (.-length (s/json-bytes (:manifest e))) (.-length rb))))]
+                          (doseq [a (range 6) b (range (inc a) 6)]
+                            (let [restored (s/unpack (s/recover (:manifest e) (:manifest-sha256 e)
+                                                              (assoc (:shards e) a nil b nil)) (s/sha (:bytes p)))]
+                              (when-not (.equals buf (:bytes (first restored))) (s/refuse "lake recovery mismatch"))))
+                          {:mode (name mode) :payload-bytes (.-length (:bytes p)) :physical-bytes physical
+                           :encode-ms (- at start) :dictionary-records (:dictionary-records p)
+                           :two-erasure-patterns-verified 15})) [:plain :cdc :vector])]
+            (swap! evaluated conj {:cid (:cid entry) :row (:row entry) :block-bytes (:bytes entry)
+                                   :offset offset :window-bytes (.-length buf) :sha256 (s/sha buf)
+                                   :results results}))))
+      (swap! unavailable conj (assoc (dissoc entry :rank) :reason "not-readable-offline")))))
+(when-not (= inventory-sha (s/sha (.readFileSync fs inv-path))) (s/refuse "inventory changed during evaluation"))
+(defn save-encoded! [mode encoded]
+  (when shard-output
+    (let [root (.join path shard-output mode)
+          receipt {:manifest-sha256 (:manifest-sha256 encoded) :payload-sha256 (:sha256 (:manifest encoded))}]
+      (doseq [i (range 6)]
+        (let [dir (.join path root (str "node-" i))]
+          (.mkdirSync fs dir #js {:recursive true})
+          (.writeFileSync fs (.join path dir "shard.bin") (nth (:shards encoded) i))
+          (when (contains? #{0 2 4} i)
+            (.writeFileSync fs (.join path dir "manifest.json") (s/json-bytes (:manifest encoded)))
+            (.writeFileSync fs (.join path dir "receipt.json") (s/json-bytes receipt)))))
+      (.writeFileSync fs (.join path root "trusted-receipt.json") (s/json-bytes receipt)))))
+(def batch-results
+  (when (seq @batch-files)
+    (mapv (fn [mode]
+            (let [start (.now performance)
+                  p (case mode :solid-zstd (s/solid-pack @batch-files) :adaptive (s/adaptive-pack @batch-files)
+                          (s/pack @batch-files mode))
+                  at (.now performance) e (s/shard (:bytes p))]
+              (doseq [a (range 6) b (range (inc a) 6)]
+                (let [restored (s/unpack (s/recover (:manifest e) (:manifest-sha256 e) (assoc (:shards e) a nil b nil))
+                                        (s/sha (:bytes p)))]
+                  (when-not (every? true? (map #(.equals (:bytes %1) (:bytes %2)) @batch-files restored))
+                    (s/refuse "batched recovery differs"))))
+              (save-encoded! (name mode) e)
+              {:mode (name mode) :selected-mode (:selected-mode p) :logical-bytes (:input-bytes p)
+               :payload-bytes (.-length (:bytes p)) :dictionary-records (:dictionary-records p)
+               :encode-ms (- at start) :two-erasure-patterns-verified 15
+               :physical-bytes (s/physical-size e)}))
+          [:plain :cdc :vector :solid-zstd :adaptive])))
+(def report {:schema "yataverse-lake-research/v1" :inventory-sha256 inventory-sha
+             :inventory-rows @rows :inventory-bytes @total :buckets @buckets
+             :scope "frozen local inventory; this tool does not verify inga signatures or live head freshness"
+             :selection (if all? "contiguous bounded range" "CID-hash-ranked size-stratified sample")
+             :start-row start-row :requested-blocks (count candidates) :read-budget budget
+             :next-row (when all? (min @rows (+ start-row limit)))
+             :range-byte-coverage (boolean (and all? (empty? @unavailable) (empty? @excluded)))
+             :evaluated-bytes @consumed :unavailable @unavailable :excluded @excluded :windows @evaluated
+             :batch-results batch-results
+             :limits "bounded batch includes at most 16MiB; no full-lake compression extrapolation"
+             :full-byte-coverage (boolean (and all? (= 0 start-row) (= @rows (count candidates))
+                                      (empty? @unavailable) (empty? @excluded) (= @total @consumed)))})
+(.mkdirSync fs (.dirname path report-path) #js {:recursive true})
+(.writeFileSync fs report-path (js/JSON.stringify (clj->js report) nil 2) #js {:flag "wx"})
+(println (js/JSON.stringify (clj->js (dissoc report :windows :unavailable :excluded)) nil 2))
+(println "evaluated windows" (count @evaluated) "unavailable" (count @unavailable) "budget-excluded" (count @excluded))
+(when (and all? (or (seq @unavailable) (seq @excluded))) (js/process.exit 2))

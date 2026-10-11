@@ -1,0 +1,64 @@
+{
+  "schema": "yataverse-real-llm-measurement/v1",
+  "header": {
+    "schema": "yataverse-gpt2-arithmetic/v1",
+    "revision": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
+    "model": "openai-community/gpt2",
+    "tokens": 1642,
+    "bytes": 4096,
+    "sha256": "44a1719a030cba837cefc7f5b9ade2228905c106b847e2ef078e564b092eab51",
+    "cdfSHA": "86c0a4dc20abca0419d6238e4acc473c2bdc728ffd8115e047537939d1e82adb",
+    "contextResetTokens": 256,
+    "byteMapping": "utf8",
+    "runtime": {
+      "python": "3.14.5",
+      "torch": "2.10.0",
+      "transformers": "4.57.6",
+      "dtype": "CPU FP32 / softmax FP64",
+      "threads": 2
+    },
+    "assets": {
+      "model.safetensors": {
+        "bytes": 548105171,
+        "sha256": "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707"
+      },
+      "tokenizer_config.json": {
+        "bytes": 26,
+        "sha256": "5e04eb606e3a1583530a42e36c2a6b6615c86f34fe77e44d9ddeb43ff940931f"
+      },
+      "config.json": {
+        "bytes": 665,
+        "sha256": "0daed7749b4f02b8f76240d5444551d7b08712dab4d0adb8239c56ba823bb7b4"
+      },
+      "tokenizer.json": {
+        "bytes": 1355256,
+        "sha256": "8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6"
+      },
+      "merges.txt": {
+        "bytes": 456318,
+        "sha256": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5"
+      },
+      "vocab.json": {
+        "bytes": 1042301,
+        "sha256": "196139668be63f3b5d6574427317ae82f612a97c5d1cdaf36ed2256dbf636783"
+      }
+    },
+    "payloadSHA": "b800f33b840a47d41a59f10cf06abbff9bec06b683dbd66cf0827ff9af19497f"
+  },
+  "originalBytes": 4096,
+  "tokens": 1642,
+  "arithmeticBits": 10674,
+  "payloadBytes": 1335,
+  "containerBytes": 2564,
+  "modelAssetBytes": 550959737,
+  "deflateBytes": 1355,
+  "loadSeconds": 12.638991666957736,
+  "encodeSeconds": 16.46397579088807,
+  "decodeSeconds": 16.410236458061263,
+  "encodeBytesPerSecond": 248.78559419814724,
+  "decodeBytesPerSecond": 249.60030347325716,
+  "exactRoundtrip": true,
+  "codeSHA": "db90255d3d1c9c0393329cce411ec1d1eb2f1ce69468d254a1413218a45c6dc0",
+  "host": "jacob.local",
+  "limits": "bounded actual-lake bytes; reversible latin1 mapping or strict UTF8; same process CPU runtime; full lake or cross-platform decoding not measured; model custody not included in container size"
+}

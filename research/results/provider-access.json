@@ -1,0 +1,21 @@
+{
+  "measured": [
+    {
+      "provider": "R2",
+      "status": "not measured",
+      "reason": "non-Mithril connected accounts R2 not enabled; Mithril excluded by user; rejected PUT never executed"
+    },
+    {
+      "provider": "B2",
+      "status": "not measured",
+      "reason": "existing CLI authorization unauthorized; no approved benchmark bucket supplied"
+    },
+    {
+      "provider": "Filecoin",
+      "status": "not measured",
+      "reason": "target service, provider contract, retrieval credentials and matched SLA not supplied"
+    }
+  ],
+  "guaranteeEquivalent": false,
+  "totalCostMeasured": false
+}

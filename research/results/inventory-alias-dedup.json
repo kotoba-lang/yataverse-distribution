@@ -1,0 +1,11 @@
+{
+  "schema": "yataverse-inventory-hash-dedup/v1",
+  "inventorySHA": "2334fb3efefc460a9ed1301aecfa2b5183133fc0bb0208a93692617672eb8a91",
+  "rows": 825390,
+  "totalBytes": 91395086102,
+  "uniqueSHA256": 825390,
+  "uniqueBytes": 91395086102,
+  "duplicateCIDAliasRows": 0,
+  "potentialExactAliasSavingBytes": 0,
+  "scope": "metadata sha2-256 multihash equivalence across CID versions/codecs; full byte scans independently validate hashes; not CDC or semantic similarity"
+}

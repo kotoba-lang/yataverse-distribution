@@ -1,0 +1,17 @@
+// A disjoint union is accepted only after checking every frozen inventory row.
+'use strict';
+const fs=require('node:fs'),path=require('node:path'),{sha}=require('./stream_codec.cljk');
+const [primary,secondary,out]=process.argv.slice(2);if(!primary||!secondary||!out||fs.existsSync(out))throw Error('new output required');
+const read=(root,f)=>fs.readFileSync(path.join(root,f)),summary=root=>JSON.parse(read(root,'summary.json'));
+const a=summary(primary),b=summary(secondary),al=read(primary,'blocks.jsonl'),bl=read(secondary,'blocks.jsonl');
+if(!a.complete||!b.complete||a.inventorySHA!==b.inventorySHA||a.inventoryRows!==b.inventoryRows||a.inventoryBytes!==b.inventoryBytes||b.exclusion.ledgerSHA!==sha(al))throw Error('incomplete or mismatched runs');
+const aa=al.toString().trimEnd().split('\n'),bb=bl.toString().trimEnd().split('\n');if(aa.length!==a.inventoryRows||bb.length!==aa.length)throw Error('ledger coverage');
+let bytes=0;for(let i=0;i<aa.length;i++){const x=JSON.parse(aa[i]),y=JSON.parse(bb[i]);if(x.row!==i||y.row!==i||x.cid!==y.cid||x.bytes!==y.bytes)throw Error('ledger identity');if(!((x.status==='cid-verified'&&y.status==='externally-verified')||(x.status==='missing'&&y.status==='cid-verified')))throw Error('row not covered exactly once');bytes+=x.bytes;}
+if(bytes!==a.inventoryBytes||a.totals.readBytes+b.totals.readBytes!==bytes||b.totals.missingBlocks!==0)throw Error('byte coverage differs');
+const totals={};for(const k of ['readBlocks','readBytes','packCount','rawContainerBytes','zstdPayloadBytes','ecPhysicalBytes','readHashMs','encodeMs','erasureMs','restoreMs'])totals[k]=a.totals[k]+b.totals[k];
+const report={schema:'yataverse-full-lake-union/v1',inventorySHA:a.inventorySHA,inventoryRows:a.inventoryRows,inventoryBytes:bytes,fullByteCoverage:true,totals,
+    audit:{primaryBlocksSHA:sha(al),secondaryBlocksSHA:sha(bl),primaryPacksSHA:sha(read(primary,'packs.jsonl')),secondaryPacksSHA:sha(read(secondary,'packs.jsonl'))},
+    runs:[a,b],capacity:{logicalBytes:bytes,compressedProviderBillableBytes:totals.zstdPayloadBytes,oneECPhysicalBytes:totals.ecPhysicalBytes,twoSiteECPhysicalBytes:2*totals.ecPhysicalBytes},
+    policy:'partition by primary readable custody, missing subset on secondary; 16MiB packs, level9 zstd with recorded per-host workers; every verified byte packed and restored exactly once',
+    guaranteeQualified:false,limits:'all frozen-inventory bytes measured; not live-head verification, complete saved custody, full-lake WAN restore, or 11-nines qualification; filesystem allocation and global control-plane indexes excluded'};
+fs.writeFileSync(out,JSON.stringify(report,null,2),{flag:'wx'});console.log(JSON.stringify({inventoryRows:report.inventoryRows,inventoryBytes:bytes,totals,fullByteCoverage:true}));
