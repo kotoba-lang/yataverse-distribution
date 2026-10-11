@@ -1,0 +1,99 @@
+{
+  "inventory-sha256": "2334fb3efefc460a9ed1301aecfa2b5183133fc0bb0208a93692617672eb8a91",
+  "schema": "yataverse-lake-research/v1",
+  "batch-results": [
+    {
+      "mode": "plain",
+      "selected-mode": null,
+      "logical-bytes": 4194528,
+      "payload-bytes": 1650122,
+      "dictionary-records": 0,
+      "encode-ms": 182.79150000000118,
+      "two-erasure-patterns-verified": 15,
+      "physical-bytes": 2477403
+    },
+    {
+      "mode": "cdc",
+      "selected-mode": null,
+      "logical-bytes": 4194528,
+      "payload-bytes": 1719191,
+      "dictionary-records": 0,
+      "encode-ms": 411.11979099999917,
+      "two-erasure-patterns-verified": 15,
+      "physical-bytes": 2581005
+    },
+    {
+      "mode": "vector",
+      "selected-mode": null,
+      "logical-bytes": 4194528,
+      "payload-bytes": 1716541,
+      "dictionary-records": 171,
+      "encode-ms": 1832.7627499999999,
+      "two-erasure-patterns-verified": 15,
+      "physical-bytes": 2577033
+    },
+    {
+      "mode": "solid-zstd",
+      "selected-mode": null,
+      "logical-bytes": 4194528,
+      "payload-bytes": 1605391,
+      "dictionary-records": 0,
+      "encode-ms": 44.63012499999968,
+      "two-erasure-patterns-verified": 15,
+      "physical-bytes": 2410305
+    },
+    {
+      "mode": "adaptive",
+      "selected-mode": "solid-zstd",
+      "logical-bytes": 4194528,
+      "payload-bytes": 1605391,
+      "dictionary-records": 0,
+      "encode-ms": 2309.3474590000005,
+      "two-erasure-patterns-verified": 15,
+      "physical-bytes": 2410305
+    }
+  ],
+  "range-byte-coverage": true,
+  "start-row": 0,
+  "read-budget": 8388608,
+  "scope": "frozen local inventory; this tool does not verify inga signatures or live head freshness",
+  "evaluated-bytes": 4194528,
+  "inventory-bytes": 91395086102,
+  "full-byte-coverage": false,
+  "buckets": {
+    "256KiB-1MiB": {
+      "rows": 51296,
+      "bytes": 24769687292
+    },
+    "lt1KiB": {
+      "rows": 270696,
+      "bytes": 64556546
+    },
+    "1-16KiB": {
+      "rows": 37191,
+      "bytes": 117799717
+    },
+    "16-256KiB": {
+      "rows": 465034,
+      "bytes": 47498091569
+    },
+    "ge8MiB": {
+      "rows": 72,
+      "bytes": 13154972451
+    },
+    "1-8MiB": {
+      "rows": 1101,
+      "bytes": 5789978527
+    }
+  },
+  "limits": "bounded batch includes at most 16MiB; no full-lake compression extrapolation",
+  "selection": "contiguous bounded range",
+  "inventory-rows": 825390,
+  "requested-blocks": 16,
+  "next-row": 16,
+  "evaluated-on": "2026-10-11",
+  "evaluated-blocks": 16,
+  "unavailable-blocks": 0,
+  "budget-excluded-blocks": 0,
+  "evaluated-windows": 16
+}

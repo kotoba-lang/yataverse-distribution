@@ -77,6 +77,12 @@ CID hash rank とサイズ階層で48候補を選び、上限1 MiB/block、総�
 さらに別プロセスから元ブロックもネットワークも使わず4つの断片ファイルだけで18ファイルのSHAを照合した。
 記録は `results/lake-summary.json`, `results/independent-restore.json`。
 
+分割全量評価CLIも実lakeの行0–15で試験した。16/16ブロック、4,194,528 bytesを欠損なくCID検証し、
+solid-zstdのEC・メタデータ込み容量は2,410,305 bytes（57.46%）だった。
+こちらでも全15通りの2断片消失を各方式で検証した。`next-row=16`, `range-byte-coverage=true`,
+`full-byte-coverage=false` と区別して記録する。`results/lake-range-summary.json` を参照。
+8.07%の集合と57.46%の集合の差も、全量の実バイト評価が必要な理由になる。
+
 合成の世代バックアップでも、vector は通常のファイル単位圧縮を上回ったが、solid-zstd がさらに小さかった。
 ランダム・圧縮済み入力では圧縮利得がなく、EC込み約1.54倍になった。
 そのため「常にAIを使う」方式は採らず、データごとの実測で選択する。
