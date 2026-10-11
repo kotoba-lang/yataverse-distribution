@@ -55,6 +55,12 @@
              (head-get t/other "statement")))
     (.then (fn [r]
              (check "heads are per signer" (= 404 (:status r)))
+             (b/handle opts store now {:method "PUT" :path (str "/v1/blocks/" t/cbor-cid)
+                                       :headers (t/signed t/murakumo "PUT" t/cbor-cid now) :body t/cbor})))
+    (.then (fn [_] (head-put t/murakumo "manifest" 1 t/cbor-cid)))
+    (.then (fn [r]
+             (check "a head can name a held dag-cbor block (a Merkle-LSM manifest)"
+                    (and (= 200 (:status r)) (= t/cbor-cid (get-in r [:json "cid"]))))
              (b/handle-heads opts store now {:method "GET" :path (str "/v1/holds/" (subs (:did t/murakumo) 8))})))
     (.then (fn [r]
              (check "the holds listing answers for a signer" (and (= 200 (:status r)) (= ["bafkreib" "bafkreia"] (get-in r [:json "cids"]))))

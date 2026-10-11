@@ -35,7 +35,7 @@
 (defn fake-store []
   (let [blocks (atom {}) holds (atom #{}) puts (atom 0)]
     {:state {:blocks blocks :holds holds :puts puts}
-     :put! (fn [buf] (swap! puts inc) (let [c (g/raw-cid buf)] (swap! blocks assoc c buf) (js/Promise.resolve c)))
+     :put! (fn [codec buf] (swap! puts inc) (let [c (b/cid-of codec buf)] (swap! blocks assoc c buf) (js/Promise.resolve c)))
      :held? (fn [p] (js/Promise.resolve (contains? @holds p)))
      :hold! (fn [p] (swap! holds conj p) (js/Promise.resolve nil))
      :release! (fn [p] (swap! holds disj p) (js/Promise.resolve true))
@@ -50,6 +50,27 @@
 (def cid (g/raw-cid block))
 
 (defn req [method path headers body] {:method method :path path :headers headers :body body})
+
+;; a dag-cbor node ({"a": 1, "b": [1, 2]}) and an address under a codec we do
+;; not accept (dag-pb, 0x70) for the same bytes
+(def cbor (js/Buffer.from #js [0xa2 0x61 0x61 0x01 0x61 0x62 0x82 0x01 0x02]))
+(def cbor-cid (b/cid-of "dag-cbor" cbor))
+(def dag-pb-cid
+  (str "b" (g/b32-encode (js/Buffer.concat #js [(js/Buffer.from #js [0x01 0x70 0x12 0x20])
+                                                (-> (.createHash nc "sha256") (.update cbor) (.digest))]))))
+
+(check "raw and dag-cbor CIDs parse with their codec; dag-pb and junk do not"
+       (and (= "raw" (:codec (b/parse-cid cid)))
+            (= "dag-cbor" (:codec (b/parse-cid cbor-cid)))
+            (nil? (b/parse-cid dag-pb-cid))
+            (nil? (b/parse-cid "QmNotRaw"))
+            (nil? (b/parse-cid (str "b" (apply str (repeat 58 "a")))))))
+(check "cid-of matches graph-head's raw-cid for raw, and Kubo's dag-cbor address"
+       (and (= cid (g/raw-cid block))
+            (= "bafyreigvc53ts6gc362hln5c7hfrq6cpbqymymm2rz332bfuzxfvt2v6ye" cbor-cid)))
+(check "hashes-to? holds for the right bytes under either codec, and only them"
+       (and (b/hashes-to? cid block) (b/hashes-to? cbor-cid cbor)
+            (not (b/hashes-to? cbor-cid block)) (not (b/hashes-to? dag-pb-cid cbor))))
 
 (let [allow? (b/limiter 2 3)]
   (check "the rate limit allows a burst, then refills at the rate, per address"
@@ -77,7 +98,7 @@
                    (check "a forged signature is refused" (= 401 forged))
                    (check "a DELETE signature does not authorise a PUT" (= 401 wrong-method))
                    (check "bytes that do not hash to the CID are refused (400)" (= 400 wrong-bytes))
-                   (check "only raw CIDv1 sha2-256 addresses are accepted" (= 400 bad-cid))
+                   (check "only CIDv1 sha2-256 raw/dag-cbor addresses are accepted" (= 400 bad-cid))
                    (check "nothing reached the store" (zero? @(get-in store [:state :puts]))))))
         (.then #(h (req "PUT" (str "/v1/blocks/" cid) (signed murakumo "PUT" cid now) block)))
         (.then (fn [r]
@@ -112,6 +133,22 @@
                  (h (req "GET" "/v1/blocks/bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy" {} nil))))
         (.then (fn [r]
                  (check "an unknown block is 404" (= 404 (:status r)))
+                 (h (req "PUT" (str "/v1/blocks/" dag-pb-cid) (signed murakumo "PUT" dag-pb-cid now) cbor))))
+        (.then (fn [r]
+                 (check "a codec other than raw or dag-cbor is refused (400)" (= 400 (:status r)))
+                 (h (req "PUT" (str "/v1/blocks/" cbor-cid) (signed murakumo "PUT" cbor-cid now) block))))
+        (.then (fn [r]
+                 (check "dag-cbor bytes that do not hash to the CID are refused (400)" (= 400 (:status r)))
+                 (h (req "PUT" (str "/v1/blocks/" cbor-cid) (signed murakumo "PUT" cbor-cid now) cbor))))
+        (.then (fn [r]
+                 (check "a signed dag-cbor write is stored under its own codec and held (201)"
+                        (and (= 201 (:status r)) (= cbor-cid (get-in r [:json "cid"]))
+                             (.equals cbor (get @(get-in store [:state :blocks]) cbor-cid))
+                             (contains? @(get-in store [:state :holds]) (b/hold-path (:did murakumo) cbor-cid))))
+                 (h (req "GET" (str "/v1/blocks/" cbor-cid) {} nil))))
+        (.then (fn [r]
+                 (check "a dag-cbor block reads back, checked against its CID"
+                        (and (= 200 (:status r)) (.equals (:bytes r) cbor) (= cbor-cid (:cid r))))
                  (println (if (zero? @failures) "block-ingest gate: passed" (str "block-ingest gate: " @failures " failure(s)")))
                  (js/process.exit (if (zero? @failures) 0 1)))))))
 
