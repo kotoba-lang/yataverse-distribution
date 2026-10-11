@@ -14,4 +14,13 @@
   "research/storage_restore.cljk" ".cljs"
   "research/storage_cost.cljk" ".cljs"
   "research/lake_evaluate.cljk" ".cljs"
-  "research/lake_test.cljk" ".cljs"}}
+  "research/lake_test.cljk" ".cljs"
+  "research/stream_codec.cljk" ".js"
+  "research/lake_stream.cljk" ".js"
+  "research/stream_test.cljk" ".js"
+  "research/merge_evaluations.cljk" ".js"
+  "research/compare_costs.cljk" ".js"
+  "research/wan_trial.cljk" ".js"
+  "research/llm_sample.cljk" ".js"
+  "research/llm_codec.cljk" ".py"
+  "research/llm_restore.cljk" ".py"}}

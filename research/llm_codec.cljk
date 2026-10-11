@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Native Python runtime (.py origin), actual GPT-2 predictive arithmetic coding.
+Offline inference. CPU FP32, two threads, pinned snapshot. Experimental numerical
+contract only: same runtime is tested, cross-platform archival decoding is not.
+Run: python3 llm_codec.cljk --input FILE --out NEW --revision FULL_HF_SHA
+"""
+import argparse, bisect, hashlib, json, os, pathlib, platform, time, zlib
+import torch
+import numpy as np
+from huggingface_hub import snapshot_download
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+
+p=argparse.ArgumentParser()
+p.add_argument('--input',required=True);p.add_argument('--out',required=True);p.add_argument('--revision',required=True)
+p.add_argument('--byte-mapping',choices=['utf8','latin1'],default='latin1')
+a=p.parse_args()
+if len(a.revision)!=40 or any(c not in '0123456789abcdef' for c in a.revision):raise ValueError('pinned revision required')
+out=pathlib.Path(a.out);out.mkdir(parents=True,exist_ok=False)
+torch.set_num_threads(2);torch.set_num_interop_threads(1);torch.use_deterministic_algorithms(True)
+t=time.perf_counter()
+root=pathlib.Path(snapshot_download('openai-community/gpt2',revision=a.revision,cache_dir=str(out/'model-cache'),token=False,
+    allow_patterns=['config.json','model.safetensors','tokenizer_config.json','tokenizer.json','vocab.json','merges.txt']))
+model=GPT2LMHeadModel.from_pretrained(root,local_files_only=True,attn_implementation='eager').cpu().eval()
+tok=GPT2Tokenizer.from_pretrained(root,local_files_only=True)
+load_seconds=time.perf_counter()-t
+assets={f.name:{'bytes':f.stat().st_size,'sha256':hashlib.sha256(f.read_bytes()).hexdigest()} for f in root.iterdir() if f.is_file()}
+raw=pathlib.Path(a.input).read_bytes();encoding='utf-8' if a.byte_mapping=='utf8' else 'latin1'
+text=raw.decode(encoding,errors='strict');ids=tok.encode(text,add_special_tokens=False)
+if tok.decode(ids,clean_up_tokenization_spaces=False).encode(encoding)!=raw:raise ValueError('tokenizer is not byte reversible')
+FULL=1<<32;HALF=FULL>>1;QUARTER=HALF>>1;MASK=FULL-1
+
+class Encoder:
+    def __init__(self):self.low=0;self.high=MASK;self.pending=0;self.bits=[]
+    def emit(self,b):self.bits.append(b);self.bits.extend([1-b]*self.pending);self.pending=0
+    def put(self,cdf,s):
+        span=self.high-self.low+1;total=int(cdf[-1]);base=self.low
+        self.high=base+span*int(cdf[s+1])//total-1;self.low=base+span*int(cdf[s])//total
+        while True:
+            if self.high<HALF:self.emit(0)
+            elif self.low>=HALF:self.emit(1);self.low-=HALF;self.high-=HALF
+            elif self.low>=QUARTER and self.high<3*QUARTER:self.pending+=1;self.low-=QUARTER;self.high-=QUARTER
+            else:break
+            self.low*=2;self.high=self.high*2+1
+    def finish(self):
+        self.pending+=1;self.emit(0 if self.low<QUARTER else 1)
+        n=len(self.bits);self.bits.extend([0]*((-n)%8))
+        return bytes(sum(self.bits[i+j]<<(7-j) for j in range(8)) for i in range(0,len(self.bits),8)),n
+
+class Decoder:
+    def __init__(self,data):
+        self.data=data;self.offset=0;self.low=0;self.high=MASK;self.code=0
+        for _ in range(32):self.code=self.code*2+self.bit()
+    def bit(self):
+        pos=self.offset;self.offset+=1
+        if self.offset>len(self.data)*8+32:raise ValueError('truncated arithmetic stream')
+        return (self.data[pos//8]>>(7-pos%8))&1 if pos<len(self.data)*8 else 0
+    def get(self,cdf):
+        span=self.high-self.low+1;total=int(cdf[-1]);v=((self.code-self.low+1)*total-1)//span
+        s=bisect.bisect_right(cdf,v)-1;base=self.low
+        self.high=base+span*int(cdf[s+1])//total-1;self.low=base+span*int(cdf[s])//total
+        while True:
+            if self.high<HALF:pass
+            elif self.low>=HALF:self.low-=HALF;self.high-=HALF;self.code-=HALF
+            elif self.low>=QUARTER and self.high<3*QUARTER:self.low-=QUARTER;self.high-=QUARTER;self.code-=QUARTER
+            else:break
+            self.low*=2;self.high=self.high*2+1;self.code=self.code*2+self.bit()
+        return s
+
+def distribution(previous,past):
+    with torch.inference_mode():r=model(torch.tensor([[previous]]),past_key_values=past,use_cache=True)
+    probs=torch.softmax(r.logits[0,-1].double(),dim=-1).numpy()
+    freq=(probs*((1<<24)-len(probs))).astype(np.int64)+1
+    cdf=np.concatenate([np.zeros(1,dtype=np.int64),np.cumsum(freq)])
+    return cdf,r.past_key_values
+
+t=time.perf_counter();enc=Encoder();past=None;previous=tok.eos_token_id;ch=hashlib.sha256()
+for i,s in enumerate(ids):
+    if i%256==0:past=None;previous=tok.eos_token_id
+    cdf,past=distribution(previous,past);ch.update(cdf.astype('<i8').tobytes());enc.put(cdf,s);previous=s
+data,bits=enc.finish();encode_seconds=time.perf_counter()-t
+header={'schema':'yataverse-gpt2-arithmetic/v1','revision':a.revision,'model':'openai-community/gpt2','tokens':len(ids),
+    'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest(),'cdfSHA':ch.hexdigest(),'contextResetTokens':256,
+    'byteMapping':a.byte_mapping,'runtime':{'python':platform.python_version(),'torch':torch.__version__,'transformers':__import__('transformers').__version__,
+        'dtype':'CPU FP32 / softmax FP64','threads':2},'assets':assets,'payloadSHA':hashlib.sha256(data).hexdigest()}
+hb=json.dumps(header,separators=(',',':'),sort_keys=True).encode();container=b'YATAL01\n'+len(hb).to_bytes(4,'big')+hb+data
+(out/'pack.bin').write_bytes(container)
+# Decoder consumes the saved compressed stream; no original token ids used.
+saved=(out/'pack.bin').read_bytes();hsize=int.from_bytes(saved[8:12],'big');h=json.loads(saved[12:12+hsize]);body=saved[12+hsize:]
+if hashlib.sha256(body).hexdigest()!=h['payloadSHA']:raise ValueError('payload hash')
+t=time.perf_counter();dec=Decoder(body);past=None;previous=tok.eos_token_id;decoded=[];dh=hashlib.sha256()
+for i in range(h['tokens']):
+    if i%256==0:past=None;previous=tok.eos_token_id
+    cdf,past=distribution(previous,past);dh.update(cdf.astype('<i8').tobytes());s=dec.get(cdf);decoded.append(s);previous=s
+restored=tok.decode(decoded,clean_up_tokenization_spaces=False).encode(encoding);decode_seconds=time.perf_counter()-t
+if hashlib.sha256(restored).hexdigest()!=h['sha256'] or len(restored)!=h['bytes'] or dh.hexdigest()!=h['cdfSHA']:raise ValueError('decode differs')
+(out/'restored.bin').write_bytes(restored)
+report={'schema':'yataverse-real-llm-measurement/v1','header':header,'originalBytes':len(raw),'tokens':len(ids),'arithmeticBits':bits,
+    'payloadBytes':len(data),'containerBytes':len(container),'modelAssetBytes':sum(x['bytes'] for x in assets.values()),
+    'deflateBytes':len(zlib.compress(raw,9)),'loadSeconds':load_seconds,'encodeSeconds':encode_seconds,'decodeSeconds':decode_seconds,
+    'encodeBytesPerSecond':len(raw)/encode_seconds,'decodeBytesPerSecond':len(raw)/decode_seconds,'exactRoundtrip':True,
+    'codeSHA':hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(),'host':platform.node(),
+    'limits':'bounded actual-lake bytes; reversible latin1 mapping or strict UTF8; same process CPU runtime; full lake or cross-platform decoding not measured; model custody not included in container size'}
+(out/'report.json').write_text(json.dumps(report,indent=2));print(json.dumps(report),flush=True)

@@ -1,0 +1,12 @@
+'use strict';
+const fs=require('node:fs'),path=require('node:path'),z=require('node:zlib');
+const {sha,recover}=require('./stream_codec.cljk');
+const [root,out]=process.argv.slice(2);if(!root||!out||fs.existsSync(out))throw Error('new output required');
+const m=JSON.parse(fs.readFileSync(path.join(root,'manifest.json'))),r=JSON.parse(fs.readFileSync(path.join(root,'trusted-receipt.json')));
+const packed=recover(m,r['manifest-sha256'],[0,1,2,3,4,5].map(i=>fs.readFileSync(path.join(root,`shard-${i}.bin`))));
+const raw=z.zstdDecompressSync(packed,{maxOutputLength:48*1024*1024}),trust=JSON.parse(fs.readFileSync(path.join(root,'raw-trust.json')));
+if(sha(raw)!==trust.rawSHA||raw.subarray(0,8).toString()!=='YATAS01\n')throw Error('raw pack differs');
+const n=raw.readUInt32BE(8),meta=JSON.parse(raw.subarray(12,12+n));const f=meta.files[0],bytes=raw.subarray(12+n,12+n+f.bytes);
+if(sha(bytes)!==f.sha256)throw Error('file hash differs');fs.mkdirSync(out,{recursive:true});const sample=bytes.subarray(0,Math.min(4096,bytes.length));
+fs.writeFileSync(path.join(out,'input.bin'),sample,{flag:'wx'});fs.writeFileSync(path.join(out,'input.json'),JSON.stringify({...f,bytes:sample.length,sha256:sha(sample),selection:'first 4096 bytes of first CID-verified lake block; no text selection'}),{flag:'wx'});
+console.log(JSON.stringify({bytes:sample.length,sha256:sha(sample)}));

@@ -1,0 +1,45 @@
+// Read and repair only dedicated research copies. Never disrupt a production WAN.
+'use strict';
+const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process'),z=require('node:zlib');
+const {performance}=require('node:perf_hooks'),{sha,json,encode,recover}=require('./stream_codec.cljk');
+const [configFile,out]=process.argv.slice(2);if(!configFile||!out||fs.existsSync(out))throw Error('new output required');
+const config=JSON.parse(fs.readFileSync(configFile));if(config.sites.length!==2||new Set(config.sites.map(s=>s.domain)).size!==2)throw Error('two declared WAN domains required');
+for(const s of config.sites){if(!/^[a-zA-Z0-9@._-]+$/.test(s.host)||!/^\/[a-zA-Z0-9/._-]+\/github\/workspaces\/codex\/yataverse-storage-rd-20261011\/wan-copy-0[12]$/.test(s.root))throw Error('dedicated allowlist only');}
+const quote=s=>"'"+s.replaceAll("'","'\\''")+"'",now=()=>performance.now();
+fs.mkdirSync(out,{recursive:true});const rows=[],custody=[];
+function ssh(site,command,input){const t=now();const r=cp.spawnSync('ssh',['-o','BatchMode=yes','-o','ConnectTimeout=10',site.host,command],{input,timeout:60000,maxBuffer:48*1024*1024});if(r.status!==0)throw Error(`research ssh failed: ${r.stderr?.toString().slice(0,400)}`);return {bytes:r.stdout,ms:now()-t};}
+function read(site,name){return ssh(site,'cat '+quote(site.root+'/'+name));}
+const syncCode="const fs=require('fs'),p=require('path'),root=process.argv[1];let bytes=0,allocated=0,files=0;for(const name of fs.readdirSync(root)){const f=p.join(root,name),s=fs.lstatSync(f);if(!s.isFile())throw Error('unexpected custody entry');const fd=fs.openSync(f,'r');try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}bytes+=s.size;allocated+=s.blocks*512;files++}const d=fs.openSync(root,'r');try{fs.fsyncSync(d)}finally{fs.closeSync(d)};console.log(JSON.stringify({files,bytes,allocatedBytes:allocated,fsync:true}))";
+for(const site of config.sites){const r=ssh(site,quote(site.node)+' -e '+quote(syncCode)+' '+quote(site.root));custody.push({site:site.domain,...JSON.parse(r.bytes)});}
+const manifestTrust=config.manifestSHA,rawTrust=config.rawSHA;
+for(const lost of config.sites){
+ const survivor=config.sites.find(s=>s!==lost),manifestRead=read(survivor,'manifest.json'),manifest=JSON.parse(manifestRead.bytes);
+ if(sha(json(manifest))!==manifestTrust)throw Error('surviving manifest untrusted');
+ for(const degraded of [false,true]){
+  const selectedManifest=degraded?read(survivor,'manifest-2.json'):manifestRead;
+  if(sha(selectedManifest.bytes)!==manifestTrust)throw Error('surviving backup manifest untrusted');
+  let downloadBytes=selectedManifest.bytes.length,downloadMs=selectedManifest.ms;const shards=Array(6).fill(null);
+  for(let i=degraded?2:0;i<6;i++){const r=read(survivor,`shard-${i}.bin`);shards[i]=r.bytes;downloadBytes+=r.bytes.length;downloadMs+=r.ms;}
+  const t=now(),payload=recover(manifest,manifestTrust,shards),decoded=z.zstdDecompressSync(payload,{maxOutputLength:48*1024*1024});
+  if(sha(decoded)!==rawTrust)throw Error('WAN recovered bytes differ');const decodeMs=now()-t;
+  rows.push({lostSite:lost.domain,survivor:survivor.domain,additionalLostShardPositions:degraded?[0,1]:[],downloadBytes,downloadMs,decodeMs,exactRawContainerSHA:sha(decoded),verified:true});
+ }
+ // Recreate lost-site custody from four survivors, not the source lake or encoder.
+ const kept=[null,null,...[2,3,4,5].map(i=>read(survivor,`shard-${i}.bin`).bytes)];const rt=now(),ec=encode(recover(manifest,manifestTrust,kept));const recreateMs=now()-rt;
+ const target=lost.root+'-repair-'+survivor.domain;if(!/^[a-zA-Z0-9._-]+$/.test(survivor.domain))throw Error('domain label');
+ ssh(lost,'mkdir '+quote(target));let uploadBytes=0,uploadMs=0;
+ const writeCode="const fs=require('fs'),p=process.argv[1];const b=fs.readFileSync(0);const fd=fs.openSync(p,'wx');try{fs.writeFileSync(fd,b);fs.fsyncSync(fd)}finally{fs.closeSync(fd)};const d=fs.openSync(require('path').dirname(p),'r');try{fs.fsyncSync(d)}finally{fs.closeSync(d)}";
+ const write=(name,b)=>{const r=ssh(lost,quote(lost.node)+' -e '+quote(writeCode)+' '+quote(target+'/'+name),b);uploadBytes+=b.length;uploadMs+=r.ms;};
+ ec.shards.forEach((b,i)=>write(`shard-${i}.bin`,b));write('manifest.json',json(ec.manifest));write('trusted-receipt.json',json(ec.receipt));
+ for(const i of [2,4]){write(`manifest-${i}.json`,json(ec.manifest));write(`receipt-${i}.json`,json(ec.receipt));}
+ let readbackBytes=0,readbackMs=0;for(let i=0;i<6;i++){const r=ssh(lost,'cat '+quote(target+`/shard-${i}.bin`));if(sha(r.bytes)!==ec.manifest.shards[i])throw Error('repair readback differs');readbackBytes+=r.bytes.length;readbackMs+=r.ms;}
+ for(const name of ['manifest.json','manifest-2.json','manifest-4.json']){const mr=ssh(lost,'cat '+quote(target+'/'+name));if(sha(mr.bytes)!==ec.manifestSHA)throw Error('repair manifest readback differs');}
+ for(const name of ['trusted-receipt.json','receipt-2.json','receipt-4.json']){const rr=ssh(lost,'cat '+quote(target+'/'+name));if(sha(rr.bytes)!==sha(json(ec.receipt)))throw Error('repair receipt readback differs');}
+ rows.push({repairSite:lost.domain,sourceSite:survivor.domain,recreateMs,uploadBytes,uploadMs,readbackBytes,readbackMs,repairSHA:ec.manifestSHA,readbackVerified:true});
+}
+const report={schema:'yataverse-wan-research/v1',rows,custody,sites:config.sites.map(s=>({domain:s.domain,host:s.host})),manifestSHA:manifestTrust,rawSHA:rawTrust,
+    guarantee:'two complete EC copies across two declared WAN domains; any one site plus any two surviving shard erasures; trusted manifest and codec availability assumed',
+    injection:'client withholds all requests to lost site; no physical network shutdown; six shards read over real SSH links; fsynced repaired copies read back',
+    physicalProfile:'12 shards, 6 manifests and 6 receipts; twice one EC physical footprint; repair copies additional test storage',
+    limits:'one bounded pack; actual link outage and full lake WAN restore not tested; caches not flushed; no annual durability or provider SLA equivalence established',codeSHA:sha(fs.readFileSync(__filename))};
+fs.writeFileSync(path.join(out,'report.json'),json(report),{flag:'wx'});console.log(JSON.stringify(report));

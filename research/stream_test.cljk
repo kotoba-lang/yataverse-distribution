@@ -1,0 +1,26 @@
+'use strict';
+const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process'),crypto=require('node:crypto'),assert=require('node:assert/strict');
+const {encode,recover,sha,json}=require('./stream_codec.cljk');
+const out=process.argv[2];if(!out||fs.existsSync(out))throw Error('new fixture root required');fs.mkdirSync(out,{recursive:true});
+let checks=0;for(const n of [0,1,3,4,5,257,65537]){const bytes=crypto.randomBytes(n),e=encode(bytes);for(let a=0;a<6;a++)for(let b=a+1;b<6;b++){const s=e.shards.slice();s[a]=s[b]=null;assert.deepEqual(recover(e.manifest,e.manifestSHA,s),bytes);checks++;}
+ const s=e.shards.map(b=>Buffer.from(b));s[0][0]^=1;s[1]=null;assert.deepEqual(recover(e.manifest,e.manifestSHA,s),bytes);checks++;
+ assert.throws(()=>recover(e.manifest,e.manifestSHA,e.shards.map((b,i)=>i<3?null:b)));checks++;
+ assert.throws(()=>recover({...e.manifest,bytes:n+1},e.manifestSHA,e.shards));checks++;
+}
+const b32='abcdefghijklmnopqrstuvwxyz234567';function base32(bytes){let acc=0,bits=0,out='';for(const b of bytes){acc=(acc<<8)|b;bits+=8;while(bits>=5){bits-=5;out+=b32[(acc>>>bits)&31];}}if(bits)out+=b32[(acc<<(5-bits))&31];return out;}
+const flat=path.join(out,'flatfs');const bytes=Buffer.from('actual bytes fixture '.repeat(300));const digest=crypto.createHash('sha256').update(bytes).digest(),cid='b'+base32(Buffer.concat([Buffer.from([1,85,18,32]),digest]));
+const key=base32(Buffer.concat([Buffer.from([18,32]),digest])).toUpperCase(),dir=path.join(flat,key.slice(-3,-1));fs.mkdirSync(dir,{recursive:true});const f=path.join(dir,key+'.data');fs.writeFileSync(f,bytes);
+const inv=path.join(out,'inventory.jsonl');fs.writeFileSync(inv,JSON.stringify({cid,bytes:bytes.length})+'\n');
+function run(name){return cp.spawnSync(process.execPath,[path.join(__dirname,'lake_stream.cljk'),'--inventory',inv,'--flatfs',flat,'--out',path.join(out,name)],{encoding:'utf8',timeout:30000});}
+assert.equal(run('complete').status,0);const report=JSON.parse(fs.readFileSync(path.join(out,'complete','summary.json')));assert.equal(report.fullByteCoverage,true);assert.equal(report.totals.readBytes,bytes.length);checks+=3;
+fs.unlinkSync(f);assert.equal(run('missing').status,2);assert.equal(JSON.parse(fs.readFileSync(path.join(out,'missing','summary.json'))).fullByteCoverage,false);checks+=2;
+fs.writeFileSync(f,Buffer.alloc(bytes.length));assert.notEqual(run('corrupt').status,0);assert.equal(fs.existsSync(path.join(out,'corrupt','summary.json')),false);checks+=2;
+fs.writeFileSync(f,bytes);fs.appendFileSync(inv,fs.readFileSync(inv));assert.notEqual(run('duplicate').status,0);checks++;
+fs.writeFileSync(inv,JSON.stringify({cid,bytes:bytes.length})+'\n');
+for(const name of ['complete','missing']){
+ const ledger=path.join(out,name,'blocks.jsonl'),second=path.join(out,'union-'+name);
+ const r=cp.spawnSync(process.execPath,[path.join(__dirname,'lake_stream.cljk'),'--inventory',inv,'--flatfs',flat,'--exclude-ledger',ledger,'--exclude-ledger-sha',sha(fs.readFileSync(ledger)),'--out',second],{encoding:'utf8'});assert.equal(r.status,0);checks++;
+ const merged=path.join(out,'merged-'+name+'.json');const m=cp.spawnSync(process.execPath,[path.join(__dirname,'merge_evaluations.cljk'),path.join(out,name),second,merged],{encoding:'utf8'});assert.equal(m.status,0);assert.equal(JSON.parse(fs.readFileSync(merged)).fullByteCoverage,true);checks+=2;
+}
+const secondary=path.join(out,'union-complete');const ledger=path.join(secondary,'blocks.jsonl');fs.writeFileSync(ledger,JSON.stringify({row:0,cid,bytes:bytes.length,status:'missing'})+'\n');assert.notEqual(cp.spawnSync(process.execPath,[path.join(__dirname,'merge_evaluations.cljk'),path.join(out,'complete'),secondary,path.join(out,'bad-union.json')]).status,0);checks++;
+console.log(JSON.stringify({checks,patterns:'all 15 two-erasure pairs for 7 sizes, corruption, insufficient shards, manifest tamper, full byte coverage and fail-closed census'}));
