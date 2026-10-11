@@ -7,4 +7,11 @@
   "src/yataverse/distribution/gossip_bridge.cljk" ".cljc"
   "test/yataverse/distribution/planner_test.cljk" ".cljs"
   "test/yataverse/distribution/gossip_bridge_test.cljk" ".cljs"
-  "test/yataverse/distribution/test_runner.cljk" ".cljs"}}
+  "test/yataverse/distribution/test_runner.cljk" ".cljs"
+  "research/lossless_storage.cljk" ".cljs"
+  "research/storage_test.cljk" ".cljs"
+  "research/storage_bench.cljk" ".cljs"
+  "research/storage_restore.cljk" ".cljs"
+  "research/storage_cost.cljk" ".cljs"
+  "research/lake_evaluate.cljk" ".cljs"
+  "research/lake_test.cljk" ".cljs"}}

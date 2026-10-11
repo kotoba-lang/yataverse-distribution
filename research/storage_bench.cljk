@@ -1,0 +1,89 @@
+(ns storage-bench (:require [lossless-storage :as s]))
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+(def clock (.-performance (js/require "node:perf_hooks")))
+(def args (vec (array-seq (.-argv js/process))))
+(def source-ref (or (second (drop-while #(not= % "--source-ref") args)) "HEAD"))
+(when-not (or (= "HEAD" source-ref) (re-matches #"[0-9a-f]{40}" source-ref))
+  (throw (ex-info "source ref must be HEAD or a full commit SHA" {})))
+(def output (or (second (drop-while #(not= % "--out") args))
+                (throw (ex-info "--out <new-output-directory> required" {}))))
+(when (.existsSync fs output) (throw (ex-info "output must be a new directory" {})))
+(.mkdirSync fs output #js {:recursive true})
+(defn random-bytes [size seed]
+  (let [buf (js/Buffer.alloc size)]
+    (loop [i 0 x seed]
+      (when (< i size)
+        (let [y (bit-xor x (bit-shift-left x 13))
+              y (bit-xor y (unsigned-bit-shift-right y 17))
+              y (bit-xor y (bit-shift-left y 5))]
+          (aset buf i (bit-and y 255)) (recur (inc i) y)))) buf))
+(defn git [args]
+  (let [r (.spawnSync cp "git" (clj->js args) #js {:maxBuffer 2000000})]
+    (when-not (= 0 (.-status r)) (throw (ex-info "git source read failed" {}))) (.-stdout r)))
+(def base (random-bytes 32768 291))
+(def suites
+  [{:name "tracked-source" :provenance "public repository HEAD; no working-tree/untracked bytes"
+    :files (mapv (fn [p] {:name p :bytes (git ["show" (str source-ref ":" p)])})
+                 ["README.md" "src/yataverse/distribution/planner.cljk"
+                  "src/yataverse/distribution/gossip_bridge.cljk"
+                  "src/yataverse/distribution/filecoin_archive.cljk" "deploy/raw_block_store.cljk"])}
+   {:name "versioned-binary" :provenance "synthetic fixed-seed random anchor, eight revisions, sparse edits"
+    :files (mapv (fn [revision]
+                   (let [buf (js/Buffer.from base)]
+                     (doseq [i (range revision)] (aset buf (+ 200 (* i 3701)) (mod (+ revision i 17) 256)))
+                     {:name (str "revision-" revision) :bytes buf})) (range 8))}
+   {:name "incompressible" :provenance "synthetic xorshift bytes; negative control"
+    :files [{:name "random.bin" :bytes (random-bytes 65536 791)}]}
+   {:name "already-compressed" :provenance "synthetic deflate of random bytes; negative control"
+    :files [{:name "compressed.bin" :bytes (s/compress (random-bytes 65536 119) nil)}]}])
+(defn write-case [label packed ec]
+  (let [dir (.join path output label)
+        manifest (:manifest ec)
+        receipt {:manifest-sha256 (:manifest-sha256 ec) :payload-sha256 (s/sha (:bytes packed))}
+        mb (s/json-bytes manifest) rb (s/json-bytes receipt)]
+    (doseq [i (range 6)]
+      (let [node (.join path dir (str "node-" i))]
+        (.mkdirSync fs node #js {:recursive true})
+        (.writeFileSync fs (.join path node "shard.bin") (nth (:shards ec) i))
+        (when (contains? #{0 2 4} i)
+          (.writeFileSync fs (.join path node "manifest.json") mb)
+          (.writeFileSync fs (.join path node "receipt.json") rb))))
+    ;; Local bootstrap copy models out-of-band trust, not cryptographic signing.
+    (.writeFileSync fs (.join path dir "trusted-receipt.json") rb)
+    (+ (reduce + 0 (map #(.-length %) (:shards ec))) (* 3 (+ (.-length mb) (.-length rb))))))
+(def rows
+  (vec (for [suite suites mode [:plain :cdc :vector :solid-zstd :adaptive]]
+         (let [start (.now clock)
+               p (case mode :solid-zstd (s/solid-pack (:files suite)) :adaptive (s/adaptive-pack (:files suite))
+                       (s/pack (:files suite) mode))
+               encoded-at (.now clock)
+               e (s/shard (:bytes p))
+               sharded-at (.now clock)
+               failures (atom 0)
+               restore-start (.now clock)]
+           (doseq [a (range 6) b (range (inc a) 6)]
+             (let [bytes (s/recover (:manifest e) (:manifest-sha256 e) (assoc (:shards e) a nil b nil))
+                   files (s/unpack bytes (s/sha (:bytes p)))]
+               (when-not (every? true? (map #(.equals (:bytes %1) (:bytes %2)) (:files suite) files))
+                 (swap! failures inc))))
+           (when (pos? @failures) (throw (ex-info "benchmark recovery failed" {})))
+           (let [end (.now clock)
+                 physical (write-case (str (:name suite) "-" (name mode)) p e)
+                 ms (fn [x y] (- y x))]
+             {:suite (:name suite) :provenance (:provenance suite) :mode (name mode)
+              :selected-mode (:selected-mode p) :logical-bytes (:input-bytes p) :payload-bytes (.-length (:bytes p))
+              :physical-bytes physical :physical-ratio (/ physical (:input-bytes p))
+              :records (:records p) :dictionary-records (:dictionary-records p)
+              :transient-vector-bytes (:index-vector-bytes p) :transient-anchor-bytes (:index-anchor-bytes p)
+              :encode-ms (ms start encoded-at) :shard-ms (ms encoded-at sharded-at)
+              :mean-recovery-unpack-ms (/ (ms restore-start end) 15)
+              :two-erasure-patterns-verified 15})))))
+(def report {:schema "yataverse-storage-benchmark/v1" :source-commit (.trim (.toString (git ["rev-parse" source-ref])))
+             :node-version (.-version js/process) :platform (.-platform js/process) :arch (.-arch js/process)
+             :limits "offline local simulation; lexical vectors; no LLM, encryption, WAN, repair daemon or provider SLA"
+             :physical-accounting "6 padded shards + 3 manifests + 3 receipts; encoder vectors transient; fs allocation excluded"
+             :rows rows})
+(.writeFileSync fs (.join path output "report.json") (js/JSON.stringify (clj->js report) nil 2))
+(println (js/JSON.stringify (clj->js report) nil 2))
