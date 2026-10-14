@@ -1,0 +1,83 @@
+{
+  "schema": "yataverse-synthetic-tape-wan-smoke/v1",
+  "syntheticNotLake": true,
+  "restore": {
+    "schema": "yataverse-full-wan-restore/v1",
+    "rootSHA": "0cfda45078fe0bf670cf68783d81ad70dd6379688f1e077471087807d9e8c546",
+    "inventorySHA": "864983d63fc06424a774dae6f01d6270d80d2ef515649907830386f8be6de1ba",
+    "verifiedBlocks": 2,
+    "verifiedBytes": 18942371,
+    "packs": 2,
+    "wireBytes": 18902680,
+    "decodeMs": 2472.657792,
+    "repairMs": 866.7555839999995,
+    "finalizeMs": 64852.71975,
+    "storageBackend": "shard-tapes",
+    "wallMs": 70716.365666,
+    "indexRebuiltSHA": "98b29003709705483230593cdcdd42444243f5f315a6ea555eb052f6067970e9",
+    "keyFromSurvivorBackup": true,
+    "metadataFromSurvivorBackup": true,
+    "indexSupplied": false,
+    "sourceLakeRead": false,
+    "rawArchiveBytes": 18942371,
+    "rawArchiveSHA": "8c859a925f541eb1b947a7af2d57e662b883b5adc93033dbd7d5d0477c20dcda",
+    "repair": {
+      "files": 43,
+      "bytes": 47340830,
+      "allocatedBytes": 47452160
+    },
+    "coldReceiver": true,
+    "fsync": true,
+    "complete": true,
+    "limits": "logical read exclusion, warm caches, dedicated study keys; source-site key compromise and annual durability not qualified"
+  },
+  "audit": {
+    "schema": "yataverse-persistent-readback/v1",
+    "rootSHA": "0cfda45078fe0bf670cf68783d81ad70dd6379688f1e077471087807d9e8c546",
+    "inventoryBytes": 18942371,
+    "inventoryRows": 2,
+    "packs": 2,
+    "shards": 12,
+    "allControlCopies": 3,
+    "allMetadataCopies": 3,
+    "readBytes": 28396092,
+    "rawArchive": {
+      "bytes": 18942371,
+      "verifiedCIDs": 2,
+      "sha256": "8c859a925f541eb1b947a7af2d57e662b883b5adc93033dbd7d5d0477c20dcda",
+      "trustedIndexSHA": "98b29003709705483230593cdcdd42444243f5f315a6ea555eb052f6067970e9",
+      "independentReadback": true
+    },
+    "wallMs": 13467.52975,
+    "storageBackend": "shard-tapes",
+    "conversion": null,
+    "allocation": {
+      "files": 44,
+      "bytes": 47341786,
+      "allocatedBytes": 47456256
+    },
+    "custodyAllocation": {
+      "files": 40,
+      "bytes": 28396314,
+      "allocatedBytes": 28499968
+    },
+    "controlAllocation": {
+      "files": 30,
+      "bytes": 77517,
+      "allocatedBytes": 147456
+    },
+    "filesystem": {
+      "capacityBytes": 20000379199488,
+      "availableBytes": 5275032293376
+    },
+    "verified": true,
+    "coldProcess": true,
+    "fsync": true,
+    "limits": "filesystem readback, no power-cut or cache eviction; no service files changed"
+  },
+  "logSHA": {
+    "smoke-wan-02.log": "f5698033488728961efaba9088bd243109e9708d5d37306a454cef4f4a6f15c4",
+    "smoke-audit-02.log": "4b513cdf3b9d86827bd44bb584be7b19657ddc24c76e9ba686e63d9f5124d04e"
+  },
+  "limits": "Small random fixture over existing SSH path; no physical WAN shutdown or power cut; no external providers tested"
+}

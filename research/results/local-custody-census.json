@@ -1,0 +1,42 @@
+{
+  "schema": "yataverse-lake-stream/v1",
+  "inventorySHA": "2334fb3efefc460a9ed1301aecfa2b5183133fc0bb0208a93692617672eb8a91",
+  "inventoryRows": 825390,
+  "inventoryBytes": 91395086102,
+  "start": 0,
+  "end": 825390,
+  "totals": {
+    "readBlocks": 479053,
+    "readBytes": 58315106160,
+    "missingBlocks": 346337,
+    "missingBytes": 33079979942,
+    "packCount": 3593,
+    "rawContainerBytes": 58397334121,
+    "zstdPayloadBytes": 15545057420,
+    "ecPhysicalBytes": 23325563445,
+    "readHashMs": 187840.18929103692,
+    "encodeMs": 498563.8597980009,
+    "erasureMs": 73612.1100329982,
+    "restoreMs": 118407.959067002
+  },
+  "wallMs": 926769.984791,
+  "complete": true,
+  "fullByteCoverage": false,
+  "host": "main-2.local",
+  "platform": "darwin",
+  "arch": "arm64",
+  "node": "v26.0.0",
+  "zstd": {
+    "level": 9,
+    "workers": 0
+  },
+  "sourceSHA": "d0db498d84743b6dc59a3ce63708955cb6d0ae5fca827390933e8545c2f73d99",
+  "codecSHA": "b2d876cde91702417d3740be1b07d67974e0670d2fffdea79a276bdd603e4769",
+  "limits": "frozen inventory; source signatures/head freshness and annual durability not established; temporary encoding not full custody; two-site EC copies cost 2x ecPhysicalBytes",
+  "sourceSHAOriginallyReported": "09368c7c187a78022070910f962c228845ab060e90a8e51a47275416bbef710b",
+  "sourceSHAProvenance": "working source edited while running; preserved pre-invocation snapshot lake_stream_workers.cljk on Xavier has this hash; unmodified original report saved alongside",
+  "audit": {
+    "blocksLedgerSHA": "7ad283b60c63fcfe2312cdcd8847b52f7b575dd99103b9701220e943c1a347ce",
+    "packsLedgerSHA": "f7e3fc1fbcc8ca08e51e78a48565873da37000ea42885e508e9d1ae4830b5ecd"
+  }
+}

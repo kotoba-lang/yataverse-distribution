@@ -1,0 +1,18 @@
+// Framed SSH stream from exactly one site; degraded mode never reads primary controls or shards 0/1.
+'use strict';
+const fs=require('node:fs'),path=require('node:path'),{once}=require('node:events');
+const {sha,regular,verifyRoot}=require('./custody_common.cljk');
+const {hasTapes,TapeReader}=require('./custody_tapes.cljk');
+const [root,trustFile,mode='degraded',rateString='16']=process.argv.slice(2),rate=Number(rateString)*1024*1024;
+if(!root||!['healthy','degraded'].includes(mode)||!Number.isFinite(rate)||rate<1024*1024||rate>32*1024*1024)throw Error('export arguments');
+const trust=JSON.parse(regular(trustFile)),copy=mode==='degraded'?2:0,control=path.join(root,'control',String(copy));
+const rootBytes=regular(path.join(control,'root.json')),body=verifyRoot(rootBytes,trust),cat=regular(path.join(control,'catalog.jsonl'));
+if(sha(cat)!==body.catalogSHA)throw Error('catalog tamper');
+let count=0,total=0,began=performance.now();
+async function send(name,b){const meta=Buffer.from(JSON.stringify({name,bytes:b.length})),h=Buffer.alloc(8);h.writeUInt32BE(meta.length,0);h.writeUInt32BE(b.length,4);for(const v of [h,meta,b])if(!process.stdout.write(v))await once(process.stdout,'drain');total+=8+meta.length+b.length;const delay=total/rate*1000-(performance.now()-began);if(delay>0)await new Promise(r=>setTimeout(r,delay));}
+(async()=>{for(const name of ['root.json','catalog.jsonl','inventory.jsonl','data-key.bin'])await send(name,regular(path.join(control,name)));
+ // The supplied index is intentionally withheld. The receiver must rebuild it from authenticated packs.
+ for(const name of Object.keys(body.assets)){const b=regular(path.join(control,name));if(sha(b)!==body.assets[name])throw Error('recovery software tamper');await send('asset/'+name,b);}
+ const catalog=cat.toString().trimEnd().split('\n').map(JSON.parse),tapes=hasTapes(root)?new TapeReader(root,catalog,trust.rootSHA,body.catalogSHA,mode==='degraded'?[2,3,4,5]:[0,1,2,3,4,5],copy):null;
+ for(const p of catalog){if(!/^[ps]-\d{6}$/.test(p.id))throw Error('pack path');const dir=path.join(root,'packs',p.id),m=tapes?Buffer.from(JSON.stringify(tapes.metadata[count].manifest)):regular(path.join(dir,`manifest-${copy}.json`));if(sha(m)!==p.manifestSHA)throw Error('pack manifest tamper');await send(p.id+'/manifest.json',m);for(let i=mode==='degraded'?2:0;i<6;i++)await send(p.id+`/shard-${i}.bin`,tapes?tapes.shard(count,i):regular(path.join(dir,`shard-${i}.bin`),48*1024*1024));count++;if(count%100===0)process.stderr.write(JSON.stringify({stage:'export',packs:count,bytes:total,wallSeconds:(performance.now()-began)/1000})+'\n');}if(tapes)tapes.close();
+ await send('end',Buffer.from(JSON.stringify({packs:count,bytes:total,mode,controlCopy:copy,indexWithheld:true,shardPositions:mode==='degraded'?[2,3,4,5]:[0,1,2,3,4,5]})));})().catch(e=>{process.stderr.write(e.message+'\n');process.exitCode=1;});

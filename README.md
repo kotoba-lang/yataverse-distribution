@@ -43,7 +43,17 @@ The name is a family name: the serving family of `yataverse.com`
   `respond-to-want`). Socket-free by design; the transport adapter
   (murakumo overlay QUIC) is the remaining host shell (ADR-2607023100).
 
-## Test
+## Lossless lake storage research (2026-10-11)
+
+[research/README.md](research/README.md) contains an offline, executable
+comparison of conventional compression, content-defined deduplication,
+vector-guided dictionaries, and systematic 4+2 erasure coding. It includes a
+full frozen inventory census and CID-verified sampled lake byte measurements.
+The tested sample favors solid zstd over vector-guided compression; neither
+LLM compression nor provider cost/SLA superiority is qualified. This research
+does not change the serving path or custody configuration.
+
+## Service tests
 
 ```sh
 kbb --backend sci --classpath "src:test:../io-libp2p/src" \

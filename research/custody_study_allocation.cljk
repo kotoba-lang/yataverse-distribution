@@ -1,0 +1,11 @@
+// Aggregate only this study's regular files; count same-inode hardlinks once, never read key contents.
+'use strict';
+const fs=require('node:fs'),path=require('node:path'),{sha,json,durable}=require('./custody_common.cljk');
+const [root,out]=process.argv.slice(2);if(!out||fs.existsSync(out)||!path.isAbsolute(root)||path.basename(root)!=='yataverse-storage-persistent-20261011'||!root.includes('/github/workspaces/codex/'))throw Error('dedicated study root and new output required');
+const seen=new Set(),stack=[root];let files=0,uniqueFiles=0,hardlinkAliases=0,symlinks=0,other=0,logicalBytes=0n,logicalAllocated=0n,uniqueBytes=0n,uniqueAllocated=0n;
+while(stack.length){const p=stack.pop(),s=fs.lstatSync(p,{bigint:true});if(s.isSymbolicLink()){symlinks++;continue;}if(s.isDirectory()){for(const name of fs.readdirSync(p))stack.push(path.join(p,name));continue;}if(!s.isFile()){other++;continue;}
+ files++;logicalBytes+=s.size;logicalAllocated+=s.blocks*512n;const id=s.dev+':'+s.ino;if(seen.has(id)){hardlinkAliases++;continue;}seen.add(id);uniqueFiles++;uniqueBytes+=s.size;uniqueAllocated+=s.blocks*512n;
+}
+const number=v=>{const n=Number(v);if(!Number.isSafeInteger(n))throw Error('allocation integer bound');return n;};
+const r={schema:'yataverse-study-unique-file-allocation/v1',codeSHA:sha(fs.readFileSync(__filename)),files,uniqueFiles,hardlinkAliases,symlinksSkipped:symlinks,otherSkipped:other,logicalBytes:number(logicalBytes),logicalAllocatedBytes:number(logicalAllocated),uniqueFileBytes:number(uniqueBytes),uniqueAllocatedBytes:number(uniqueAllocated),scope:'entire dedicated study root, including preserved incomplete trials, source-view controls, keys, runtimes and logs; same dev/inode counted once; original lake outside study root excluded',limits:'regular-file stat blocks only; directory/inode/journal/reserves and filesystem CoW/snapshot sharing not measured; instantaneous metadata census, not content verification'};
+durable(out,json(r));console.log(JSON.stringify(r));

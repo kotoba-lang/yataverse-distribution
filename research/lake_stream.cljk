@@ -1,0 +1,56 @@
+// Run with Node 26: node lake_stream.cljk --inventory ... --out NEW --flatfs ... --raw ...
+// Read-only sources, bounded packs, every block CID checked. Native .js origin.
+'use strict';
+const fs=require('node:fs'),path=require('node:path'),z=require('node:zlib'),os=require('node:os');
+const {performance}=require('node:perf_hooks');
+const {sha,json,encode,recover}=require('./stream_codec.cljk');
+const args=process.argv.slice(2), opt=(k,d)=>args.includes(k)?args[args.indexOf(k)+1]:d;
+const runtimeSourceSHA=sha(fs.readFileSync(__filename));
+const inventory=opt('--inventory'),out=opt('--out'),flatfs=opt('--flatfs'),raw=opt('--raw');
+const start=Number(opt('--start','0')),limit=Number(opt('--limit','1000000000'));
+const workers=Number(opt('--zstd-workers','0'));
+if(!inventory||!out||fs.existsSync(out)||!flatfs||![start,limit,workers].every(Number.isSafeInteger)||start<0||limit<1||workers<0||workers>3) throw Error('invalid arguments/new output required');
+fs.mkdirSync(out,{recursive:true});
+const inv=fs.readFileSync(inventory), invSHA=sha(inv), lines=inv.toString().trimEnd().split('\n');
+if(opt('--sha256',invSHA)!==invSHA) throw Error('inventory hash differs');
+const b58='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz', b32='abcdefghijklmnopqrstuvwxyz234567';
+function cidDigest(cid) {
+  let bytes;
+  if(/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(cid)) {
+    let n=0n; for(const ch of cid) n=n*58n+BigInt(b58.indexOf(ch)); let hex=n.toString(16); if(hex.length%2) hex='0'+hex; bytes=Buffer.from(hex,'hex');
+  } else if(/^b[a-z2-7]{20,200}$/.test(cid)) {
+    const a=[];let acc=0,bits=0;for(const c of cid.slice(1)){ acc=(acc<<5)|b32.indexOf(c);bits+=5;if(bits>=8){bits-=8;a.push((acc>>>bits)&255);}} bytes=Buffer.from(a);
+    let i=0; const vint=()=>{let n=0,shift=0,b;do { if(i>=bytes.length||shift>49) throw Error('bad varint'); b=bytes[i++];n+=(b&127)*2**shift;shift+=7; }while(b&128);return n;};
+    if(vint()!==1)throw Error('CID version');vint();bytes=bytes.subarray(i);
+  } else throw Error('CID syntax');
+  if(bytes.length!==34||bytes[0]!==18||bytes[1]!==32)throw Error('CID hash type');return bytes.subarray(2);
+}
+function keyFor(digest){let acc=0,bits=0,key='';for(const b of Buffer.concat([Buffer.from([18,32]),digest])){acc=(acc<<8)|b;bits+=8;while(bits>=5){bits-=5;key+=b32[(acc>>>bits)&31];}}if(bits)key+=b32[(acc<<(5-bits))&31];return key.toUpperCase();}
+const seen=new Set();let expectedBytes=0;for(const line of lines){const r=JSON.parse(line);cidDigest(r.cid);if(seen.has(r.cid)||!Number.isSafeInteger(r.bytes)||r.bytes<1||r.bytes>256000000)throw Error('inventory row');seen.add(r.cid);expectedBytes+=r.bytes;} seen.clear();
+const excludedRows=new Set();let excludedBytes=0,exclusionLedgerSHA=null;
+if(opt('--exclude-ledger')){const ledger=fs.readFileSync(opt('--exclude-ledger'));exclusionLedgerSHA=sha(ledger);if(exclusionLedgerSHA!==opt('--exclude-ledger-sha'))throw Error('untrusted exclusion ledger');const entries=ledger.toString().trimEnd().split('\n');if(entries.length!==lines.length||start!==0||limit<lines.length)throw Error('exclusion requires complete full-row ledger');entries.forEach((l,i)=>{const e=JSON.parse(l),r=JSON.parse(lines[i]);if(e.row!==i||e.cid!==r.cid||e.bytes!==r.bytes||!['cid-verified','missing'].includes(e.status))throw Error('exclusion ledger coverage differs');if(e.status==='cid-verified'){excludedRows.add(i);excludedBytes+=r.bytes;}});}
+const fd=fs.openSync(path.join(out,'blocks.jsonl'),'wx'), pfd=fs.openSync(path.join(out,'packs.jsonl'),'wx');
+const now=()=>performance.now(), began=now(), totals={readBlocks:0,readBytes:0,missingBlocks:0,missingBytes:0,packCount:0,rawContainerBytes:0,zstdPayloadBytes:0,ecPhysicalBytes:0,readHashMs:0,encodeMs:0,erasureMs:0,restoreMs:0};
+let pieces=[],size=0,sample=false,first=true;
+function writeDurable(file,bytes){const f=fs.openSync(file,'wx');try{fs.writeFileSync(f,bytes);fs.fsyncSync(f);}finally{fs.closeSync(f);}const d=fs.openSync(path.dirname(file),'r');try{fs.fsyncSync(d);}finally{fs.closeSync(d);}}
+function checkpoint(final=false){fs.fsyncSync(fd);fs.fsyncSync(pfd);const report={schema:'yataverse-lake-stream/v1',inventorySHA:invSHA,inventoryRows:lines.length,inventoryBytes:expectedBytes,start,end:Math.min(lines.length,start+limit),totals,wallMs:now()-began,complete:final,fullByteCoverage:final&&start===0&&limit>=lines.length&&totals.readBlocks===lines.length&&totals.missingBlocks===0&&totals.readBytes===expectedBytes,exclusion:{ledgerSHA:exclusionLedgerSHA,rows:excludedRows.size,bytes:excludedBytes},partitionByteCoverage:final&&start===0&&limit>=lines.length&&totals.readBlocks+excludedRows.size===lines.length&&totals.readBytes+excludedBytes===expectedBytes&&totals.missingBlocks===0,host:os.hostname(),platform:process.platform,arch:process.arch,node:process.version,zstd:{level:9,workers,jobSize:workers?1048576:null},sourceSHA:runtimeSourceSHA,codecSHA:sha(fs.readFileSync(require.resolve('./stream_codec.cljk'))),limits:'frozen inventory; source signatures/head freshness and annual durability not established; temporary encoding not full custody; two-site EC copies cost 2x ecPhysicalBytes'};const tmp=path.join(out,'progress.tmp');fs.writeFileSync(tmp,json(report));fs.renameSync(tmp,path.join(out,final?'summary.json':'progress.json'));if(final)console.log(JSON.stringify(report));}
+function flush(){if(!pieces.length)return;let t=now();const meta=json({schema:'yataverse-stream-pack/v1',files:pieces.map(p=>({cid:p.cid,offset:p.offset,bytes:p.buf.length,sha256:sha(p.buf)}))}),header=Buffer.alloc(12);header.write('YATAS01\n');header.writeUInt32BE(meta.length,8);const rawPack=Buffer.concat([header,meta,...pieces.map(p=>p.buf)]);
+ const params={[z.constants.ZSTD_c_compressionLevel]:9,[z.constants.ZSTD_c_nbWorkers]:workers};if(workers)params[z.constants.ZSTD_c_jobSize]=1048576;
+ const packed=z.zstdCompressSync(rawPack,{params});const encMS=now()-t;t=now();const ec=encode(packed),ecMS=now()-t;t=now();const restored=recover(ec.manifest,ec.manifestSHA,ec.shards.map((b,i)=>i<2?null:b));const decoded=z.zstdDecompressSync(restored,{maxOutputLength:rawPack.length});if(!decoded.equals(rawPack))throw Error('pack roundtrip differs');const restoreMS=now()-t;
+ const r={pack:totals.packCount,logicalBytes:size,files:pieces.length,rawContainerBytes:rawPack.length,zstdPayloadBytes:packed.length,ecPhysicalBytes:ec.physicalBytes,encodeMs:encMS,erasureMs:ecMS,restoreMs:restoreMS,payloadSHA:sha(packed),rawSHA:sha(rawPack),lossPattern:[0,1]};fs.writeSync(pfd,json(r));fs.writeSync(pfd,'\n');for(const k of ['rawContainerBytes','zstdPayloadBytes','ecPhysicalBytes'])totals[k]+=r[k];totals.encodeMs+=encMS;totals.erasureMs+=ecMS;totals.restoreMs+=restoreMS;totals.packCount++;
+ if(first){first=false;const d=path.join(out,'wan-pack');fs.mkdirSync(d);writeDurable(path.join(d,'trusted-receipt.json'),json(ec.receipt));writeDurable(path.join(d,'manifest.json'),json(ec.manifest));for(const i of [2,4]){writeDurable(path.join(d,`manifest-${i}.json`),json(ec.manifest));writeDurable(path.join(d,`receipt-${i}.json`),json(ec.receipt));}ec.shards.forEach((b,i)=>writeDurable(path.join(d,`shard-${i}.bin`),b));writeDurable(path.join(d,'raw-trust.json'),json({rawSHA:r.rawSHA,logicalBytes:size,rawContainerBytes:rawPack.length}));}
+ pieces=[];size=0;
+}
+const decoder=new TextDecoder('utf-8',{fatal:true});
+for(let row=start;row<Math.min(lines.length,start+limit);row++) {
+ const r=JSON.parse(lines[row]);if(excludedRows.has(row)){fs.writeSync(fd,JSON.stringify({row,cid:r.cid,bytes:r.bytes,status:'externally-verified'})+'\n');continue;}
+ const t=now(),digest=cidDigest(r.cid),key=keyFor(digest),fp=path.join(flatfs,key.slice(-3,-1),key+'.data'),rp=raw?path.join(raw,sha(Buffer.from(r.cid,'ascii')).slice(0,2),r.cid+'.block'):null;
+ const file=[fp,rp].find(p=>p&&fs.existsSync(p));
+ if(!file){totals.missingBlocks++;totals.missingBytes+=r.bytes;fs.writeSync(fd,JSON.stringify({row,cid:r.cid,bytes:r.bytes,status:'missing'})+'\n');continue;}
+ if(!fs.lstatSync(file).isFile()||fs.statSync(file).size!==r.bytes)throw Error('source type/size differs');const bytes=fs.readFileSync(file);if(sha(bytes)!==digest.toString('hex'))throw Error('source CID mismatch');totals.readHashMs+=now()-t;totals.readBlocks++;totals.readBytes+=bytes.length;
+ fs.writeSync(fd,JSON.stringify({row,cid:r.cid,bytes:r.bytes,status:'cid-verified'})+'\n');
+ if(!sample&&bytes.length>=4096){const b=bytes.subarray(0,4096);try{const text=decoder.decode(b);if([...text].filter(c=>c==='\n'||c==='\r'||c==='\t'||c.charCodeAt(0)>=32).length/text.length>.98){writeDurable(path.join(out,'llm-input.bin'),b);writeDurable(path.join(out,'llm-input.json'),json({cid:r.cid,row,offset:0,bytes:b.length,sha256:sha(b),selection:'first CID-verified block with 4096-byte strict UTF8 printable prefix'}));sample=true;}}catch(e){if(e.code!=='ERR_ENCODING_INVALID_ENCODED_DATA')throw e;}}
+ for(let offset=0;offset<bytes.length;offset+=4*1024*1024){const b=bytes.subarray(offset,Math.min(bytes.length,offset+4*1024*1024));if(size+b.length>16*1024*1024)flush();pieces.push({cid:r.cid,offset,buf:b});size+=b.length;}
+ if(row%5000===4999){flush();checkpoint();console.log(JSON.stringify({row,readBytes:totals.readBytes,missing:totals.missingBlocks,wallSeconds:(now()-began)/1000}));}
+}
+flush();if(sha(fs.readFileSync(inventory))!==invSHA)throw Error('inventory changed');checkpoint(true);fs.closeSync(fd);fs.closeSync(pfd);if(totals.missingBlocks)process.exitCode=2;

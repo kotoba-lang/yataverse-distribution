@@ -1,0 +1,69 @@
+(ns storage-test (:require [lossless-storage :as s]))
+(def failures (atom []))
+(def checks (atom 0))
+(defn check [label ok] (swap! checks inc) (when-not ok (swap! failures conj label)))
+(defn throws? [f] (try (f) false (catch :default _ true)))
+(defn sample [size seed]
+  (let [buf (js/Buffer.alloc size)]
+    (loop [i 0 x seed]
+      (when (< i size)
+        (let [y (bit-xor x (bit-shift-left x 13))
+              y (bit-xor y (unsigned-bit-shift-right y 17))
+              y (bit-xor y (bit-shift-left y 5))]
+          (aset buf i (bit-and y 255)) (recur (inc i) y)))) buf))
+(def files [{:name "empty" :bytes (js/Buffer.alloc 0)}
+            {:name "binary" :bytes (sample 9000 771)}
+            {:name "duplicate" :bytes (sample 9000 771)}
+            {:name "unicode" :bytes (js/Buffer.from (.repeat "復元保証\u0000\r\n" 200))}])
+(doseq [mode [:plain :cdc :vector]]
+  (let [p (s/pack files mode) restored (s/unpack (:bytes p) (s/sha (:bytes p)))]
+    (check (str mode " exact roundtrip")
+           (every? true? (map #(and (= (:name %1) (:name %2)) (.equals (:bytes %1) (:bytes %2))) files restored)))
+    (check (str mode " deterministic packing") (.equals (:bytes p) (:bytes (s/pack files mode))))
+    (when (not= mode :plain) (check (str mode " dedup used") (< (:records p) 5)))))
+(check "duplicate labels refused" (throws? #(s/pack [(first files) (first files)] :cdc)))
+(check "invalid CDC parameters refused" (throws? #(s/chunks (sample 10 1) 100 7 10)))
+(check "six independent domains tolerate two domain losses"
+       (= 2 (:worst-case-erased-shards (s/validate-placement ["a" "b" "c" "d" "e" "f"] 2))))
+(check "three domains two shards each tolerate one domain loss"
+       (= 2 (:worst-case-erased-shards (s/validate-placement ["a" "a" "b" "b" "c" "c"] 1))))
+(check "two WANs with three shards each refused"
+       (throws? #(s/validate-placement ["a" "a" "a" "b" "b" "b"] 1)))
+(check "three domains do not tolerate arbitrary two domain loss"
+       (throws? #(s/validate-placement ["a" "a" "b" "b" "c" "c"] 2)))
+(doseq [p [(s/solid-pack files) (s/adaptive-pack files)]]
+  (let [out (s/unpack (:bytes p) (s/sha (:bytes p)))]
+    (check "solid/adaptive exact restoration" (every? true? (map #(.equals (:bytes %1) (:bytes %2)) files out)))))
+(let [a (s/adaptive-pack files)]
+  (check "adaptive no worse than strongest measured baseline"
+         (<= (.-length (:bytes a)) (.-length (:bytes (s/solid-pack files))))))
+(let [anchor (sample 14000 1234) variant (js/Buffer.from anchor)]
+  (aset variant 400 73)
+  (let [p (s/pack [{:name "a" :bytes anchor} {:name "b" :bytes variant}] :vector)]
+    (check "vector-guided dictionary selected" (pos? (:dictionary-records p)))
+    (check "dictionary exact binary recovery" (.equals variant (:bytes (second (s/unpack (:bytes p) (s/sha (:bytes p)))))))
+    (let [j (s/parse-pack (:bytes p))]
+      (let [bad (s/serialize-pack (assoc-in j [:records 0 :id] (.repeat "0" 64)))]
+        (check "inner record digest checked" (throws? #(s/unpack bad (s/sha bad))))))))
+(doseq [size [0 1 3 4 5 37 257]]
+  (let [buf (sample size (+ size 117)) e (s/shard buf)]
+    (doseq [a (range 6) b (range (inc a) 6)]
+      (check (str "any two erased " size " " a "/" b)
+             (.equals buf (s/recover (:manifest e) (:manifest-sha256 e) (assoc (:shards e) a nil b nil)))))
+    (check "three missing shards refused"
+           (throws? #(s/recover (:manifest e) (:manifest-sha256 e) (assoc (:shards e) 0 nil 1 nil 2 nil))))
+    (let [bad (js/Buffer.from (nth (:shards e) 1))]
+      (aset bad 0 (bit-xor 1 (aget bad 0)))
+      (check "corruption plus erasure recovered"
+             (.equals buf (s/recover (:manifest e) (:manifest-sha256 e) (assoc (:shards e) 1 bad 4 nil))))
+      (check "corruption plus two erasures refused"
+             (throws? #(s/recover (:manifest e) (:manifest-sha256 e) (assoc (:shards e) 1 bad 4 nil 5 nil)))))
+    (check "manifest tampering refused"
+           (throws? #(s/recover (assoc (:manifest e) :sha256 (.repeat "0" 64)) (:manifest-sha256 e) (:shards e))))))
+(let [p (:bytes (s/pack files :vector))]
+  (check "wrong pack trust anchor refused" (throws? #(s/unpack p (.repeat "0" 64))))
+  (let [j (s/parse-pack p)]
+    (let [bad (s/serialize-pack (assoc-in j [:records 0 :base] 0))]
+      (check "self/cyclic dictionary reference refused" (throws? #(s/unpack bad (s/sha bad)))))))
+(println (js/JSON.stringify (clj->js {:checks @checks :failures @failures})))
+(when (seq @failures) (js/process.exit 1))

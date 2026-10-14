@@ -1,0 +1,64 @@
+{
+  "schema": "yataverse-matched-capacity-cost/v1",
+  "inventorySHA": "2334fb3efefc460a9ed1301aecfa2b5183133fc0bb0208a93692617672eb8a91",
+  "fullByteCoverage": true,
+  "rates": {
+    "date": "2026-10-11",
+    "r2StandardUSDPerGBMonth": 0.015,
+    "b2USDPerGBMonth": 0.00695,
+    "filOneUSDPerTBMonth": 5.99,
+    "filOneMinimumUSDMonth": 5.99
+  },
+  "logicalGB": 91.395086102,
+  "packedGB": 20.938877542,
+  "twoSiteECPhysicalGB": 62.841585444,
+  "providerRows": [
+    {
+      "name": "R2 Standard",
+      "rawBillableGB": 91.395086102,
+      "compressedBillableGB": 20.938877542,
+      "rawCapacityMonthlyUSD": 1.3709262915299998,
+      "compressedCapacityMonthlyUSD": 0.31408316313,
+      "totalMonthlyUSD": null,
+      "source": "https://developers.cloudflare.com/r2/pricing/",
+      "limits": "capacity marginal estimate; free allowances, billing rounding, operations, retrieval, version retention and migration compute are additional; actual PUT/GET and invoices not measured"
+    },
+    {
+      "name": "B2",
+      "rawBillableGB": 91.395086102,
+      "compressedBillableGB": 20.938877542,
+      "rawCapacityMonthlyUSD": 0.6351958484088999,
+      "compressedCapacityMonthlyUSD": 0.1455251989169,
+      "totalMonthlyUSD": null,
+      "source": "https://www.backblaze.com/cloud-storage/pricing",
+      "limits": "capacity marginal estimate; free allowances, billing rounding, operations, retrieval, version retention and migration compute are additional; actual PUT/GET and invoices not measured"
+    },
+    {
+      "name": "Filecoin / Fil One specific service",
+      "rawBillableGB": 91.395086102,
+      "compressedBillableGB": 20.938877542,
+      "rawCapacityMonthlyUSD": 5.99,
+      "compressedCapacityMonthlyUSD": 5.99,
+      "totalMonthlyUSD": null,
+      "source": "https://www.fil.one/",
+      "limits": "service-specific published price, minimum $5.99/month; reasonable-use egress; not a generic Filecoin tariff or matched durability/SLA quote"
+    }
+  ],
+  "own": {
+    "name": "Yataverse two-site complete EC copies",
+    "physicalGB": 62.841585444,
+    "capacityMonthlyUSD": null,
+    "measuredEncodeWallHoursSum": 0.38099697086944434,
+    "encodeUSD": null,
+    "totalMonthlyUSD": null,
+    "limits": "wall time summed over measured hosts, not metered CPU-hours; assumed hourly rate applies to allocated execution time; full allocation, global indexes, production slack, lifecycle and maintenance remain unmeasured"
+  },
+  "assumptions": {},
+  "assumptionsAreMeasurements": false,
+  "guaranteeEquivalent": false,
+  "breakEvenNodeUSDPerGBMonthIgnoringAllOtherCosts": {
+    "versusCompressedR2": 0.00499801462536124,
+    "versusCompressedB2": 0.0023157467764173744
+  },
+  "conclusion": "same compressed payload on providers is the control; no measured TCO or equal durability claim; Filecoin quote and R2/B2 runtime access unresolved; Mithril excluded"
+}

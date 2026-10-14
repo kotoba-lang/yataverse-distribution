@@ -1,0 +1,42 @@
+(ns lake-test (:require [lossless-storage :as s] [graph-head :as g]))
+(def fs (js/require "node:fs"))
+(def cp (js/require "node:child_process"))
+(def path (js/require "node:path"))
+(def argv (vec (array-seq (.-argv js/process))))
+(def root (second (drop-while #(not= % "--work-root") argv)))
+(when (or (nil? root) (.existsSync fs root)) (s/refuse "--work-root must be new"))
+(.mkdirSync fs root #js {:recursive true})
+(def blobs [(js/Buffer.from "復元保証付きの公開テストデータ") (js/Buffer.from (.repeat "common dictionary bytes" 20))])
+(def rows (mapv (fn [b] {:cid (g/raw-cid b) :bytes (.-length b)}) blobs))
+(def flat (.join path root "blocks"))
+(defn block-path [b]
+  (let [digest (-> (.createHash s/crypto "sha256") (.update b) (.digest))
+        key (.toUpperCase (g/b32-encode (js/Buffer.concat #js [(js/Buffer.from #js [18 32]) digest])))]
+    (.join path flat (subs key (- (count key) 3) (dec (count key))) (str key ".data"))))
+(doseq [b blobs] (let [p (block-path b)] (.mkdirSync fs (.dirname path p) #js {:recursive true}) (.writeFileSync fs p b)))
+(def inv (.join path root "inventory.jsonl"))
+(.writeFileSync fs inv (apply str (map #(str (.toString (s/json-bytes %)) "\n") rows)))
+(def common ["--backend" "sci" "--classpath" ".:../deploy" "lake_evaluate.cljk" "--inventory" inv
+             "--flatfs-root" flat "--ipfs-bin" "/nonexistent-kubo" "--all" "--limit" "2"])
+(defn run [extra] (.spawnSync cp "kbb" (clj->js (into common extra)) #js {:encoding "utf8" :maxBuffer 1000000}))
+(def failures (atom []))
+(defn check [label ok] (when-not ok (swap! failures conj label)))
+(let [out (.join path root "complete.json") r (run ["--report" out "--count" "2" "--sha256" (s/sha (.readFileSync fs inv))])]
+  (check "offline fixture evaluates" (= 0 (.-status r)))
+  (when (= 0 (.-status r))
+    (let [p (js->clj (js/JSON.parse (.readFileSync fs out "utf8")) :keywordize-keys true)]
+      (check "full byte coverage requires every CID" (true? (:full-byte-coverage p)))
+      (check "batched 15-pattern recovery exercised" (every? #(= 15 (:two-erasure-patterns-verified %)) (:batch-results p))))))
+(check "wrong inventory anchor rejected"
+       (not= 0 (.-status (run ["--report" (.join path root "wrong.json") "--sha256" (.repeat "0" 64)]))))
+(.unlinkSync fs (block-path (second blobs)))
+(let [out (.join path root "partial.json") r (run ["--report" out])]
+  (check "missing bytes make contiguous evaluation incomplete" (= 2 (.-status r)))
+  (let [p (js->clj (js/JSON.parse (.readFileSync fs out "utf8")) :keywordize-keys true)]
+    (check "missing block not claimed restored" (and (false? (:full-byte-coverage p)) (= 1 (count (:unavailable p)))))))
+(.writeFileSync fs (block-path (first blobs)) (js/Buffer.alloc (.-length (first blobs))))
+(check "CID mismatch rejected"
+       (not= 0 (.-status (run ["--report" (.join path root "corrupt.json")]))))
+(check "CID mismatch never writes a success report" (not (.existsSync fs (.join path root "corrupt.json"))))
+(println (js/JSON.stringify (clj->js {:checks 8 :failures @failures})))
+(when (seq @failures) (js/process.exit 1))

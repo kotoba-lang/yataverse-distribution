@@ -1,0 +1,2 @@
+;; Offline research uses Node built-ins only, independent of service deps.
+{:paths ["."]}

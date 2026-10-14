@@ -1,0 +1,11 @@
+{
+  "files_verified": 18,
+  "lost_nodes": [
+    0,
+    2
+  ],
+  "manifest_sha256": "8166ebd71b6999d1f0c3b1a81c4bb04786d11acdfe7fd63efae6085609320ecf",
+  "source_inventory_sha256": "2334fb3efefc460a9ed1301aecfa2b5183133fc0bb0208a93692617672eb8a91",
+  "network_used": false,
+  "original_blocks_used": false
+}

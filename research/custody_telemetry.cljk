@@ -1,0 +1,40 @@
+# Native Python origin. Read-only rails and local Kubo latency, not mains power.
+import json, pathlib, sys, time, urllib.request, os
+root = pathlib.Path(sys.argv[1])
+root.mkdir(parents=True, exist_ok=True)
+out = root / 'telemetry.jsonl'
+interval = 10
+rails = [('GPU', 4, 1), ('CPU', 4, 2), ('SOC', 4, 3), ('CV', 5, 1), ('VDDRQ', 5, 2), ('SYS5V', 5, 3)]
+resume = sys.argv[2:] == ['--append']
+if sys.argv[2:] and not resume:
+    raise ValueError('only explicit append continuation is supported')
+if resume and not out.is_file():
+    raise ValueError('existing study telemetry required')
+with out.open('a' if resume else 'x') as log:
+    for _ in range(2160):
+        if (root / 'stop-telemetry').exists():
+            break
+        t = time.monotonic()
+        phase = (root / 'phase.txt').read_text().strip() if (root / 'phase.txt').exists() else 'baseline'
+        row = {'time': time.time(), 'monotonic': t, 'phase': phase, 'load': os.getloadavg(), 'railWatts': {}, 'mainsPowerMeasured': False}
+        for name, hw, ch in rails:
+            p = pathlib.Path(f'/sys/class/hwmon/hwmon{hw}')
+            try:
+                mv = int((p / f'in{ch}_input').read_text())
+                ma = int((p / f'curr{ch}_input').read_text())
+                row['railWatts'][name] = mv * ma / 1e6
+            except (OSError, ValueError):
+                row['railWatts'][name] = None
+        try:
+            begin = time.monotonic()
+            req = urllib.request.Request('http://127.0.0.1:5001/api/v0/version', data=b'')
+            with urllib.request.urlopen(req, timeout=2) as response:
+                response.read(4096)
+            row['kuboVersionLatencyMs'] = (time.monotonic() - begin) * 1000
+            row['kuboVersionOK'] = True
+        except Exception as error:
+            row['kuboVersionOK'] = False
+            row['kuboErrorType'] = type(error).__name__
+        log.write(json.dumps(row) + '\n')
+        log.flush()
+        time.sleep(max(0, interval - (time.monotonic() - t)))

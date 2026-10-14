@@ -1,0 +1,23 @@
+// Measured capacity + explicit assumptions. Unknown total cost stays null.
+'use strict';
+const fs=require('node:fs');
+const [file,out,assumptionsFile]=process.argv.slice(2);if(!file||!out||fs.existsSync(out))throw Error('new output required');
+const r=JSON.parse(fs.readFileSync(file));if(!r.fullByteCoverage)throw Error('full bytes required; no extrapolation');
+const t=r.totals,logicalGB=r.inventoryBytes/1e9,packedGB=t.zstdPayloadBytes/1e9,twoSiteGB=2*t.ecPhysicalBytes/1e9;
+const assumptions=assumptionsFile?JSON.parse(fs.readFileSync(assumptionsFile)):{};
+for(const [k,v] of Object.entries(assumptions))if(typeof v!=='number'||!Number.isFinite(v)||v<0)throw Error('nonnegative numeric assumptions only');
+const rates={date:'2026-10-11',r2StandardUSDPerGBMonth:.015,b2USDPerGBMonth:.00695,filOneUSDPerTBMonth:5.99,filOneMinimumUSDMonth:5.99};
+const providerRows=[['R2 Standard',rates.r2StandardUSDPerGBMonth,'https://developers.cloudflare.com/r2/pricing/'],['B2',rates.b2USDPerGBMonth,'https://www.backblaze.com/cloud-storage/pricing']].map(([name,rate,source])=>({name,rawBillableGB:logicalGB,compressedBillableGB:packedGB,rawCapacityMonthlyUSD:logicalGB*rate,compressedCapacityMonthlyUSD:packedGB*rate,totalMonthlyUSD:null,source,limits:'capacity marginal estimate; free allowances, billing rounding, operations, retrieval, version retention and migration compute are additional; actual PUT/GET and invoices not measured'}));
+providerRows.push({name:'Filecoin / Fil One specific service',rawBillableGB:logicalGB,compressedBillableGB:packedGB,rawCapacityMonthlyUSD:Math.max(5.99,logicalGB/1000*5.99),compressedCapacityMonthlyUSD:Math.max(5.99,packedGB/1000*5.99),totalMonthlyUSD:null,source:'https://www.fil.one/',limits:'service-specific published price, minimum $5.99/month; reasonable-use egress; not a generic Filecoin tariff or matched durability/SLA quote'});
+const required=['nodeUSDPerGBMonth','overheadUSDMonth','encodeUSDPerAllocatedHostHour','amortizeInitialEncodeMonths','retrievalUSDMonth','repairUSDMonth'];
+const completeAssumptions=required.every(k=>Object.hasOwn(assumptions,k))&&assumptions.amortizeInitialEncodeMonths>0;
+const encodeCPUHours=(t.encodeMs+t.erasureMs)/3600000;
+const own={name:'Yataverse two-site complete EC copies',physicalGB:twoSiteGB,capacityMonthlyUSD:Object.hasOwn(assumptions,'nodeUSDPerGBMonth')?twoSiteGB*assumptions.nodeUSDPerGBMonth:null,
+    measuredEncodeWallHoursSum:encodeCPUHours,encodeUSD:null,totalMonthlyUSD:null,
+    limits:'wall time summed over measured hosts, not metered CPU-hours; assumed hourly rate applies to allocated execution time; full allocation, global indexes, production slack, lifecycle and maintenance remain unmeasured'};
+if(completeAssumptions){own.encodeUSD=encodeCPUHours*assumptions.encodeUSDPerAllocatedHostHour;own.totalMonthlyUSD=own.capacityMonthlyUSD+assumptions.overheadUSDMonth+assumptions.retrievalUSDMonth+assumptions.repairUSDMonth+own.encodeUSD/assumptions.amortizeInitialEncodeMonths;}
+const report={schema:'yataverse-matched-capacity-cost/v1',inventorySHA:r.inventorySHA,fullByteCoverage:true,rates,logicalGB,packedGB,twoSiteECPhysicalGB:twoSiteGB,
+    providerRows,own,assumptions,assumptionsAreMeasurements:false,guaranteeEquivalent:false,
+    breakEvenNodeUSDPerGBMonthIgnoringAllOtherCosts:{versusCompressedR2:packedGB*.015/twoSiteGB,versusCompressedB2:packedGB*.00695/twoSiteGB},
+    conclusion:'same compressed payload on providers is the control; no measured TCO or equal durability claim; Filecoin quote and R2/B2 runtime access unresolved; Mithril excluded'};
+fs.writeFileSync(out,JSON.stringify(report,null,2),{flag:'wx'});console.log(JSON.stringify({logicalGB,packedGB,twoSiteGB,providerRows,own}));

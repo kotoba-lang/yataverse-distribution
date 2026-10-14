@@ -1,0 +1,44 @@
+'use strict';
+const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process'),crypto=require('node:crypto'),assert=require('node:assert/strict');
+const {sha,json,durable,seal,unseal,verifyRoot}=require('./custody_common.cljk');
+const root=process.argv[2];if(!root||fs.existsSync(root))throw Error('new fixture');fs.mkdirSync(root,{recursive:true,mode:0o700});let checks=0;
+const key=crypto.randomBytes(32),b=Buffer.from('private study bytes '.repeat(200)),sealed=seal(b,key,'aad');assert.deepEqual(unseal(sealed,key,'aad'),b);checks++;assert.throws(()=>unseal(sealed,crypto.randomBytes(32),'aad'));checks++;assert.throws(()=>unseal(sealed,key,'other'));checks++;const bad=Buffer.from(sealed);bad[bad.length-1]^=1;assert.throws(()=>unseal(bad,key,'aad'));checks++;
+const alphabet='abcdefghijklmnopqrstuvwxyz234567';function base32(a){let v=0,bits=0,s='';for(const n of a){v=(v<<8)|n;bits+=8;while(bits>=5){bits-=5;s+=alphabet[(v>>>bits)&31];}}if(bits)s+=alphabet[(v<<(5-bits))&31];return s;}
+const data=[Buffer.from('first block text '.repeat(4000)),crypto.randomBytes(18*1024*1024+3)],flat=path.join(root,'flat'),rows=[];fs.mkdirSync(flat);
+// Enough small, distinct blocks to cross both index batch boundaries and exercise the final partial batch.
+for(let i=0;i<4096;i++){const bytes=Buffer.alloc(128,0x61);bytes.writeUInt32LE(i);data.push(bytes);}
+for(const bytes of data){const d=crypto.createHash('sha256').update(bytes).digest(),cid='b'+base32(Buffer.concat([Buffer.from([1,85,18,32]),d])),k=base32(Buffer.concat([Buffer.from([18,32]),d])).toUpperCase(),dir=path.join(flat,k.slice(-3,-1));fs.mkdirSync(dir,{recursive:true});durable(path.join(dir,k+'.data'),bytes);rows.push({cid,bytes:bytes.length});}
+const inv=path.join(root,'inventory.jsonl'),keyFile=path.join(root,'key.bin'),signFile=path.join(root,'sign.pem'),trust=path.join(root,'trust.json'),built=path.join(root,'build');durable(inv,Buffer.from(rows.map(JSON.stringify).join('\n')+'\n'));durable(keyFile,key);const pair=crypto.generateKeyPairSync('ed25519');durable(signFile,Buffer.from(pair.privateKey.export({type:'pkcs8',format:'pem'})));
+function run(file,args,input){const r=cp.spawnSync(process.execPath,[path.join(__dirname,file),...args],{input,timeout:60000,maxBuffer:64*1024*1024});return r;}
+let r=run('custody_build.cljk',['--inventory',inv,'--sha256',sha(fs.readFileSync(inv)),'--flatfs',flat,'--out',built,'--key',keyFile,'--pause-ms','0']);assert.equal(r.status,0,r.stderr?.toString());checks++;
+r=run('custody_finalize.cljk',[built,inv,keyFile,signFile,trust]);assert.equal(r.status,0,r.stderr?.toString());checks++;
+const trusted=JSON.parse(fs.readFileSync(trust));assert.throws(()=>verifyRoot(fs.readFileSync(path.join(built,'control/2/root.json')),{...trusted,rootSHA:'0'.repeat(64)}));checks++;
+const sourceRootBefore=fs.readFileSync(path.join(built,'control/2/root.json')),sourceAudit=path.join(root,'source-audit.json'),view=path.join(root,'source-view'),viewTrust=path.join(root,'view-trust.json');
+r=run('custody_audit.cljk',[built,trust,sourceAudit]);assert.equal(r.status,0,r.stderr?.toString());checks++;
+r=run('custody_source_view.cljk',[built,trust,sourceAudit,view]);assert.equal(r.status,0,r.stderr?.toString());checks++;
+r=run('custody_finalize.cljk',[view,inv,keyFile,signFile,viewTrust]);assert.equal(r.status,0,r.stderr?.toString());checks++;
+r=run('custody_audit.cljk',[view,viewTrust,path.join(root,'view-audit.json')]);assert.equal(r.status,0,r.stderr?.toString());checks++;
+assert.deepEqual(fs.readFileSync(path.join(built,'control/2/root.json')),sourceRootBefore);checks++;
+const firstPack=fs.readdirSync(path.join(built,'packs')).sort()[0];assert.equal(fs.statSync(path.join(built,'packs',firstPack,'shard-2.bin')).ino,fs.statSync(path.join(view,'packs',firstPack,'shard-2.bin')).ino);checks++;
+const originalBody=verifyRoot(sourceRootBefore,trusted),viewBody=verifyRoot(fs.readFileSync(path.join(view,'control/2/root.json')),JSON.parse(fs.readFileSync(viewTrust)));assert.deepEqual([viewBody.inventorySHA,viewBody.catalogSHA,viewBody.indexSHA],[originalBody.inventorySHA,originalBody.catalogSHA,originalBody.indexSHA]);checks++;
+// Physically corrupt fixture-primary controls and withheld fixture shards only; production paths are absent.
+for(const name of ['data-key.bin','root.json','index.jsonl'])fs.writeFileSync(path.join(built,'control/0',name),Buffer.from('lost fixture primary'));
+for(const dir of fs.readdirSync(path.join(built,'packs'))){for(const name of ['shard-0.bin','shard-1.bin','manifest-0.json'])fs.writeFileSync(path.join(built,'packs',dir,name),Buffer.from('lost fixture primary'));}
+const stream=run('custody_export.cljk',[built,trust,'degraded','32']);assert.equal(stream.status,0,stream.stderr?.toString());checks++;
+const restored=path.join(root,'restored');r=run('custody_restore.cljk',[trust,restored,'raw'],stream.stdout);assert.equal(r.status,0,r.stderr?.toString());checks++;assert.deepEqual(fs.readFileSync(path.join(restored,'restored-lake.bin')),Buffer.concat(data));checks++;
+const report=JSON.parse(fs.readFileSync(path.join(restored,'restore-report.json')));assert.equal(report.verifiedBlocks,data.length);assert.equal(report.indexSupplied,false);checks+=2;
+r=run('custody_audit.cljk',[restored,trust,path.join(root,'audit.json')]);assert.equal(r.status,0,r.stderr?.toString());checks++;
+assert.equal(JSON.parse(fs.readFileSync(path.join(root,'audit.json'))).rawArchive.offsetIndex.verified,true);checks++;
+const offsetFile=path.join(restored,'restored-lake-index.jsonl'),offsetOriginal=fs.readFileSync(offsetFile),offsetLines=offsetOriginal.toString().trimEnd().split('\n'),offsetBad=JSON.parse(offsetLines[0]);offsetBad.archiveOffset=1;offsetLines[0]=JSON.stringify(offsetBad);fs.writeFileSync(offsetFile,offsetLines.join('\n')+'\n');r=run('custody_audit.cljk',[restored,trust,path.join(root,'bad-offset-index.json')]);assert.notEqual(r.status,0);assert.equal(fs.existsSync(path.join(root,'bad-offset-index.json')),false);checks++;fs.writeFileSync(offsetFile,offsetOriginal);
+const {hasTapes}=require('./custody_tapes.cljk');if(hasTapes(restored)){for(const name of ['shard-0.bin','shard-1.bin','metadata-0.jsonl'])fs.renameSync(path.join(restored,'tapes',name),path.join(restored,'tapes',name+'.withheld'));for(const i of [0,2,4])fs.renameSync(path.join(restored,'control',String(i),'index.jsonl'),path.join(restored,'control',String(i),'index.jsonl.withheld'));fs.renameSync(path.join(restored,'control/0/data-key.bin'),path.join(restored,'control/0/data-key.bin.withheld'));}
+const secondStream=run('custody_export.cljk',[restored,trust,'degraded','32']);assert.equal(secondStream.status,0,secondStream.stderr?.toString());checks++;
+const secondRoot=path.join(root,'second-restore');r=run('custody_restore.cljk',[trust,secondRoot,'verify'],secondStream.stdout);assert.equal(r.status,0,r.stderr?.toString());checks++;
+assert.equal(JSON.parse(fs.readFileSync(path.join(secondRoot,'restore-report.json'))).verifiedBytes,data.reduce((n,b)=>n+b.length,0));checks++;
+r=run('custody_audit.cljk',[secondRoot,trust,path.join(root,'second-audit.json')]);assert.equal(r.status,0,r.stderr?.toString());checks++;
+const drift=path.join(root,'drift-runtime');fs.mkdirSync(drift);for(const name of ['custody_restore.cljk','custody_common.cljk','stream_codec.cljk','custody_tapes.cljk'])fs.copyFileSync(path.join(__dirname,name),path.join(drift,name));fs.appendFileSync(path.join(drift,'custody_common.cljk'),'\n// fixture runtime drift\n');
+r=cp.spawnSync(process.execPath,[path.join(drift,'custody_restore.cljk'),trust,path.join(root,'wrong-runtime')],{input:stream.stdout});assert.notEqual(r.status,0);checks++;
+const restoredKey=path.join(secondRoot,'control/2/data-key.bin');fs.chmodSync(restoredKey,0o644);r=run('custody_audit.cljk',[secondRoot,trust,path.join(root,'bad-permissions.json')]);assert.notEqual(r.status,0);checks++;fs.chmodSync(restoredKey,0o600);
+// Wrong survivor key and damaged frame are rejected before completion.
+fs.writeFileSync(path.join(built,'control/2/data-key.bin'),crypto.randomBytes(32));const wrong=run('custody_export.cljk',[built,trust,'degraded','32']);r=run('custody_restore.cljk',[trust,path.join(root,'wrong-key')],wrong.stdout);assert.notEqual(r.status,0);assert.equal(fs.existsSync(path.join(root,'wrong-key/restore-report.json')),false);checks+=2;
+r=run('custody_restore.cljk',[trust,path.join(root,'truncated')],stream.stdout.subarray(0,stream.stdout.length-20));assert.notEqual(r.status,0);checks++;
+console.log(JSON.stringify({checks,verified:'AES authentication, signed root, cold full CID restore, index rebuild, backup metadata/key, repair persisted readback, wrong key and truncation refusal'}));

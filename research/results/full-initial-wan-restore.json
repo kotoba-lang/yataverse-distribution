@@ -1,0 +1,30 @@
+{
+  "schema": "yataverse-full-wan-restore/v1",
+  "rootSHA": "7a4fb7430b599ea594dc9a11415a0d1ae074554f71f3b7fe54269363f7f4d3c6",
+  "inventorySHA": "2334fb3efefc460a9ed1301aecfa2b5183133fc0bb0208a93692617672eb8a91",
+  "verifiedBlocks": 825390,
+  "verifiedBytes": 91395086102,
+  "packs": 5619,
+  "wireBytes": 21045433967,
+  "decodeMs": 919195.189237993,
+  "repairMs": 2109549.042375001,
+  "finalizeMs": 199266.48675000016,
+  "storageBackend": "shard-tapes",
+  "wallMs": 6025559.45325,
+  "indexRebuiltSHA": "e4eb14e7ff06dfb21ce44c678b7004d55360ee9f3f6d9981cff173c1e8b46888",
+  "keyFromSurvivorBackup": true,
+  "metadataFromSurvivorBackup": true,
+  "indexSupplied": false,
+  "sourceLakeRead": false,
+  "rawArchiveBytes": 0,
+  "rawArchiveSHA": "cc199fbc56b2b19d68136f1e4b40c6a9c369039a2c868d2ec6abac0892c4fefe",
+  "repair": {
+    "files": 41,
+    "bytes": 32412078367,
+    "allocatedBytes": 32475000832
+  },
+  "coldReceiver": true,
+  "fsync": true,
+  "complete": true,
+  "limits": "logical read exclusion, warm caches, dedicated study keys; source-site key compromise and annual durability not qualified"
+}

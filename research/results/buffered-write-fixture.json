@@ -1,0 +1,36 @@
+{
+  "scope": "local macOS fixture only; no full-lake/WAN/HDD speed claim",
+  "checks": 24,
+  "verifiedBlocks": 4098,
+  "verifiedBytes": 19466659,
+  "sourceSHA": "f5693a376e77f3978469ec8fa2600326a98315e2417a68fd47067eda14a07b0c",
+  "writeBatching": {
+    "index": {
+      "bufferLimitBytes": 262144,
+      "logicalWrites": 4102,
+      "systemWrites": 4,
+      "bytes": 897291
+    },
+    "raw": {
+      "bufferLimitBytes": 4194304,
+      "logicalWrites": 4102,
+      "systemWrites": 5,
+      "bytes": 19466659
+    },
+    "rawOffsetIndex": {
+      "bufferLimitBytes": 262144,
+      "logicalWrites": 4102,
+      "systemWrites": 2,
+      "bytes": 504582
+    }
+  },
+  "rawArchiveOffsetIndex": {
+    "rows": 4102,
+    "sha256": "b3ea742b52df3e71acbe3940392e181cf08adb61be24eb2f139529d8194a3ce7",
+    "verified": true,
+    "basis": "all mappings agree with signed canonical index"
+  },
+  "independentReadback": true,
+  "fullCampaignUsesPreviousFrozenReceiver": true,
+  "fixtureNiceRequestDenied": true
+}

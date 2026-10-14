@@ -1,0 +1,22 @@
+(ns storage-restore (:require [lossless-storage :as s]))
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def args (vec (array-seq (.-argv js/process))))
+(def dir (second (drop-while #(not= % "--case") args)))
+(def trust (second (drop-while #(not= % "--trust") args)))
+(def lost-text (or (second (drop-while #(not= % "--lost") args)) "0,1"))
+(when-not (and dir trust (re-matches #"[0-9a-f]{64}" trust) (re-matches #"[0-5](,[0-5])*" lost-text))
+  (throw (ex-info "--case DIR --trust MANIFEST_SHA --lost 0,1 required" {})))
+(def lost (set (map js/parseInt (.split lost-text ","))))
+(def manifest
+  (first (keep (fn [i] (let [f (.join path dir (str "node-" i) "manifest.json")]
+                        (when (and (not (contains? lost i)) (.existsSync fs f))
+                          (js->clj (js/JSON.parse (.readFileSync fs f "utf8")) :keywordize-keys true)))) (range 6))))
+(when-not manifest (throw (ex-info "no surviving manifest" {})))
+(def shards (mapv (fn [i] (let [f (.join path dir (str "node-" i) "shard.bin")]
+                           (when (and (not (contains? lost i)) (.existsSync fs f)) (.readFileSync fs f)))) (range 6)))
+(def payload (s/recover manifest trust shards))
+(def recovered (s/unpack payload (:sha256 manifest)))
+(println (js/JSON.stringify (clj->js {:lost (sort lost) :manifest-sha256 trust
+                                     :files (mapv #(hash-map :name (:name %) :bytes (.-length (:bytes %))
+                                                            :sha256 (s/sha (:bytes %))) recovered)})))

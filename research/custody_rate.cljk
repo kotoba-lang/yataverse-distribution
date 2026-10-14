@@ -1,0 +1,4 @@
+// Backpressure + a bounded study bandwidth, with no binary logging.
+'use strict';
+const {once}=require('node:events');const rate=Number(process.argv[2]||16)*1024*1024;if(!Number.isFinite(rate)||rate<1024*1024||rate>32*1024*1024)throw Error('rate');
+(async()=>{let bytes=0;const start=performance.now();for await(const b of process.stdin){if(!process.stdout.write(b))await once(process.stdout,'drain');bytes+=b.length;const delay=bytes/rate*1000-(performance.now()-start);if(delay>0)await new Promise(r=>setTimeout(r,delay));}})().catch(e=>{console.error(e.message);process.exitCode=1;});

@@ -1,0 +1,46 @@
+{
+  "schema": "yataverse-persistent-build/v1",
+  "inventorySHA": "2334fb3efefc460a9ed1301aecfa2b5183133fc0bb0208a93692617672eb8a91",
+  "inventoryRows": 825390,
+  "inventoryBytes": 91395086102,
+  "start": 0,
+  "end": 825390,
+  "totals": {
+    "readBlocks": 825390,
+    "readBytes": 91395086102,
+    "missingBlocks": 0,
+    "missingBytes": 0,
+    "packCount": 5619,
+    "rawContainerBytes": 91551988738,
+    "zstdPayloadBytes": 20969055218,
+    "ecPhysicalBytes": 31466056986,
+    "readHashMs": 555015.1389816175,
+    "encodeMs": 3918162.6263669915,
+    "erasureMs": 157541.5663859875,
+    "restoreMs": 652023.5262659823
+  },
+  "wallMs": 6254443.016671,
+  "complete": true,
+  "fullByteCoverage": true,
+  "exclusion": {
+    "ledgerSHA": null,
+    "rows": 0,
+    "bytes": 0
+  },
+  "partitionByteCoverage": true,
+  "host": "xavier",
+  "platform": "linux",
+  "arch": "arm64",
+  "node": "v26.0.0",
+  "zstd": {
+    "level": 9,
+    "workers": 0,
+    "jobSize": null
+  },
+  "sourceSHA": "8dc01bdbd47c086019478a9094f14a0454fcd1688204410ec9d73c664044e401",
+  "codecSHA": "b2d876cde91702417d3740be1b07d67974e0670d2fffdea79a276bdd603e4769",
+  "encrypted": true,
+  "keySHA": "fdba9f2af2d860de2fc6ac7f6f1f7a495c584ed5e6278da9752afa663e830bb3",
+  "packPrefix": "p",
+  "limits": "dedicated persistent encrypted research custody; annual durability and SLA not qualified"
+}

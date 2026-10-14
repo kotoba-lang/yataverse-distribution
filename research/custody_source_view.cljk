@@ -1,0 +1,21 @@
+// New software/control view of verified study shards, sharing bytes on the SAME physical node.
+'use strict';
+const fs=require('node:fs'),path=require('node:path');
+const {regular,sha,durable,json,syncDir,verifyRoot}=require('./custody_common.cljk');
+const [source,trustFile,auditFile,out]=process.argv.slice(2);
+if(!out||!path.isAbsolute(source)||!path.isAbsolute(out)||fs.existsSync(out)||path.dirname(source)!==path.dirname(out))throw Error('new sibling study view required');
+const parts=source.split(path.sep);if(!parts.includes('yataverse-storage-persistent-20261011')||!source.includes('/github/workspaces/codex/'))throw Error('dedicated study only');
+const trust=JSON.parse(regular(trustFile)),auditBytes=regular(auditFile),audit=JSON.parse(auditBytes),body=verifyRoot(regular(path.join(source,'control/2/root.json')),trust);
+const packReadback=audit.storageBackend==='pack-files'||(audit.storageBackend==='shard-tapes'&&audit.conversion?.converted===true&&audit.conversion.legacyFilesRetained===true);
+if(!audit.verified||audit.rootSHA!==trust.rootSHA||audit.inventoryRows!==body.inventoryRows||audit.inventoryBytes!==body.inventoryBytes||!packReadback)throw Error('verified pack-file source required');
+const summary=regular(path.join(source,'summary.json')),catalog=regular(path.join(source,'packs.jsonl')),index=regular(path.join(source,'index.jsonl'));
+const s=JSON.parse(summary);if(!s.complete||!s.fullByteCoverage||s.inventorySHA!==body.inventorySHA||s.inventoryRows!==body.inventoryRows||s.inventoryBytes!==body.inventoryBytes||sha(catalog)!==body.catalogSHA||sha(index)!==body.indexSHA)throw Error('source coverage/metadata mismatch');
+const packs=catalog.toString().trimEnd().split('\n').map(JSON.parse);if(packs.length!==body.packCount||new Set(packs.map(p=>p.id)).size!==packs.length)throw Error('catalog coverage');
+fs.mkdirSync(out,{mode:0o700});fs.mkdirSync(path.join(out,'packs'),{mode:0o700});
+for(const p of packs){if(!/^[ps]-\d{6}$/.test(p.id))throw Error('pack id');const d=path.join(out,'packs',p.id);fs.mkdirSync(d,{mode:0o700});
+ const names=[...Array.from({length:6},(_,i)=>`shard-${i}.bin`),...[0,2,4].flatMap(i=>[`manifest-${i}.json`,`receipt-${i}.json`])];
+ for(const name of names){const old=path.join(source,'packs',p.id,name);if(!fs.lstatSync(old).isFile())throw Error('regular source file required');fs.linkSync(old,path.join(d,name));}syncDir(d);
+}
+syncDir(path.join(out,'packs'));for(const [name,bytes] of [['summary.json',summary],['packs.jsonl',catalog],['index.jsonl',index]])durable(path.join(out,name),bytes);
+const report={schema:'yataverse-study-source-view/v1',codeSHA:sha(regular(__filename)),sourceRootSHA:trust.rootSHA,sourceAuditSHA:sha(auditBytes),inventorySHA:body.inventorySHA,catalogSHA:body.catalogSHA,indexSHA:body.indexSHA,packs:packs.length,sharedShardFiles:packs.length*6,physicalReplicaCreated:false,scope:'same-node hardlinks to verified immutable study pack files; original controls unchanged; finalize new controls before export'};
+durable(path.join(out,'source-view.json'),json(report));syncDir(out);console.log(JSON.stringify(report));

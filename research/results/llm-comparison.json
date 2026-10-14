@@ -1,0 +1,36 @@
+{
+  "reports": [
+    {
+      "kind": "binary",
+      "inputBytes": 4096,
+      "inputSHA": "e7892eb2442a19cfa1bfea3e8ca2b27445736d99064d4335cb3715e104cbecc2",
+      "zstd9PayloadBytes": 2810,
+      "deflate9PayloadBytes": 2853,
+      "llmPayloadBytes": 6240,
+      "llmContainerBytes": 7471,
+      "llmECPhysicalBytes": 13410,
+      "modelAssetsBytes": 550959737,
+      "encodeSeconds": 50.948880000039935,
+      "decodeSeconds": 50.67928887507878,
+      "limits": "zstd/DEFLATE sizes exclude a shared storage container; LLM has its own model metadata; EC manifest digest lengths fixed; model custody additional",
+      "llmPackSHA": "c9128fe7f47826d931b23c224f1fc489a2bbfc7f13b3bf4f396a99cd6abdb412",
+      "twoErasurePatternsVerified": 15
+    },
+    {
+      "kind": "utf8",
+      "inputBytes": 4096,
+      "inputSHA": "44a1719a030cba837cefc7f5b9ade2228905c106b847e2ef078e564b092eab51",
+      "zstd9PayloadBytes": 1341,
+      "deflate9PayloadBytes": 1355,
+      "llmPayloadBytes": 1335,
+      "llmContainerBytes": 2564,
+      "llmECPhysicalBytes": 6045,
+      "modelAssetsBytes": 550959737,
+      "encodeSeconds": 16.46397579088807,
+      "decodeSeconds": 16.410236458061263,
+      "limits": "zstd/DEFLATE sizes exclude a shared storage container; LLM has its own model metadata; EC manifest digest lengths fixed; model custody additional",
+      "llmPackSHA": "f95f475db02726bc37513c4cbddef2cea5007f11e7b96779bcdef37c098c6038",
+      "twoErasurePatternsVerified": 15
+    }
+  ]
+}

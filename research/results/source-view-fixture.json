@@ -1,0 +1,24 @@
+{
+  "checks": 31,
+  "scope": "local fixture; source view is same-node sharing, not an additional fault domain",
+  "sourceControlUnchanged": true,
+  "sourceAndViewShardInodeEqual": true,
+  "inventoryCatalogIndexBindingEqual": true,
+  "viewAuditVerified": true,
+  "verifiedBlocks": 4098,
+  "verifiedBytes": 19466659,
+  "rootSHA": "65b210c9bb5418c04a9c6d7fa6a7cadb3cf26dcd518f6873919d1af7030db100",
+  "sourceView": {
+    "schema": "yataverse-study-source-view/v1",
+    "sourceRootSHA": "a963d36299da740885b0e7f572bc72c6cf3e320d80e69c095729de18638b0dde",
+    "sourceAuditSHA": "dd444e187c93fed59a613f0e26576148fb198abaa240e3c77fdeb100bd5142ed",
+    "inventorySHA": "943e085f497ff0233b9deb55e2f82a7747ac5cb7ad73eca9c34de3331fa2e816",
+    "catalogSHA": "72cd84cd594ac7852f06a9b9b2f026d7f38b0ff6e913603f7779cfa96c0c7d2f",
+    "indexSHA": "b3a5e8b434df0dd640a59c2fc68ae0a261289fd04896a18a4b7397ee58e57036",
+    "packs": 2,
+    "sharedShardFiles": 12,
+    "physicalReplicaCreated": false,
+    "scope": "same-node hardlinks to verified immutable study pack files; original controls unchanged; finalize new controls before export"
+  },
+  "helperProvenanceFieldAddedAfterTest": true
+}

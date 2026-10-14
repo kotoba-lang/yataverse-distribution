@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Independent-process offline GPT-2 restore. No source input or network access.
+Python runtime, .py origin. Requires a caller-trusted compressed-pack SHA.
+"""
+import argparse, bisect, hashlib, json, pathlib, platform, time
+import torch
+import numpy as np
+import transformers
+from transformers import GPT2LMHeadModel,GPT2Tokenizer
+p=argparse.ArgumentParser();p.add_argument('--pack',required=True);p.add_argument('--trust',required=True)
+p.add_argument('--model-root',required=True);p.add_argument('--out',required=True);a=p.parse_args()
+out=pathlib.Path(a.out);out.mkdir(parents=True,exist_ok=False)
+raw=pathlib.Path(a.pack).read_bytes()
+if len(raw)>1048576 or hashlib.sha256(raw).hexdigest()!=a.trust or raw[:8]!=b'YATAL01\n':raise ValueError('untrusted compressed pack')
+n=int.from_bytes(raw[8:12],'big');h=json.loads(raw[12:12+n]);data=raw[12+n:]
+if h['schema']!='yataverse-gpt2-arithmetic/v1' or not 0<=h['tokens']<=65536 or not 0<=h['bytes']<=65536:raise ValueError('bounds')
+if h['contextResetTokens']!=256 or h['byteMapping'] not in ['utf8','latin1']:raise ValueError('codec contract')
+if hashlib.sha256(data).hexdigest()!=h['payloadSHA']:raise ValueError('payload hash')
+if h['runtime']['torch']!=torch.__version__ or h['runtime']['transformers']!=transformers.__version__:raise ValueError('numerical runtime differs')
+root=pathlib.Path(a.model_root)
+for name,v in h['assets'].items():
+    if pathlib.Path(name).name!=name:raise ValueError('model asset path')
+    b=(root/name).read_bytes()
+    if len(b)!=v['bytes'] or hashlib.sha256(b).hexdigest()!=v['sha256']:raise ValueError('model asset mismatch')
+torch.set_num_threads(2);torch.set_num_interop_threads(1);torch.use_deterministic_algorithms(True)
+model=GPT2LMHeadModel.from_pretrained(root,local_files_only=True,attn_implementation='eager').cpu().eval()
+tok=GPT2Tokenizer.from_pretrained(root,local_files_only=True)
+FULL=1<<32;HALF=FULL>>1;QUARTER=HALF>>1;MASK=FULL-1
+offset=0;low=0;high=MASK;code=0
+def bit():
+    global offset
+    pos=offset;offset+=1
+    if offset>len(data)*8+32:raise ValueError('truncated stream')
+    return (data[pos//8]>>(7-pos%8))&1 if pos<len(data)*8 else 0
+for _ in range(32):code=code*2+bit()
+t=time.perf_counter();past=None;previous=tok.eos_token_id;decoded=[];dh=hashlib.sha256()
+for i in range(h['tokens']):
+    if i%256==0:past=None;previous=tok.eos_token_id
+    with torch.inference_mode():r=model(torch.tensor([[previous]]),past_key_values=past,use_cache=True)
+    past=r.past_key_values;probs=torch.softmax(r.logits[0,-1].double(),dim=-1).numpy()
+    freq=(probs*((1<<24)-len(probs))).astype(np.int64)+1;cdf=np.concatenate([np.zeros(1,dtype=np.int64),np.cumsum(freq)])
+    dh.update(cdf.astype('<i8').tobytes());span=high-low+1;total=int(cdf[-1]);v=((code-low+1)*total-1)//span
+    s=bisect.bisect_right(cdf,v)-1
+    if not 0<=s<len(probs):raise ValueError('decoded token outside alphabet')
+    base=low;high=base+span*int(cdf[s+1])//total-1;low=base+span*int(cdf[s])//total
+    while True:
+        if high<HALF:pass
+        elif low>=HALF:low-=HALF;high-=HALF;code-=HALF
+        elif low>=QUARTER and high<3*QUARTER:low-=QUARTER;high-=QUARTER;code-=QUARTER
+        else:break
+        low*=2;high=high*2+1;code=code*2+bit()
+    decoded.append(s);previous=s
+restored=tok.decode(decoded,clean_up_tokenization_spaces=False).encode('utf-8' if h['byteMapping']=='utf8' else 'latin1')
+elapsed=time.perf_counter()-t
+if len(restored)!=h['bytes'] or hashlib.sha256(restored).hexdigest()!=h['sha256'] or dh.hexdigest()!=h['cdfSHA']:raise ValueError('restoration differs')
+(out/'restored.bin').write_bytes(restored)
+report={'schema':'yataverse-independent-llm-restore/v1','bytes':len(restored),'sha256':h['sha256'],'compressedPackSHA':a.trust,
+    'seconds':elapsed,'sourceRead':False,'networkUsed':False,'modelAssetsVerified':len(h['assets']),'CDFSHA':dh.hexdigest(),
+    'host':platform.node(),'codeSHA':hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(),
+    'limits':'same hardware and numerical runtime; cross-platform portability not established'}
+(out/'report.json').write_text(json.dumps(report,indent=2));print(json.dumps(report))

@@ -1,0 +1,44 @@
+# Native Python origin. Background only this study's macOS Node processes.
+import json, pathlib, shlex, subprocess, sys, time
+
+root = pathlib.Path(sys.argv[1])
+dry = sys.argv[2:] == ['--dry-run']
+if sys.argv[2:] and not dry:
+    raise ValueError('arguments')
+if sys.platform != 'darwin' or root.name != 'yataverse-storage-persistent-20261011' or root.parent.parts[-3:] != ('github', 'workspaces', 'codex'):
+    raise ValueError('dedicated macOS study root required')
+allowed = {str(root / 'runtime' / x) for x in ['custody_audit.cljk', 'custody_restore.cljk', 'custody_export.cljk']}
+applied = set()
+for _ in range(2160):
+    if (root / 'stop-probes').exists():
+        break
+    for line in subprocess.check_output(['ps', '-axo', 'pid=,args='], text=True).splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            args = shlex.split(parts[1])
+        except ValueError:
+            continue
+        if len(args) < 3 or args[0] != '/Users/junkawasaki/.local/bin/node' or args[2] not in allowed:
+            continue
+        if not any(a.startswith(str(root) + '/') for a in args[3:]):
+            continue
+        pid = int(parts[0])
+        if pid in applied:
+            continue
+        row = {'pid': pid, 'script': pathlib.Path(args[2]).name, 'time': time.time(), 'scope': 'study process only', 'dryRun': dry}
+        if not dry:
+            result = subprocess.run(['/usr/sbin/taskpolicy', '-b', '-p', str(pid)], capture_output=True, text=True)
+            row.update(backgroundApplied=result.returncode == 0, exitCode=result.returncode)
+            if result.returncode:
+                row['error'] = result.stderr.strip()
+            else:
+                applied.add(pid)
+            with (root / 'io-policy-events.jsonl').open('a') as log:
+                log.write(json.dumps(row) + '\n')
+                log.flush()
+        print(json.dumps(row), flush=True)
+    if dry:
+        break
+    time.sleep(10)

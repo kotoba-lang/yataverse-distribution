@@ -1,0 +1,117 @@
+{
+  "schema": "yataverse-full-lake-union/v1",
+  "inventorySHA": "2334fb3efefc460a9ed1301aecfa2b5183133fc0bb0208a93692617672eb8a91",
+  "inventoryRows": 825390,
+  "inventoryBytes": 91395086102,
+  "fullByteCoverage": true,
+  "totals": {
+    "readBlocks": 825390,
+    "readBytes": 91395086102,
+    "packCount": 5620,
+    "rawContainerBytes": 91536624664,
+    "zstdPayloadBytes": 20938877542,
+    "ecPhysicalBytes": 31420792722,
+    "readHashMs": 377826.76823802246,
+    "encodeMs": 1271264.0395669998,
+    "erasureMs": 100325.05556299973,
+    "restoreMs": 224597.30985199986
+  },
+  "audit": {
+    "primaryBlocksSHA": "7ad283b60c63fcfe2312cdcd8847b52f7b575dd99103b9701220e943c1a347ce",
+    "secondaryBlocksSHA": "b99b2401265e9778a79e8e34343d5ef77cb68a6f5ada942d5797a0a130503b68",
+    "primaryPacksSHA": "f7e3fc1fbcc8ca08e51e78a48565873da37000ea42885e508e9d1ae4830b5ecd",
+    "secondaryPacksSHA": "af23c5fcd2a5524c71e55b9d971b40fd9abcdefa95c99861e278302eb6e52a48"
+  },
+  "runs": [
+    {
+      "schema": "yataverse-lake-stream/v1",
+      "inventorySHA": "2334fb3efefc460a9ed1301aecfa2b5183133fc0bb0208a93692617672eb8a91",
+      "inventoryRows": 825390,
+      "inventoryBytes": 91395086102,
+      "start": 0,
+      "end": 825390,
+      "totals": {
+        "readBlocks": 479053,
+        "readBytes": 58315106160,
+        "missingBlocks": 346337,
+        "missingBytes": 33079979942,
+        "packCount": 3593,
+        "rawContainerBytes": 58397334121,
+        "zstdPayloadBytes": 15545057420,
+        "ecPhysicalBytes": 23325563445,
+        "readHashMs": 187840.18929103692,
+        "encodeMs": 498563.8597980009,
+        "erasureMs": 73612.1100329982,
+        "restoreMs": 118407.959067002
+      },
+      "wallMs": 926769.984791,
+      "complete": true,
+      "fullByteCoverage": false,
+      "host": "main-2.local",
+      "platform": "darwin",
+      "arch": "arm64",
+      "node": "v26.0.0",
+      "zstd": {
+        "level": 9,
+        "workers": 0
+      },
+      "sourceSHA": "d0db498d84743b6dc59a3ce63708955cb6d0ae5fca827390933e8545c2f73d99",
+      "codecSHA": "b2d876cde91702417d3740be1b07d67974e0670d2fffdea79a276bdd603e4769",
+      "limits": "frozen inventory; source signatures/head freshness and annual durability not established; temporary encoding not full custody; two-site EC copies cost 2x ecPhysicalBytes",
+      "sourceSHAOriginallyReported": "09368c7c187a78022070910f962c228845ab060e90a8e51a47275416bbef710b",
+      "sourceSHAProvenance": "working source edited while running; preserved pre-invocation snapshot lake_stream_workers.cljk on Xavier has this hash; unmodified original report saved alongside"
+    },
+    {
+      "schema": "yataverse-lake-stream/v1",
+      "inventorySHA": "2334fb3efefc460a9ed1301aecfa2b5183133fc0bb0208a93692617672eb8a91",
+      "inventoryRows": 825390,
+      "inventoryBytes": 91395086102,
+      "start": 0,
+      "end": 825390,
+      "totals": {
+        "readBlocks": 346337,
+        "readBytes": 33079979942,
+        "missingBlocks": 0,
+        "missingBytes": 0,
+        "packCount": 2027,
+        "rawContainerBytes": 33139290543,
+        "zstdPayloadBytes": 5393820122,
+        "ecPhysicalBytes": 8095229277,
+        "readHashMs": 189986.57894698554,
+        "encodeMs": 772700.1797689988,
+        "erasureMs": 26712.94553000152,
+        "restoreMs": 106189.35078499785
+      },
+      "wallMs": 1168568.257624,
+      "complete": true,
+      "fullByteCoverage": false,
+      "exclusion": {
+        "ledgerSHA": "7ad283b60c63fcfe2312cdcd8847b52f7b575dd99103b9701220e943c1a347ce",
+        "rows": 479053,
+        "bytes": 58315106160
+      },
+      "partitionByteCoverage": true,
+      "host": "xavier",
+      "platform": "linux",
+      "arch": "arm64",
+      "node": "v26.0.0",
+      "zstd": {
+        "level": 9,
+        "workers": 3,
+        "jobSize": 1048576
+      },
+      "sourceSHA": "09368c7c187a78022070910f962c228845ab060e90a8e51a47275416bbef710b",
+      "codecSHA": "b2d876cde91702417d3740be1b07d67974e0670d2fffdea79a276bdd603e4769",
+      "limits": "frozen inventory; source signatures/head freshness and annual durability not established; temporary encoding not full custody; two-site EC copies cost 2x ecPhysicalBytes"
+    }
+  ],
+  "capacity": {
+    "logicalBytes": 91395086102,
+    "compressedProviderBillableBytes": 20938877542,
+    "oneECPhysicalBytes": 31420792722,
+    "twoSiteECPhysicalBytes": 62841585444
+  },
+  "policy": "partition by primary readable custody, missing subset on secondary; 16MiB packs, level9 zstd with recorded per-host workers; every verified byte packed and restored exactly once",
+  "guaranteeQualified": false,
+  "limits": "all frozen-inventory bytes measured; not live-head verification, complete saved custody, full-lake WAN restore, or 11-nines qualification; filesystem allocation and global control-plane indexes excluded"
+}

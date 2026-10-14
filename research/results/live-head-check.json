@@ -1,0 +1,23 @@
+{
+  "checkedAt": "2026-10-11T05:48:45.727Z",
+  "ref": "yataverse/lake",
+  "seq": 6,
+  "cid": "bafkreiezmplv33krtco5jmbxp6jepnnvpdse2k2bu7epslfrmxavjzmnty",
+  "verifiedWitnesses": [
+    "w1",
+    "w2",
+    "w4",
+    "w6",
+    "w7"
+  ],
+  "unreachableWitnesses": [
+    "w3",
+    "w5"
+  ],
+  "minimum": 5,
+  "ledgerSHA": "cf3f4742740eb891fb512d4fc4f3a6f90cc07bb5dfdda1300ddef83ce514ddf9",
+  "writerPolicy": "pinned ledger writer policy applies from seq4",
+  "frozenInventorySHA": "2334fb3efefc460a9ed1301aecfa2b5183133fc0bb0208a93692617672eb8a91",
+  "inventoryBindingReResolved": false,
+  "scope": "live committed head proof checked; frozen resolved inventory reused; no writer seed read and no submit"
+}

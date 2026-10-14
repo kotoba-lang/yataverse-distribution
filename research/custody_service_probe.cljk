@@ -1,0 +1,28 @@
+# Native Python origin. Existing local Kubo endpoint; no service configuration changes.
+import json, pathlib, sys, time, urllib.request
+root = pathlib.Path(sys.argv[1])
+port = int(sys.argv[2])
+if port not in (5001, 5002):
+    raise ValueError('existing local Kubo port only')
+resume = sys.argv[3:] == ['--append']
+if sys.argv[3:] and not resume:
+    raise ValueError('only explicit append continuation is supported')
+out = root / 'service-probes.jsonl'
+if resume and not out.is_file():
+    raise ValueError('existing study probe log required')
+with out.open('a' if resume else 'x') as log:
+    for _ in range(2160):
+        if (root / 'stop-probes').exists():
+            break
+        start = time.monotonic()
+        row = {'time': time.time(), 'phase': (root / 'phase.txt').read_text().strip() if (root / 'phase.txt').exists() else 'baseline', 'scope': 'local Kubo version only'}
+        try:
+            req = urllib.request.Request(f'http://127.0.0.1:{port}/api/v0/version', data=b'')
+            with urllib.request.urlopen(req, timeout=2) as response:
+                response.read(4096)
+            row.update(ok=True, latencyMs=(time.monotonic() - start) * 1000)
+        except Exception as error:
+            row.update(ok=False, errorType=type(error).__name__)
+        log.write(json.dumps(row) + '\n')
+        log.flush()
+        time.sleep(max(0, 10 - (time.monotonic() - start)))

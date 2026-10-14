@@ -1,0 +1,14 @@
+{
+  "schema": "yataverse-independent-llm-restore/v1",
+  "bytes": 4096,
+  "sha256": "e7892eb2442a19cfa1bfea3e8ca2b27445736d99064d4335cb3715e104cbecc2",
+  "compressedPackSHA": "c9128fe7f47826d931b23c224f1fc489a2bbfc7f13b3bf4f396a99cd6abdb412",
+  "seconds": 50.65550304111093,
+  "sourceRead": false,
+  "networkUsed": false,
+  "modelAssetsVerified": 6,
+  "CDFSHA": "ed94dbfc6d1b8fb03fdcc3f33d151bb05a9351cc9befc6387dde9adab4e0e7d6",
+  "host": "jacob.local",
+  "codeSHA": "34651de61eddc92b99cba5538491a6ea120485d7b4365f289db970427052caf8",
+  "limits": "same hardware and numerical runtime; cross-platform portability not established"
+}

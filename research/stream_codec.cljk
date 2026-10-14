@@ -1,0 +1,46 @@
+// Native Node hot loops; .js origin is recorded in cljk-origin.edn.
+'use strict';
+const crypto = require('node:crypto');
+const sha = b => crypto.createHash('sha256').update(b).digest('hex');
+const json = v => Buffer.from(JSON.stringify(v));
+const tables = Array.from({length:256}, (_, a) => Uint8Array.from({length:256}, (_, b) => {
+  let x=a, y=b, v=0;
+  while(y) { if(y&1) v^=x; x=(x<<1)^((x&128)?0x11d:0); y>>=1; }
+  return v&255;
+}));
+const generator = [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1],[1,1,1,1],[1,2,4,8]];
+function combine(row, buffers) {
+  const out=Buffer.alloc(buffers[0].length);
+  row.forEach((c,k)=>{ if(c) { const t=tables[c], b=buffers[k]; for(let i=0;i<b.length;i++) out[i]^=t[b[i]]; }});
+  return out;
+}
+function inverse(matrix) {
+  const rows=matrix.map((r,i)=>r.concat([0,1,2,3].map(j=>+(i===j))));
+  for(let c=0;c<4;c++) {
+    const p=rows.findIndex((r,i)=>i>=c&&r[c]); if(p<0) throw Error('singular matrix');
+    [rows[p],rows[c]]=[rows[c],rows[p]];
+    const inv=tables[rows[c][c]].indexOf(1); rows[c]=rows[c].map(v=>tables[inv][v]);
+    for(let i=0;i<4;i++) if(i!==c) { const t=tables[rows[i][c]]; rows[i]=rows[i].map((v,j)=>v^t[rows[c][j]]); }
+  }
+  return rows.map(r=>r.slice(4));
+}
+function encode(payload) {
+  if(!Buffer.isBuffer(payload)||payload.length>48*1024*1024) throw Error('payload bound');
+  const width=Math.max(1,Math.ceil(payload.length/4)), padded=Buffer.alloc(width*4); payload.copy(padded);
+  const data=[0,1,2,3].map(i=>padded.subarray(i*width,(i+1)*width));
+  const shards=data.concat(generator.slice(4).map(r=>combine(r,data)));
+  const manifest={schema:'yataverse-research-ec/v1',k:4,m:2,width,bytes:payload.length,sha256:sha(payload),shards:shards.map(sha)};
+  const manifestSHA=sha(json(manifest));
+  const receipt={ 'manifest-sha256':manifestSHA, 'payload-sha256':manifest.sha256 };
+  return {manifest,manifestSHA,shards,receipt,physicalBytes:6*width+3*(json(manifest).length+json(receipt).length)};
+}
+function recover(manifest, trust, shards) {
+  if(sha(json(manifest))!==trust || manifest.schema!=='yataverse-research-ec/v1' || manifest.k!==4 || manifest.m!==2 ||
+     !Number.isInteger(manifest.bytes)||manifest.bytes<0||manifest.bytes>48*1024*1024 ||
+     manifest.width!==Math.max(1,Math.ceil(manifest.bytes/4))||manifest.shards.length!==6||shards.length!==6) throw Error('untrusted manifest');
+  const ids=shards.flatMap((b,i)=>Buffer.isBuffer(b)&&b.length===manifest.width&&sha(b)===manifest.shards[i]?[i]:[]).slice(0,4);
+  if(ids.length<4) throw Error('insufficient valid shards');
+  const out=Buffer.concat(inverse(ids.map(i=>generator[i])).map(r=>combine(r,ids.map(i=>shards[i])))).subarray(0,manifest.bytes);
+  if(sha(out)!==manifest.sha256) throw Error('recovery digest differs'); return out;
+}
+module.exports={sha,json,encode,recover};

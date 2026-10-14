@@ -1,0 +1,27 @@
+(ns storage-cost (:require [lossless-storage :as s]))
+(def argv (vec (array-seq (.-argv js/process))))
+(defn option [key default] (or (second (drop-while #(not= % key) argv)) default))
+(def logical-gb (js/Number (option "--logical-gb" "91.395086102")))
+(def ratio (js/Number (option "--physical-ratio" "1.5")))
+(def node-rate (js/Number (option "--node-usd-gb-month" "0.003")))
+(def overhead (js/Number (option "--other-usd-month" "0")))
+(when-not (and (every? #(and (js/Number.isFinite %) (<= 0 %)) [logical-gb ratio node-rate overhead])
+               (pos? logical-gb) (pos? ratio)) (s/refuse "invalid cost inputs"))
+(def self-cost (+ (* logical-gb ratio node-rate) overhead))
+(def baselines
+  [{:name "R2 Standard" :rate 0.015 :source "https://developers.cloudflare.com/r2/pricing/"}
+   {:name "B2 list price" :rate 0.00695 :source "https://www.backblaze.com/cloud-storage/pricing"}])
+(println
+ (js/JSON.stringify
+  (clj->js {:as-of "2026-10-11" :logical-gb logical-gb :physical-ratio ratio
+            :node-usd-gb-month node-rate :other-usd-month overhead :yataverse-scenario-usd-month self-cost
+            :scope "capacity-only scenarios; assumed node cost; no measured TCO or durability equivalence"
+            :other-costs "include hardware amortization, energy, compute, embedding/model custody, repair bandwidth, operations, SLA"
+            :provider-compressed-control "apply identical compression/container to provider objects; provider internal redundancy is in tariff"
+            :baselines (mapv (fn [p]
+                               (assoc p :uncompressed-usd-month (* logical-gb (:rate p))
+                                        :break-even-node-usd-gb-month
+                                        (max 0 (/ (- (* logical-gb (:rate p)) overhead) (* logical-gb ratio)))
+                                        :scenario-saves-capacity-only (< self-cost (* logical-gb (:rate p))))) baselines)
+            :filecoin "No universal fixed rate. Obtain a current equivalent service/deal quote; 2025 Onchain Cloud announcement was limited-time early-adopter pricing, not a current quote."
+            :excluded "free tiers, request rounding, egress allowances, taxes, minimum duration, quote discounts"}) nil 2))

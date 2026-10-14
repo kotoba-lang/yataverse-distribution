@@ -1,0 +1,81 @@
+# Native Python origin. Restart only one identified study observer; retain/append all samples.
+import hashlib, json, os, pathlib, shlex, signal, subprocess, sys, time
+
+root = pathlib.Path(sys.argv[1])
+kind = sys.argv[2]
+dry = sys.argv[3:] == ['--dry-run']
+if sys.argv[3:] and not dry:
+    raise ValueError('arguments')
+if not root.is_absolute() or root.name != 'yataverse-storage-persistent-20261011' or root.parent.parts[-3:] != ('github', 'workspaces', 'codex'):
+    raise ValueError('dedicated study root required')
+if kind not in ('telemetry', 'probes'):
+    raise ValueError('observer kind')
+name = 'custody_telemetry.cljk' if kind == 'telemetry' else 'custody_service_probe.cljk'
+script = root / 'runtime' / name
+log = root / ('telemetry.jsonl' if kind == 'telemetry' else 'service-probes.jsonl')
+stop = root / ('stop-telemetry' if kind == 'telemetry' else 'stop-probes')
+if stop.exists() or not log.is_file() or log.is_symlink():
+    raise ValueError('active study log required')
+data = log.read_bytes()
+if not data.endswith(b'\n'):
+    raise ValueError('last sample incomplete')
+json.loads(data.splitlines()[-1])
+candidates = []
+for line in subprocess.check_output(['ps', '-axo', 'pid=,args='], text=True).splitlines():
+    tokens = line.strip().split(None, 1)
+    if len(tokens) != 2:
+        continue
+    pid, command = tokens
+    try:
+        args = shlex.split(command)
+    except ValueError:
+        continue
+    expected = 3 if kind == 'telemetry' else 4
+    if len(args) not in (expected, expected + 1) or not pathlib.Path(args[0]).name.lower().startswith('python'):
+        continue
+    if len(args) == expected + 1 and args[-1] != '--append':
+        continue
+    if args[1] not in (str(script), 'runtime/' + name) or args[2] not in (str(root), '.'):
+        continue
+    if kind == 'probes' and args[3] != '5002':
+        continue
+    if args[2] == '.':
+        if sys.platform != 'linux' or pathlib.Path('/proc/' + pid + '/cwd').resolve() != root:
+            continue
+    candidates.append((int(pid), len(args) == expected + 1))
+if len(candidates) != 1:
+    raise ValueError('exactly one original study observer required: ' + str(candidates))
+pid, already_append = candidates[0]
+if dry:
+    print(json.dumps({'kind': kind, 'pid': pid, 'dryRun': True}))
+    sys.exit(0)
+before = script if already_append else root / 'runtime' / (name[:-5] + '.before-append.cljk')
+if not before.is_file():
+    raise ValueError('original observer code snapshot required')
+os.kill(pid, signal.SIGTERM)
+for _ in range(100):
+    if not subprocess.run(['ps', '-p', str(pid), '-o', 'pid='], text=True, stdout=subprocess.PIPE, check=False).stdout.strip():
+        break
+    time.sleep(0.1)
+else:
+    raise RuntimeError('original observer did not exit')
+os.nice(19)
+data = log.read_bytes()
+if not data.endswith(b'\n'):
+    raise ValueError('stopped observer left incomplete sample')
+with (root / ('observer-' + kind + '-append-' + str(time.time_ns()) + '.log')).open('x') as output:
+    args = [sys.executable, str(script), str(root)] + ([] if kind == 'telemetry' else ['5002']) + ['--append']
+    child = subprocess.Popen(args, cwd=root, stdin=subprocess.DEVNULL, stdout=output, stderr=output, start_new_session=True)
+    time.sleep(0.25)
+    if child.poll() is not None:
+        raise RuntimeError('continued observer failed to start')
+event = {'kind': kind, 'time': time.time(), 'previousPID': pid, 'newPID': child.pid,
+         'priorLogBytes': len(data), 'priorLogSHA': hashlib.sha256(data).hexdigest(),
+         'previousRuntimeSHA': hashlib.sha256(before.read_bytes()).hexdigest(),
+         'continuedRuntimeSHA': hashlib.sha256(script.read_bytes()).hexdigest(), 'append': True,
+         'scope': 'passive study observer only; no storage receiver, service or network settings changed'}
+with (root / 'observer-restarts.jsonl').open('a') as events:
+    events.write(json.dumps(event) + '\n')
+    events.flush()
+    os.fsync(events.fileno())
+print(json.dumps(event))

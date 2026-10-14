@@ -1,0 +1,12 @@
+{
+  "schema": "yataverse-receiver-short-profile/v1",
+  "phase": "initial full-lake copy to Jacob",
+  "scope": "study receiver PID only, one second at 10ms interval, nice 19",
+  "mainThreadSamples": 63,
+  "writeCallSamples": 62,
+  "profileSHA": "3905f329edbc030165744d023bf2b136505c33defed707d9c925b2df6487e69b",
+  "physicalFootprintMiB": 473,
+  "peakPhysicalFootprintMiB": 657.3,
+  "inference": "Write-path waiting is a likely bottleneck at this sampled moment; not a whole-campaign attribution or disk-only throughput result",
+  "limits": "Existing shared-host workloads and one-second sampling; exact full transfer/decode/repair times are reported only on campaign completion"
+}

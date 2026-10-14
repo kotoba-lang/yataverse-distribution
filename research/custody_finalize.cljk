@@ -1,0 +1,16 @@
+// Sign a complete study root; no partial census can become a recovery root.
+'use strict';
+const fs=require('node:fs'),path=require('node:path');
+const {sha,json,durable,syncDir,regular,signRoot}=require('./custody_common.cljk');
+const [root,inventory,keyFile,signFile,trustOut]=process.argv.slice(2);
+if(!root||!trustOut||fs.existsSync(trustOut)||fs.existsSync(path.join(root,'control')))throw Error('new finalization required');
+const summary=JSON.parse(regular(path.join(root,'summary.json'))),inv=regular(inventory),key=regular(keyFile,32);
+if(!summary.fullByteCoverage||!summary.complete||sha(inv)!==summary.inventorySHA||sha(key)!==summary.keySHA)throw Error('complete bytes and key required');
+const cat=regular(path.join(root,'packs.jsonl')),index=regular(path.join(root,'index.jsonl'));
+const packs=cat.toString().trimEnd().split('\n').map(JSON.parse);if(packs.length!==summary.totals.packCount||new Set(packs.map(p=>p.id)).size!==packs.length)throw Error('catalog coverage');
+const assets={};for(const name of ['custody_common.cljk','stream_codec.cljk','custody_restore.cljk','custody_export.cljk','custody_tapes.cljk'])assets[name]=sha(regular(path.join(__dirname,name)));
+const body={schema:'yataverse-persistent-catalog/v1',inventorySHA:sha(inv),inventoryRows:summary.inventoryRows,inventoryBytes:summary.inventoryBytes,indexSHA:sha(index),catalogSHA:sha(cat),packCount:packs.length,keySHA:sha(key),encryption:'AES-256-GCM; aad inventorySHA:packId',assets,createdAt:new Date().toISOString()};
+const signed=signRoot(body,regular(signFile).toString()),signedBytes=json(signed),control=path.join(root,'control');fs.mkdirSync(control,{mode:0o700});
+for(const i of [0,2,4]){const d=path.join(control,String(i));fs.mkdirSync(d,{mode:0o700});for(const [name,b] of [['root.json',signedBytes],['catalog.jsonl',cat],['index.jsonl',index],['inventory.jsonl',inv],['data-key.bin',key]])durable(path.join(d,name),b);for(const name of Object.keys(assets))durable(path.join(d,name),regular(path.join(__dirname,name)));syncDir(d);}
+syncDir(control);syncDir(root);const trust={schema:'yataverse-persistent-trust/v1',rootSHA:sha(signedBytes),publicKey:signed.publicKey,inventorySHA:body.inventorySHA,keySHA:body.keySHA};durable(trustOut,json(trust));
+console.log(JSON.stringify({rootSHA:trust.rootSHA,inventoryRows:body.inventoryRows,inventoryBytes:body.inventoryBytes,packCount:body.packCount,signed:true,keyBytes:32,keyExposed:false}));
